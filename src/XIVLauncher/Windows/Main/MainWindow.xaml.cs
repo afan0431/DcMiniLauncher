@@ -31,6 +31,12 @@ public partial class MainWindow
 
     private const int CURRENT_VERSION_LEVEL = 2;
 
+    /// <summary>不含注入选择那一列的窗口宽度, 与 MainWindow.xaml 的 Width 一致</summary>
+    private const double BASE_WIDTH = 780;
+
+    /// <summary>注入选择那一列占的宽度（控件 240 + 左边距 8 + 右留白）</summary>
+    private const double INJECTION_OPTIONS_WIDTH = 260;
+
     private readonly AccountManager accountManager;
     private readonly Launcher       launcher;
 
@@ -55,6 +61,13 @@ public partial class MainWindow
 
         Closed  += Model.OnWindowClosed;
         Closing += Model.OnWindowClosing;
+
+        // 注入选择那一列只在登录后出现, 窗口宽度跟着让位, 免得登录页右边空一块
+        Model.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(MainWindowViewModel.IsInjectionOptionsVisible))
+                Dispatcher.Invoke(ApplyInjectionOptionsWidth);
+        };
         Model.Activate += () => Dispatcher.Invoke
         (() =>
             {
@@ -158,6 +171,9 @@ public partial class MainWindow
         Activated += (_, _) => Model.GameUpdateMonitor.QueueCheck();
     }
 
+    private void ApplyInjectionOptionsWidth() =>
+        Width = Model.IsInjectionOptionsVisible ? BASE_WIDTH + INJECTION_OPTIONS_WIDTH : BASE_WIDTH;
+
     private void OnSettingsRequested(object? sender, EventArgs e)
     {
         var window = new SettingsWindow(Model.Settings)
@@ -174,8 +190,11 @@ public partial class MainWindow
         {
             PreserveWindowPosition.RestorePosition(this);
 
-            Width  = 780;
+            // 与 MainWindow.xaml 的 Width/Height 保持一致
+            Width  = BASE_WIDTH;
             Height = 540;
+
+            ApplyInjectionOptionsWidth();
         }
         catch (Exception ex)
         {

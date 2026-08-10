@@ -10,6 +10,7 @@ using XIVLauncher.Common.Util;
 using XIVLauncher.Login.WeGame;
 using XIVLauncher.CompanionApp;
 using XIVLauncher.Dalamud;
+using XIVLauncher.Minion;
 using XIVLauncher.Windows.Services;
 
 namespace XIVLauncher.Windows.ViewModel;
@@ -81,6 +82,67 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
             field = true;
         }
     } = true;
+
+    #region Minion
+
+    /// <summary>
+    ///     Minion 安装目录, 空表示用默认的 <see cref="MinionAccounts.DEFAULT_INSTALL_PATH" />
+    /// </summary>
+    [ObservableProperty]
+    public partial string MinionInstallPath { get; set; } = string.Empty;
+
+    /// <summary>
+    ///     Minion 论坛账号（-minionid）
+    /// </summary>
+    [ObservableProperty]
+    public partial string MinionId { get; set; } = string.Empty;
+
+    /// <summary>
+    ///     Minion 账号密码, 明文 —— MinionLauncher 的 -minionpass 只接受明文
+    /// </summary>
+    [ObservableProperty]
+    public partial string MinionPassword { get; set; } = string.Empty;
+
+    /// <summary>
+    ///     「检测」按钮的结果
+    /// </summary>
+    [ObservableProperty]
+    public partial string MinionDetectResult { get; set; } = string.Empty;
+
+    [RelayCommand]
+    private void DetectMinionInstall()
+    {
+        var installPath = string.IsNullOrWhiteSpace(MinionInstallPath)
+                              ? MinionAccounts.DEFAULT_INSTALL_PATH
+                              : MinionInstallPath.Trim();
+
+        // 把检测用的目录直接填回输入框, 免得用户还要自己敲一遍默认路径
+        MinionInstallPath = installPath;
+
+        var launcherExePath = MinionAccounts.GetLauncherExePath(installPath);
+        var accountsPath    = MinionAccounts.GetAccountsJsonPath(installPath);
+
+        var lines = new List<string>
+        {
+            MinionAccounts.IsLauncherPresent(installPath)
+                ? $"✔ 找到 {launcherExePath}"
+                : $"✘ 未找到 {launcherExePath}"
+        };
+
+        if (MinionAccounts.TryLoadGroups(out var groups, out var error, installPath))
+            lines.Add
+            (
+                groups.Count > 0
+                    ? $"✔ {accountsPath}: {groups.Count} 个分组 / {groups.Sum(group => group.Accounts.Count)} 个账号（{string.Join("、", groups.Select(group => group.Id))}）"
+                    : $"✘ {accountsPath} 里没有任何分组"
+            );
+        else
+            lines.Add($"✘ {error}");
+
+        MinionDetectResult = string.Join(Environment.NewLine, lines);
+    }
+
+    #endregion
 
     [ObservableProperty]
     public partial string LaunchArgs { get; set; } = string.Empty;
@@ -242,6 +304,10 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
         ManualInjectDelayMs                         = App.Settings.ManualInjectDelayMs;
         EnableHooks                                 = App.Settings.DalamudEnabled;
         EnableDcTravel                              = true;
+        MinionInstallPath                           = App.Settings.MinionInstallPath ?? string.Empty;
+        MinionId                                    = App.Settings.MinionId          ?? string.Empty;
+        MinionPassword                              = App.Settings.MinionPassword    ?? string.Empty;
+        MinionDetectResult                          = string.Empty;
         LaunchArgs                                  = App.Settings.AdditionalLaunchArgs ?? string.Empty;
         DpiAwarenessIndex                           = (int)App.Settings.DPIAwareness;
         VersionLabelText                            = $"XIVLauncher - v{AppUtil.GetAssemblyVersion()}";
@@ -327,6 +393,14 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
                 settings.SpeedLimitBytes                      = speedLimitBytes;
                 settings.WeGamePath                           = string.IsNullOrWhiteSpace(WeGamePath) ? null : new DirectoryInfo(WeGamePath);
                 settings.CredType                             = credTypeApplyResult.AppliedCredType;
+
+                var minionInstallPath = MinionInstallPath.Trim();
+                var minionId          = MinionId.Trim();
+
+                settings.MinionInstallPath = string.IsNullOrEmpty(minionInstallPath) ? null : minionInstallPath;
+                settings.MinionId          = string.IsNullOrEmpty(minionId) ? null : minionId;
+                // 不做 Trim —— 密码可能就是以空白开头或结尾
+                settings.MinionPassword = string.IsNullOrEmpty(MinionPassword) ? null : MinionPassword;
             }
         );
 

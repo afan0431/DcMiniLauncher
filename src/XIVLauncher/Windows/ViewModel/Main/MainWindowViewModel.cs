@@ -31,6 +31,11 @@ internal partial class MainWindowViewModel : ObservableObject
 
     public DashboardViewModel DashboardPage { get; }
 
+    /// <summary>
+    ///     启动页的注入选择（Dalamud / Minion / 都注 / 都不注）
+    /// </summary>
+    public InjectionOptionsViewModel InjectionOptions { get; }
+
     public DCTravelViewModel DCTravelPage { get; }
 
     public AccountSwitcherViewModel AccountSwitcher { get; }
@@ -169,6 +174,8 @@ internal partial class MainWindowViewModel : ObservableObject
         );
         GameUpdateMonitor = new GameUpdateMonitorService(this);
 
+        InjectionOptions = new InjectionOptionsViewModel(Settings, new DialogService(window));
+
         DCTravelPage = new DCTravelViewModel
         (
             () => SwitchCard(LoginCardType.Dashboard),
@@ -214,6 +221,7 @@ internal partial class MainWindowViewModel : ObservableObject
         Settings.SettingsSaved += (_, _) =>
         {
             InjectPage.ReloadSettings();
+            InjectionOptions.ReloadFromSettings();
             RefreshDalamudInfoCommandState();
         };
     }
@@ -353,7 +361,14 @@ internal partial class MainWindowViewModel : ObservableObject
     public partial bool IsEnabled { get; set; }
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsInjectionOptionsVisible))]
     public partial int LoginCardTransitionerIndex { get; set; } = 1;
+
+    /// <summary>
+    ///     注入选择那一列只在登录后的主页面显示（登录页 / 扫码 / 手动注入 / 超域旅行都藏起来）
+    /// </summary>
+    public bool IsInjectionOptionsVisible =>
+        LoginCardTransitionerIndex == (int)LoginCardType.Dashboard;
 
     [ObservableProperty]
     public partial bool IsLoadingDialogOpen { get; set; }

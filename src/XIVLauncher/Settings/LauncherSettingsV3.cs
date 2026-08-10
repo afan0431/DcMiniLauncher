@@ -230,6 +230,65 @@ public sealed class LauncherSettingsV3 : IAccountSettingsStore
 
     #endregion
 
+    #region Minion 注入配置
+
+    /// <summary>
+    ///     本次启动是否在游戏起来后挂 MinionLauncher（启动页每次现选）
+    /// </summary>
+    public bool MinionAttachEnabled
+    {
+        get;
+        set => Set(ref field, value);
+    }
+
+    /// <summary>
+    ///     本次启动使用的 Minion 分组，读自 Minion 的 Settings\Accounts.json（启动页每次现选）
+    /// </summary>
+    public string? MinionGroup
+    {
+        get;
+        set => Set(ref field, value);
+    }
+
+    /// <summary>
+    ///     本次启动使用的 Minion 账号，存 Accounts.json 里的 UID（一个分组下可能有多个账号，启动页每次现选）
+    /// </summary>
+    public string? MinionAccountUid
+    {
+        get;
+        set => Set(ref field, value);
+    }
+
+    /// <summary>
+    ///     Minion 安装目录，空则用 <see cref="Minion.MinionAccounts.DEFAULT_INSTALL_PATH" />（配置一次）
+    /// </summary>
+    public string? MinionInstallPath
+    {
+        get;
+        set => Set(ref field, value);
+    }
+
+    /// <summary>
+    ///     Minion 账号密码，明文 —— MinionLauncher 的 <c>-minionpass</c> 只接受明文，
+    ///     传 Accounts.json 里加密的 KeyPassword 会注入成功但 bot 不运行（配置一次）
+    /// </summary>
+    public string? MinionPassword
+    {
+        get;
+        set => Set(ref field, value);
+    }
+
+    /// <summary>
+    ///     Minion 论坛账号，对应 <c>-minionid</c>，不在 Accounts.json 里（配置一次）
+    /// </summary>
+    public string? MinionId
+    {
+        get;
+        set => Set(ref field, value);
+    }
+
+    #endregion
+
     #region 超域旅行配置
 
     /// <summary>

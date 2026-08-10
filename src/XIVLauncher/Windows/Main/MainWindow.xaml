@@ -23,6 +23,7 @@
     <Window.Resources>
         <system:Double x:Key="BannerCardWidth">450</system:Double>
         <system:Double x:Key="BannerCardHeight">250</system:Double>
+        <BooleanToVisibilityConverter x:Key="BoolToVis" />
     </Window.Resources>
 
     <Grid>
@@ -35,6 +36,8 @@
 
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <!-- 注入选择 -->
                     <ColumnDefinition />
                 </Grid.ColumnDefinitions>
 
@@ -59,6 +62,15 @@
                                        Grid.Column="1"
                                        Width="280"
                                        Margin="8,0,0,4" />
+
+                <!-- 本次注入（Dalamud / Minion / 都注 / 都不注）, 只在登录后的主页面显示。
+                     边距与登录卡片一致, 卡片上下沿对齐；内部行结构对齐卡片内容, 见控件本体 -->
+                <main:InjectionOptionsControl Grid.Row="0"
+                                              Grid.RowSpan="2"
+                                              Grid.Column="2"
+                                              Width="240"
+                                              Margin="8,0,0,4"
+                                              Visibility="{Binding IsInjectionOptionsVisible, Converter={StaticResource BoolToVis}}" />
 
                 <materialDesign:DialogHost
                     Identifier="MaintenanceQueueDialogHost"

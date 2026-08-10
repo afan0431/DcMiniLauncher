@@ -260,6 +260,20 @@
                                 <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
                             <Border Style="{StaticResource SidebarIconCircleStyle}">
+                                <materialDesign:PackIcon Kind="RobotOutline"
+                                                         Style="{StaticResource SidebarNavigationIconStyle}" />
+                            </Border>
+                            <TextBlock Grid.Column="1" Margin="12,0,0,0"
+                                       Style="{StaticResource SidebarNavigationTextStyle}" Text="Minion" />
+                        </Grid>
+                    </ListBoxItem>
+                    <ListBoxItem>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="36" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Border Style="{StaticResource SidebarIconCircleStyle}">
                                 <materialDesign:PackIcon Kind="InformationOutline"
                                                          Style="{StaticResource SidebarNavigationIconStyle}" />
                             </Border>
@@ -662,6 +676,86 @@
                                 </Grid>
                             </materialDesign:Card>
                         </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+            <TabItem x:Name="TabMinion">
+                <ScrollViewer Style="{StaticResource PageScrollViewerStyle}">
+                    <StackPanel MaxWidth="820">
+                        <TextBlock Style="{StaticResource PageTitleStyle}" Text="Minion" />
+                        <TextBlock Margin="0,5,0,28" Style="{StaticResource PageDescriptionStyle}"
+                                   Text="配置一次即可, 每次启动在启动页选「是否注入 Minion」和用哪个分组、账号" />
+
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="安装位置" />
+                        <materialDesign:Card Style="{StaticResource SettingCardStyle}">
+                            <StackPanel>
+                                <TextBlock Style="{StaticResource SettingTitleStyle}" Text="Minion 安装目录" />
+                                <TextBlock Style="{StaticResource SettingDescriptionStyle}"
+                                           Text="应该包含 MinionLauncher_64.exe 与 Settings\Accounts.json; 留空则使用 C:\MINI。启动器会以该目录为工作目录拉起 MinionLauncher" />
+                                <Grid Margin="0,16,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <components:FolderEntry Grid.Column="0" Description="Minion 安装目录"
+                                                            VerticalAlignment="Center"
+                                                            Text="{Binding MinionInstallPath, UpdateSourceTrigger=PropertyChanged}" />
+                                    <Button Grid.Column="1" Margin="16,0,0,0" MinWidth="88" Content="检测"
+                                            VerticalAlignment="Center"
+                                            ToolTip="检查 MinionLauncher_64.exe 与 Accounts.json 是否可用, 并把目录填回上面"
+                                            Command="{Binding DetectMinionInstallCommand}" />
+                                </Grid>
+                                <TextBlock Margin="0,14,0,0" Style="{StaticResource SettingDescriptionStyle}"
+                                           Text="{Binding MinionDetectResult}" TextWrapping="Wrap"
+                                           LineHeight="20" />
+                            </StackPanel>
+                        </materialDesign:Card>
+
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="账号" />
+                        <materialDesign:Card Style="{StaticResource SettingCardStyle}">
+                            <StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="260" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Margin="0,0,24,0">
+                                        <TextBlock Style="{StaticResource SettingTitleStyle}" Text="Minion 账号" />
+                                        <TextBlock Style="{StaticResource SettingDescriptionStyle}"
+                                                   Text="MinionLauncher 的 -minionid, 不在 Accounts.json 里" />
+                                    </StackPanel>
+                                    <TextBox Grid.Column="1" VerticalAlignment="Center"
+                                             Text="{Binding MinionId, UpdateSourceTrigger=PropertyChanged}"
+                                             materialDesign:HintAssist.Hint="Minion 账号"
+                                             materialDesign:HintAssist.IsFloating="True"
+                                             Style="{StaticResource ThemeTextBoxStyle}" />
+                                </Grid>
+                                <Separator Style="{StaticResource SettingSeparatorStyle}" />
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="260" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Margin="0,0,24,0">
+                                        <TextBlock Style="{StaticResource SettingTitleStyle}" Text="Minion 账号密码" />
+                                        <TextBlock Style="{StaticResource SettingDescriptionStyle}"
+                                                   Text="MinionLauncher 的 -minionpass 只接受明文" />
+                                    </StackPanel>
+                                    <PasswordBox x:Name="MinionPasswordBox" Grid.Column="1" VerticalAlignment="Center"
+                                                 PasswordChanged="MinionPasswordBox_OnPasswordChanged"
+                                                 materialDesign:HintAssist.Hint="Minion 账号密码"
+                                                 materialDesign:HintAssist.IsFloating="True" />
+                                </Grid>
+                                <Border Margin="0,18,0,0" Padding="12,10" Background="#14FF9800" CornerRadius="4">
+                                    <StackPanel Orientation="Horizontal">
+                                        <materialDesign:PackIcon Width="18" Height="18" Margin="0,1,10,0"
+                                                                 Foreground="#FF9800" Kind="AlertCircleOutline" />
+                                        <TextBlock Foreground="#FF9800" TextWrapping="Wrap"
+                                                   Text="密码会以明文保存在启动器配置文件里 —— MinionLauncher 只接受明文传参, 请自行斟酌" />
+                                    </StackPanel>
+                                </Border>
+                            </StackPanel>
+                        </materialDesign:Card>
                     </StackPanel>
                 </ScrollViewer>
             </TabItem>
