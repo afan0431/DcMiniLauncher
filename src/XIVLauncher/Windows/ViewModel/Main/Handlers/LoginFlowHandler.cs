@@ -270,7 +270,7 @@ internal sealed class LoginFlowHandler
             dcTravelRuntimeService.ConfigureQuickLoginRefresh(workflowResult.RefreshGameSessionIdByQuickLoginFunc);
 
         gameLaunchContext.DcTravelPort = gameLaunchContext.LoginResult.State == LoginState.Ok
-                                             ? await dcTravelRuntimeService.StartAsync(true, false).ConfigureAwait(false)
+                                             ? await dcTravelRuntimeService.StartAsync().ConfigureAwait(false)
                                              : 0;
 
         if (await ProcessLoginResultAsync(gameLaunchContext, action).ConfigureAwait(false))

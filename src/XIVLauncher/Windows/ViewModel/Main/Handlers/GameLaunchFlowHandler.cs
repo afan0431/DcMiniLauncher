@@ -83,6 +83,13 @@ internal sealed class GameLaunchFlowHandler
             dalamudOk = dalamudUpdateResult;
         }
 
+        // 本次启动到底有哪个游戏内代理 —— 挂 Minion（F3）与游戏内跨大区走哪条路（F4）都看这个。
+        // Dalamud 那一位用 dalamudOk 而不是设置值: 开关开着但兼容/更新没过时它并不会真的注入。
+        gameLaunchContext.InGameAgents = (dalamudOk ? InGameAgents.Dalamud : InGameAgents.None)
+                                        | (App.Settings.MinionAttachEnabled ? InGameAgents.Minion : InGameAgents.None);
+
+        Log.Information("[GameLaunch] 本次启动的游戏内代理: {InGameAgents}", gameLaunchContext.InGameAgents);
+
         var gameRunner = new GameRunner
         (
             dalamudSession,

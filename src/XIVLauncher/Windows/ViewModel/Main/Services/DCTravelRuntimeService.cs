@@ -53,12 +53,19 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
     public void Bind(LoginSessionRefreshContext context) =>
         Client.BindLoginSessionRefresh(context);
 
-    public async Task<int> StartAsync(bool enableDalamud, bool skipDcTravel)
+    /// <summary>
+    ///     建立超域旅行会话并开监听端口, 返回端口号。
+    /// </summary>
+    /// <remarks>
+    ///     这里**不**按「本次是否注入 Dalamud / Minion」来决定启不启：本方法是唯一建立会话
+    ///     （BeginSession + GetValidCookie + 保活）的地方, 启动器自己的超域传送页面也用同一个
+    ///     <see cref="Client" />。按代理去卡, 会把「什么都不注」的用户的超域传送一起卡死。
+    ///     游戏内那半自己会挑执行者: 有 Dalamud → 插件读 <c>XL.DcTraveler</c> 端口;
+    ///     只 Minion → 注入的 native 模块被启动器经命名管道驱动（F4），不走这个端口。
+    /// </remarks>
+    public async Task<int> StartAsync()
     {
         Stop();
-
-        if (!enableDalamud || skipDcTravel)
-            return 0;
 
         Client.BeginSession();
         var version = Volatile.Read(ref sessionVersion);
