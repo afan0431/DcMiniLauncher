@@ -218,6 +218,21 @@ public static class GameArgumentInterop
             SetupHook(functionAddress);
         }
 
+        /// <summary>
+        ///     记下这块**游戏进程里**的分配, 并掐掉它的终结器。
+        ///     这些内存装的是 arg-fix 函数和它用到的字符串, 游戏被改写的 sdoLogin 会一直 jmp 进来 ——
+        ///     游戏活着期间释放它 = 下次调用跳进已解除映射的地址, 游戏直接闪退。
+        ///     <c>PrivateAllocation</c> 的终结器正是干这个的, 且什么时候跑完全看启动器的 GC,
+        ///     所以表现为随机闪退（2026-08-14 定位: 终结器栈上还抛了
+        ///     <c>InvalidOperationException: No process is associated with this object</c>）。
+        ///     游戏退出时这些内存随进程一起消失, 我们本来就不需要释放。
+        /// </summary>
+        private void KeepForever(PrivateAllocation allocation)
+        {
+            privateAllocations.Add(allocation);
+            GC.SuppressFinalize(allocation);
+        }
+
         private static byte[] Assemble(Assembler assembler, ulong rip = 0)
         {
             using var stream = new MemoryStream();
@@ -241,7 +256,7 @@ public static class GameArgumentInterop
                     TargetProcess = targetProcess
                 }
             );
-            privateAllocations.Add(testSidPrefixAllocation);
+            KeepForever(testSidPrefixAllocation);
             externalMemory.WriteRaw(testSidPrefixAllocation.BaseAddress, testSidPrefixBytes);
 
             var sndaIdPrefixBytes = Encoding.ASCII.GetBytes(SNDA_ID_PREFIX + '\0');
@@ -255,7 +270,7 @@ public static class GameArgumentInterop
                     TargetProcess = targetProcess
                 }
             );
-            privateAllocations.Add(sndaIdPrefixAllocation);
+            KeepForever(sndaIdPrefixAllocation);
             externalMemory.WriteRaw(sndaIdPrefixAllocation.BaseAddress, sndaIdPrefixBytes);
 
             var assembler = new Assembler(64);
@@ -365,7 +380,7 @@ public static class GameArgumentInterop
                     TargetProcess = targetProcess
                 }
             );
-            privateAllocations.Add(argFixFunctionAllocation);
+            KeepForever(argFixFunctionAllocation);
             argFixFunctionAddress = argFixFunctionAllocation.BaseAddress;
             externalMemory.WriteRaw(argFixFunctionAddress, bytes);
             Log.Information("ArgFixFunctionAddress: 0x{ArgFixFunctionAddress:X}", argFixFunctionAddress);

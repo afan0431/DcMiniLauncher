@@ -190,7 +190,8 @@ internal sealed class GameLaunchFlowHandler
             gameLaunchService.StopCompanionApps(launched.ProcessID, companionAppManager);
         }
 
-        Log.Verbose("游戏进程已退出");
+        // 退出码是事后判断「玩家自己关的」还是「闪退」的唯一线索, 打成 Info 方便排查
+        Log.Information("游戏进程已退出 (PID={ProcessID}, ExitCode=0x{ExitCode:X8})", launched.ProcessID, (uint)launched.ExitCode);
 
         return launched;
     }
