@@ -31,9 +31,34 @@ public sealed record MinionAccount
     public int? Datacenter { get; init; }
 
     /// <summary>
-    ///     <c>-usebeta</c> —— 用户的分组里确实有标着 beta 的条目, 挂载时必须照抄, 否则会用错一套游戏文件
+    ///     <c>-usebeta</c> —— 用户的分组里确实有勾 beta 的条目。
+    ///     ⚠ 光传这个没用, 真正决定跑不跑 beta 的是 <c>-datpath</c> 指向哪份 dat, 见 <c>MinionAttacher</c>。
     /// </summary>
     public bool UseBetaFiles { get; init; }
+
+    /// <summary>
+    ///     <c>-streamermode</c>
+    /// </summary>
+    public bool StreamerMode { get; init; }
+
+    /// <summary>
+    ///     <c>-setwindowtitle</c>
+    /// </summary>
+    public bool SetWindowTitle { get; init; }
+
+    /// <summary>
+    ///     启动页下拉里显示的文字。同一分组里 beta 与非 beta 两条常常**共用同一个 Keycode**,
+    ///     光显示 Keycode 根本分不出来（用户的 3/4/5/6/7 组都是这样）, 所以把 beta 标在最前面
+    ///     —— 下拉窄, 尾部会被省略号吃掉。
+    /// </summary>
+    public string DisplayText
+    {
+        get
+        {
+            var keycode = string.IsNullOrWhiteSpace(Keycode) ? "(无 Keycode)" : Keycode;
+            return UseBetaFiles ? $"[beta] {keycode}" : keycode;
+        }
+    }
 
     /// <summary>
     ///     给人看的标识 —— Accounts.json 里的条目经常没有名字
@@ -139,9 +164,11 @@ public static class MinionAccounts
                     Group        = ReadString(element, "Group"),
                     CharName     = ReadString(element, "CharName"),
                     Notes        = ReadString(element, "Notes"),
-                    ProductId    = ReadInt(element, "ProductID"),
-                    Datacenter   = ReadInt(element, "Datacenter"),
-                    UseBetaFiles = ReadBool(element, "UseBetaFFXIVFiles")
+                    ProductId      = ReadInt(element, "ProductID"),
+                    Datacenter     = ReadInt(element, "Datacenter"),
+                    UseBetaFiles   = ReadBool(element, "UseBetaFFXIVFiles"),
+                    StreamerMode   = ReadBool(element, "StreamerMode"),
+                    SetWindowTitle = ReadBool(element, "SetWindowTitle")
                 }
             );
         }
