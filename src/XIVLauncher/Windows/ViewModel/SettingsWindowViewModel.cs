@@ -104,6 +104,12 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
     public partial string MinionPassword { get; set; } = string.Empty;
 
     /// <summary>
+    ///     游戏窗口出现后等多久再挂 bot（毫秒）；两个都开时会自动排在 Dalamud 之后, 见 <c>MinionAttacher</c>
+    /// </summary>
+    [ObservableProperty]
+    public partial decimal? MinionAttachDelayMs { get; set; }
+
+    /// <summary>
     ///     「检测」按钮的结果
     /// </summary>
     [ObservableProperty]
@@ -307,6 +313,7 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
         MinionInstallPath                           = App.Settings.MinionInstallPath ?? string.Empty;
         MinionId                                    = App.Settings.MinionId          ?? string.Empty;
         MinionPassword                              = App.Settings.MinionPassword    ?? string.Empty;
+        MinionAttachDelayMs                         = App.Settings.MinionAttachDelayMS;
         MinionDetectResult                          = string.Empty;
         LaunchArgs                                  = App.Settings.AdditionalLaunchArgs ?? string.Empty;
         DpiAwarenessIndex                           = (int)App.Settings.DPIAwareness;
@@ -400,7 +407,8 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
                 settings.MinionInstallPath = string.IsNullOrEmpty(minionInstallPath) ? null : minionInstallPath;
                 settings.MinionId          = string.IsNullOrEmpty(minionId) ? null : minionId;
                 // 不做 Trim —— 密码可能就是以空白开头或结尾
-                settings.MinionPassword = string.IsNullOrEmpty(MinionPassword) ? null : MinionPassword;
+                settings.MinionPassword     = string.IsNullOrEmpty(MinionPassword) ? null : MinionPassword;
+                settings.MinionAttachDelayMS = Math.Clamp(MinionAttachDelayMs ?? 0, 0, 120_000);
             }
         );
 

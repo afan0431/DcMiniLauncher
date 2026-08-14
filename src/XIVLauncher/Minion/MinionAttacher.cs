@@ -1,6 +1,9 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using Serilog;
+using XIVLauncher.Common.Game;
+using XIVLauncher.Dalamud;
 
 namespace XIVLauncher.Minion;
 
@@ -38,6 +41,15 @@ public static class MinionAttacher
     /// <summary>MinionLauncher 要能找到游戏窗口才肯 attach, 先等窗口出来再拉它</summary>
     private static readonly TimeSpan GAME_WINDOW_TIMEOUT = TimeSpan.FromMinutes(2);
 
+    /// <summary>
+    ///     两个都开时 Minion 至少比 Dalamud 的注入延迟晚这么多 —— Dalamud 随进程创建注入(entrypoint),
+    ///     Minion 只能事后 attach, 撞在一起容易出事
+    /// </summary>
+    private const int MIN_DELAY_AFTER_DALAMUD_MS = 3000;
+
+    /// <summary>等 Dalamud.dll 出现在游戏进程里的上限</summary>
+    private static readonly TimeSpan DALAMUD_WAIT_TIMEOUT = TimeSpan.FromMinutes(1);
+
     /// <summary>MinionLauncher attach 完会自己退出; 超时视为卡住</summary>
     private static readonly TimeSpan LAUNCHER_TIMEOUT = TimeSpan.FromMinutes(3);
 
@@ -45,7 +57,15 @@ public static class MinionAttacher
     ///     按启动页选中的分组/账号, 把 MinionLauncher 挂到 <paramref name="gameProcess" /> 上。
     ///     不抛异常, 失败信息在返回值里（挂不上不该连累已经起来的游戏）。
     /// </summary>
-    public static async Task<MinionAttachResult> AttachAsync(Process gameProcess, CancellationToken cancellationToken = default)
+    /// <param name="gamePath">启动器本次用的游戏目录, 用来兜底 <c>-path</c>（Accounts.json 里的路径常常是旧机器的）</param>
+    /// <param name="dalamudInjected">本次是否真的注了 Dalamud —— 是的话要等它先落地再挂 Minion</param>
+    public static async Task<MinionAttachResult> AttachAsync
+    (
+        Process           gameProcess,
+        DirectoryInfo?    gamePath,
+        bool              dalamudInjected,
+        CancellationToken cancellationToken = default
+    )
     {
         var installPath = MinionAccounts.InstallPath;
         var launcherExe = MinionAccounts.GetLauncherExePath(installPath);
@@ -67,10 +87,36 @@ public static class MinionAttacher
         if (account == null)
             return MinionAttachResult.Failed($"Minion 分组 {App.Settings.MinionGroup ?? "(未选择)"} 下没有账号, 请在启动页重新选择分组");
 
-        if (BuildArguments(account, installPath, gameProcess.Id) is not { } arguments)
+        if (ResolveGameExePath(account, gamePath, gameProcess) is not { } gameExePath)
+            return MinionAttachResult.Failed
+            (
+                $"找不到可用的游戏 exe 给 -path 用（Accounts.json 里写的是 {account.PathToExe ?? "(空)"}, 本机不存在; " +
+                $"启动器的游戏目录 {gamePath?.FullName ?? "(未配置)"} 下也没找到）"
+            );
+
+        if (BuildArguments(account, installPath, gameExePath, gameProcess.Id) is not { } arguments)
             return MinionAttachResult.Failed(DescribeMissingFields(account));
 
         await WaitForGameWindowAsync(gameProcess, cancellationToken).ConfigureAwait(false);
+
+        if (dalamudInjected)
+            await WaitForDalamudAsync(gameProcess, cancellationToken).ConfigureAwait(false);
+
+        var delay = ResolveAttachDelay(dalamudInjected);
+
+        if (delay > TimeSpan.Zero)
+        {
+            Log.Information("[Minion] 等 {Delay:0.0}s 再挂载（Dalamud 本次{DalamudState}）", delay.TotalSeconds, dalamudInjected ? "已注入" : "未注入");
+
+            try
+            {
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return MinionAttachResult.Failed("挂载 Minion 已取消");
+            }
+        }
 
         if (gameProcess.HasExited)
             return MinionAttachResult.Failed("游戏进程已退出, 没有可挂载的目标");
@@ -94,11 +140,10 @@ public static class MinionAttacher
     ///     游戏由本启动器起并已登录, Minion 只负责 attach。
     ///     缺必需字段时返回 null。
     /// </summary>
-    private static List<string>? BuildArguments(MinionAccount account, string installPath, int gamePid)
+    private static List<string>? BuildArguments(MinionAccount account, string installPath, string gameExePath, int gamePid)
     {
         if (string.IsNullOrWhiteSpace(account.Uid)             ||
             string.IsNullOrWhiteSpace(account.Keycode)         ||
-            string.IsNullOrWhiteSpace(account.PathToExe)       ||
             string.IsNullOrWhiteSpace(App.Settings.MinionId)   ||
             string.IsNullOrWhiteSpace(App.Settings.MinionPassword))
             return null;
@@ -119,13 +164,46 @@ public static class MinionAttacher
             "-attach=true",
             $"-attachtopid={gamePid}",
 
-            // -path 必填, 缺了报 Invalid Game exe path; 给了 attachtopid 就不会拿它重开游戏
-            $"-path={account.PathToExe}",
+            // -path 必填且**文件必须真的存在**, 否则 launcher 报 Invalid Game exe path 直接退出;
+            // 给了 attachtopid 就不会拿它重开游戏, 只是校验
+            $"-path={gameExePath}",
             $"-datpath={Path.Combine(botPath, "MinionFiles", DAT_NAME_CN)}",
             $"-botpath={botPath}",
             $"-usebeta={(account.UseBetaFiles ? "1" : "0")}",
             $"-datacenter={account.Datacenter ?? 0}"
         ];
+    }
+
+    /// <summary>
+    ///     挑一个**真实存在**的 exe 给 <c>-path</c>。
+    ///     不能只信 Accounts.json 的 <c>PathToExe</c>: 那是 MINIONAPP 当初配的, 换机器/换盘后就成了死路径,
+    ///     MinionLauncher 校验不过会直接 "ERROR: Invalid Game exe path!" 退出, 根本不会 attach（2026-08-14 实测）。
+    ///     优先本次启动用的游戏目录下的官方登录器（与 MINIONAPP 的配法一致）, 再退回账号里的路径, 最后用游戏进程自己的 exe。
+    /// </summary>
+    private static string? ResolveGameExePath(MinionAccount account, DirectoryInfo? gamePath, Process gameProcess)
+    {
+        List<string?> candidates =
+        [
+            gamePath == null ? null : Path.Combine(gamePath.FullName, "sdo", "sdologin", "Launcher.exe"),
+            account.PathToExe,
+            gamePath == null ? null : Path.Combine(gamePath.FullName, "game", "ffxiv_dx11.exe"),
+            TryGetProcessExePath(gameProcess)
+        ];
+
+        return candidates.FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate) && File.Exists(candidate));
+    }
+
+    private static string? TryGetProcessExePath(Process gameProcess)
+    {
+        try
+        {
+            return gameProcess.MainModule?.FileName;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[Minion] 读取游戏进程的 exe 路径失败");
+            return null;
+        }
     }
 
     private static string DescribeMissingFields(MinionAccount account)
@@ -136,8 +214,6 @@ public static class MinionAttacher
             missing.Add("账号 UID");
         if (string.IsNullOrWhiteSpace(account.Keycode))
             missing.Add("Keycode");
-        if (string.IsNullOrWhiteSpace(account.PathToExe))
-            missing.Add("PathToExe（Accounts.json 里该账号的游戏路径）");
         if (string.IsNullOrWhiteSpace(App.Settings.MinionId))
             missing.Add("Minion 账号（设置 → Minion）");
         if (string.IsNullOrWhiteSpace(App.Settings.MinionPassword))
@@ -171,16 +247,27 @@ public static class MinionAttacher
 
         using var launcher = new Process { StartInfo = startInfo };
 
+        // MinionLauncher 出错时是打一行 "ERROR: …" 然后正常退出, 不认这行就会把失败当成功
+        var errorLines = new ConcurrentQueue<string>();
+
         launcher.OutputDataReceived += (_, args) =>
         {
-            if (args.Data != null)
-                Log.Information("[Minion] launcher: {Line}", args.Data);
+            if (args.Data == null)
+                return;
+
+            Log.Information("[Minion] launcher: {Line}", args.Data);
+
+            if (args.Data.Contains("ERROR", StringComparison.OrdinalIgnoreCase))
+                errorLines.Enqueue(args.Data.Trim());
         };
 
         launcher.ErrorDataReceived += (_, args) =>
         {
-            if (args.Data != null)
-                Log.Warning("[Minion] launcher(stderr): {Line}", args.Data);
+            if (args.Data == null)
+                return;
+
+            Log.Warning("[Minion] launcher(stderr): {Line}", args.Data);
+            errorLines.Enqueue(args.Data.Trim());
         };
 
         try
@@ -213,11 +300,85 @@ public static class MinionAttacher
                        : MinionAttachResult.Failed($"MinionLauncher 超过 {LAUNCHER_TIMEOUT.TotalMinutes:0} 分钟没有退出, 已结束该进程");
         }
 
-        // ⚠ 退出码不当判据: MinionLauncher 正常收尾时打的是 "Exiting Launcher, returning PID = <游戏PID>",
-        //    退出码到底是 0 还是那个 PID 没有实测过, 拿它判成败会误报。
-        Log.Information("[Minion] MinionLauncher 已退出 (ExitCode={ExitCode}); bot 是否真的在跑以游戏内 overlay / 新 bot 日志为准", launcher.ExitCode);
+        var exitCode = launcher.ExitCode;
+        Log.Information("[Minion] MinionLauncher 已退出 (ExitCode={ExitCode})", exitCode);
+
+        if (!errorLines.IsEmpty)
+            return MinionAttachResult.Failed($"MinionLauncher 报错: {string.Join(" / ", errorLines)}");
+
+        // 正常收尾打的是 "Exiting Launcher, returning PID = <游戏PID>" —— 退出码可能就是那个 PID,
+        // 所以只有负数才判失败（实测参数错误时是 -106）, 正数不当失败看。
+        if (exitCode < 0)
+            return MinionAttachResult.Failed($"MinionLauncher 异常退出 (ExitCode={exitCode}), 详见日志");
+
+        Log.Information("[Minion] launcher 侧没有报错; bot 是否真的在跑以游戏内 overlay / 新 bot 日志为准");
 
         return MinionAttachResult.Succeeded();
+    }
+
+    /// <summary>
+    ///     挂载等多久 —— 与 Dalamud 用同一套「毫秒延迟」的配法。
+    ///     两个都开时强制排在 Dalamud 之后: 取「设置里的挂载延迟」和「Dalamud 注入延迟 + 间隔」的较大者。
+    /// </summary>
+    private static TimeSpan ResolveAttachDelay(bool dalamudInjected)
+    {
+        var configured = (int)Math.Clamp(App.Settings.MinionAttachDelayMS, 0, 120_000);
+
+        if (!dalamudInjected)
+            return TimeSpan.FromMilliseconds(configured);
+
+        var dalamudDelay = (int)Math.Clamp(App.Settings.DalamudInjectionDelayMS, 0, DalamudLaunchOptions.MAX_DELAY_INITIALIZE_MS);
+        var afterDalamud = dalamudDelay + MIN_DELAY_AFTER_DALAMUD_MS;
+
+        if (afterDalamud > configured)
+            Log.Information("[Minion] 挂载延迟按 Dalamud 顺延: {Configured}ms → {Effective}ms", configured, afterDalamud);
+
+        return TimeSpan.FromMilliseconds(Math.Max(configured, afterDalamud));
+    }
+
+    /// <summary>
+    ///     等 Dalamud.dll 真的出现在游戏进程里 —— 「Minion 要比 Dalamud 晚」靠这个信号保证, 而不是靠掐表。
+    ///     等不到也照常往下走（Dalamud 自己会报错, 不该因此不挂 Minion）。
+    /// </summary>
+    private static async Task WaitForDalamudAsync(Process gameProcess, CancellationToken cancellationToken)
+    {
+        var stopwatch = Stopwatch.StartNew();
+
+        while (stopwatch.Elapsed < DALAMUD_WAIT_TIMEOUT)
+        {
+            if (gameProcess.HasExited)
+                return;
+
+            if (IsDalamudLoaded(gameProcess))
+            {
+                Log.Information("[Minion] 已检测到 Dalamud 注入完成, 用时 {Elapsed:0.0}s", stopwatch.Elapsed.TotalSeconds);
+                return;
+            }
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+
+        Log.Warning("[Minion] 等了 {Timeout:0} 分钟没见到 Dalamud.dll, 仍然按计划挂载", DALAMUD_WAIT_TIMEOUT.TotalMinutes);
+    }
+
+    private static bool IsDalamudLoaded(Process gameProcess)
+    {
+        try
+        {
+            return FFXIVProcess.IsDalamudInjected(gameProcess);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[Minion] 检查 Dalamud 是否注入失败");
+            return false;
+        }
     }
 
     /// <summary>

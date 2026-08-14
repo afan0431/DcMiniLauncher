@@ -260,6 +260,17 @@ public sealed class LauncherSettingsV3 : IAccountSettingsStore
     }
 
     /// <summary>
+    ///     游戏窗口出现后, 等多久再挂 MinionLauncher（毫秒）。
+    ///     Dalamud 是随进程创建注入的（entrypoint），Minion 只能事后 attach，两个都开时必须排在 Dalamud 之后，
+    ///     故实际等待还会取 <see cref="DalamudInjectionDelayMS" /> + 一段间隔的较大者，见 <c>MinionAttacher</c>。
+    /// </summary>
+    public decimal MinionAttachDelayMS
+    {
+        get;
+        set => Set(ref field, value);
+    } = 5000;
+
+    /// <summary>
     ///     Minion 安装目录，空则用 <see cref="Minion.MinionAccounts.DEFAULT_INSTALL_PATH" />（配置一次）
     /// </summary>
     public string? MinionInstallPath

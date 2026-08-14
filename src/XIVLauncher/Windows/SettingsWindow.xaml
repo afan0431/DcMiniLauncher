@@ -711,6 +711,26 @@
                             </StackPanel>
                         </materialDesign:Card>
 
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="挂载时机" />
+                        <materialDesign:Card Style="{StaticResource SettingCardStyle}">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="260" />
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Margin="0,0,24,0">
+                                    <TextBlock Style="{StaticResource SettingTitleStyle}" Text="挂载延迟" />
+                                    <TextBlock Style="{StaticResource SettingDescriptionStyle}" TextWrapping="Wrap"
+                                               Text="游戏窗口出现后等多久再挂 bot。Dalamud 是随进程创建注入的, Minion 只能事后 attach; 两个都开时会自动等 Dalamud 注入完成、并至少比 Dalamud 注入延迟晚 3 秒" />
+                                </StackPanel>
+                                <TextBox Grid.Column="1" VerticalAlignment="Center"
+                                         HorizontalContentAlignment="Right" Text="{Binding MinionAttachDelayMs}"
+                                         materialDesign:HintAssist.Hint="毫秒"
+                                         materialDesign:HintAssist.IsFloating="True"
+                                         Style="{StaticResource ThemeTextBoxStyle}" />
+                            </Grid>
+                        </materialDesign:Card>
+
                         <TextBlock Style="{StaticResource SectionTitleStyle}" Text="账号" />
                         <materialDesign:Card Style="{StaticResource SettingCardStyle}">
                             <StackPanel>

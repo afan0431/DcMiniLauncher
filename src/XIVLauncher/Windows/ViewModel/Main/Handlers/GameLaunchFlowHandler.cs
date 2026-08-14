@@ -153,7 +153,7 @@ internal sealed class GameLaunchFlowHandler
         }
 
         if (gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion))
-            await AttachMinionAsync(launched).ConfigureAwait(false);
+            await AttachMinionAsync(launched, gamePath, dalamudOk).ConfigureAwait(false);
 
         Log.Debug("等待游戏进程退出");
 
@@ -199,11 +199,17 @@ internal sealed class GameLaunchFlowHandler
     ///     起完游戏后把 MinionLauncher 挂到游戏进程上（F3）。挂不上只提示, 不影响已经在跑的游戏。
     ///     ⚠ 判据纪律: launcher 自报 "Attaching Successfull" 不算数, bot 有没有真跑看游戏内 overlay / 新 bot 日志。
     /// </summary>
-    private async Task AttachMinionAsync(FFXIVProcess launched)
+    private async Task AttachMinionAsync(FFXIVProcess launched, DirectoryInfo gamePath, bool dalamudInjected)
     {
         try
         {
-            var result = await MinionAttacher.AttachAsync(launched.UnderlyingProcess, vm.LoginFlow.LoginCancellationToken).ConfigureAwait(false);
+            var result = await MinionAttacher.AttachAsync
+                               (
+                                   launched.UnderlyingProcess,
+                                   gamePath,
+                                   dalamudInjected,
+                                   vm.LoginFlow.LoginCancellationToken
+                               ).ConfigureAwait(false);
 
             if (result.Ok)
                 return;
