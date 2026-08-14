@@ -21,6 +21,21 @@ public sealed record MinionAccount
     public string? Notes { get; init; }
 
     /// <summary>
+    ///     <c>-productid</c>, 国服是 8
+    /// </summary>
+    public int? ProductId { get; init; }
+
+    /// <summary>
+    ///     <c>-datacenter</c>, Accounts.json 里都是 0
+    /// </summary>
+    public int? Datacenter { get; init; }
+
+    /// <summary>
+    ///     <c>-usebeta</c> —— 用户的分组里确实有标着 beta 的条目, 挂载时必须照抄, 否则会用错一套游戏文件
+    /// </summary>
+    public bool UseBetaFiles { get; init; }
+
+    /// <summary>
     ///     给人看的标识 —— Accounts.json 里的条目经常没有名字
     /// </summary>
     public string Label
@@ -118,12 +133,15 @@ public static class MinionAccounts
             (
                 new MinionAccount
                 {
-                    Uid       = ReadString(element, "UID"),
-                    Keycode   = ReadString(element, "Keycode"),
-                    PathToExe = ReadString(element, "PathToExe"),
-                    Group     = ReadString(element, "Group"),
-                    CharName  = ReadString(element, "CharName"),
-                    Notes     = ReadString(element, "Notes")
+                    Uid          = ReadString(element, "UID"),
+                    Keycode      = ReadString(element, "Keycode"),
+                    PathToExe    = ReadString(element, "PathToExe"),
+                    Group        = ReadString(element, "Group"),
+                    CharName     = ReadString(element, "CharName"),
+                    Notes        = ReadString(element, "Notes"),
+                    ProductId    = ReadInt(element, "ProductID"),
+                    Datacenter   = ReadInt(element, "Datacenter"),
+                    UseBetaFiles = ReadBool(element, "UseBetaFFXIVFiles")
                 }
             );
         }
@@ -168,6 +186,20 @@ public static class MinionAccounts
         }
     }
 
+    /// <summary>
+    ///     按启动页选中的分组与账号 UID 取账号 —— 挂 Minion（F3）时用。
+    ///     UID 对不上（Accounts.json 改过）就退回该分组的第一个账号, 免得配置一变就挂不上。
+    /// </summary>
+    public static MinionAccount? FindAccount(string? group, string? uid, string? installPath = null)
+    {
+        var accountsInGroup = LoadAccounts(installPath)
+                              .Where(account => string.Equals(account.Group?.Trim(), group?.Trim(), StringComparison.OrdinalIgnoreCase))
+                              .ToList();
+
+        return accountsInGroup.FirstOrDefault(account => string.Equals(account.Uid, uid, StringComparison.OrdinalIgnoreCase))
+               ?? accountsInGroup.FirstOrDefault();
+    }
+
     private static string? ReadString(JsonElement element, string propertyName)
     {
         if (!element.TryGetProperty(propertyName, out var value))
@@ -179,6 +211,33 @@ public static class MinionAccounts
             // Group 目前是字符串, 但容忍 Minion 写成数字
             JsonValueKind.Number => value.ToString(),
             _                    => null
+        };
+    }
+
+    private static int? ReadInt(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var value))
+            return null;
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.Number when value.TryGetInt32(out var number)              => number,
+            JsonValueKind.String when int.TryParse(value.GetString(), out var parsed) => parsed,
+            _                                                                        => null
+        };
+    }
+
+    private static bool ReadBool(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var value))
+            return false;
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.True   => true,
+            JsonValueKind.Number => value.TryGetInt32(out var number) && number != 0,
+            JsonValueKind.String => bool.TryParse(value.GetString(), out var parsed) && parsed,
+            _                    => false
         };
     }
 }

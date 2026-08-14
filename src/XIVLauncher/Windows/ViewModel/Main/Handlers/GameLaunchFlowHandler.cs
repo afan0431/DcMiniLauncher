@@ -18,6 +18,7 @@ using XIVLauncher.Login;
 using XIVLauncher.Login.Channels;
 using XIVLauncher.Login.Client;
 using XIVLauncher.Login.Models;
+using XIVLauncher.Minion;
 using XIVLauncher.Support;
 using XIVLauncher.Windows.GameClientFiles;
 using XIVLauncher.Windows.ViewModel.Main.Services;
@@ -151,6 +152,9 @@ internal sealed class GameLaunchFlowHandler
             gameLaunchService.StopCompanionApps(launched.ProcessID, companionAppManager);
         }
 
+        if (gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion))
+            await AttachMinionAsync(launched).ConfigureAwait(false);
+
         Log.Debug("等待游戏进程退出");
 
         try
@@ -189,6 +193,40 @@ internal sealed class GameLaunchFlowHandler
         Log.Verbose("游戏进程已退出");
 
         return launched;
+    }
+
+    /// <summary>
+    ///     起完游戏后把 MinionLauncher 挂到游戏进程上（F3）。挂不上只提示, 不影响已经在跑的游戏。
+    ///     ⚠ 判据纪律: launcher 自报 "Attaching Successfull" 不算数, bot 有没有真跑看游戏内 overlay / 新 bot 日志。
+    /// </summary>
+    private async Task AttachMinionAsync(FFXIVProcess launched)
+    {
+        try
+        {
+            var result = await MinionAttacher.AttachAsync(launched.UnderlyingProcess, vm.LoginFlow.LoginCancellationToken).ConfigureAwait(false);
+
+            if (result.Ok)
+                return;
+
+            Log.Error("[Minion] 挂载失败: {Error}", result.Error);
+
+            CustomMessageBox.Builder
+                            .NewFrom($"挂载 Minion 失败\n\n{result.Error}")
+                            .WithImage(MessageBoxImage.Warning)
+                            .WithAppendText("\n\n游戏已经启动, 可在补齐配置后手动挂载")
+                            .WithParentWindow(vm.Window)
+                            .Show();
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[Minion] 挂载时发生未处理异常");
+
+            CustomMessageBox.Builder
+                            .NewFrom(ex, "Minion")
+                            .WithAppendText("\n\n挂载 Minion 时发生错误, 游戏已经启动, 不受影响")
+                            .WithParentWindow(vm.Window)
+                            .Show();
+        }
     }
 
     /// <summary>
