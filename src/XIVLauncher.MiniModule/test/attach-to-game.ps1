@@ -22,7 +22,10 @@ param(
     [switch]$Reload,
     # 停在标题菜单时跑: RELEASE(作废大厅上下文) → LOGIN(点开始游戏), 主机名和 SID 都不动,
     # 于是等价于「用全新连接登录同一个大区」—— 真实换服流程去掉换服那两步的版本。
-    [switch]$LoginTest
+    [switch]$LoginTest,
+    # 从「已连上大厅」的状态（角色选择页 / 游戏内）跑: RETURNTITLE → 等标题 → RELEASE,
+    # 核对 LobbyUIClient.Context 真的从非零被清成 0 —— 这是 P3 结论里最关键的一步。
+    [switch]$ReturnTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -287,6 +290,62 @@ try
         Write-Host "  ADDONS → $addons"
 
         Write-Host "  KEEPALIVE OFF → $(Send-ModuleCommand -Pipe $pipe -Command 'KEEPALIVE OFF')"
+        Write-Host ''
+    }
+
+    if ($ReturnTest)
+    {
+        Write-Host '--- RETURNTITLE + RELEASE 自检 (会把你踢回标题) ---' -ForegroundColor Cyan
+
+        $before = Send-ModuleCommand -Pipe $pipe -Command 'PROBE'
+        $ctxBefore = if ($before -match 'ctx=(\S+)') { $Matches[1] } else { '?' }
+        Write-Host "  调用前: ctx=$ctxBefore"
+
+        if ($ctxBefore -match '^0x0+$')
+        {
+            Write-Host '  [注意] ctx 本来就是 0, 这轮验不到「清掉活的上下文」' -ForegroundColor Yellow
+        }
+
+        # 保活先开, 免得回到标题后闲置飘进片头动画
+        $null = Send-ModuleCommand -Pipe $pipe -Command 'KEEPALIVE ON'
+        Write-Host "  RETURNTITLE → $(Send-ModuleCommand -Pipe $pipe -Command 'RETURNTITLE')"
+
+        $deadline = (Get-Date).AddSeconds(120)
+        $ready    = $false
+
+        while ((Get-Date) -lt $deadline)
+        {
+            Start-Sleep -Seconds 2
+            $response = Send-ModuleCommand -Pipe $pipe -Command 'TITLEREADY'
+
+            if ($response -match 'ready=1') { $ready = $true; break }
+        }
+
+        if ($ready) { Write-Host '  [OK] 已经回到标题菜单' -ForegroundColor Green }
+        else { Write-Host '  [!!] 120 秒内没回到标题菜单' -ForegroundColor Red }
+
+        $mid = Send-ModuleCommand -Pipe $pipe -Command 'PROBE'
+        if ($mid -match 'ctx=(\S+) state=(\d+)') { Write-Host "  回到标题后: ctx=$($Matches[1]) state=$($Matches[2])" }
+
+        Write-Host "  RELEASE → $(Send-ModuleCommand -Pipe $pipe -Command 'RELEASE')"
+
+        $after = Send-ModuleCommand -Pipe $pipe -Command 'PROBE'
+        if ($after -match 'ctx=(\S+) state=(\d+)')
+        {
+            # ⚠ 先把捕获组存下来: 下面再用一次 -match 会把 $Matches 整个换掉（PS 经典坑）
+            $ctxAfter   = $Matches[1]
+            $stateAfter = $Matches[2]
+
+            Write-Host "  RELEASE 后: ctx=$ctxAfter state=$stateAfter"
+
+            if (($ctxAfter -match '^0x0+$') -and $stateAfter -eq '0')
+            {
+                Write-Host '  [OK] 大厅上下文已被作废 (Context/State 归零)' -ForegroundColor Green
+            }
+            else { Write-Host '  [!!] Context/State 没归零' -ForegroundColor Red }
+        }
+
+        $null = Send-ModuleCommand -Pipe $pipe -Command 'KEEPALIVE OFF'
         Write-Host ''
     }
 
