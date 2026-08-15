@@ -320,8 +320,13 @@ namespace
     using GetComponentButtonFn = void* (*)(void* addon, unsigned int nodeId);
     using ReceiveEventFn       = void  (*)(void* addon, int eventType, int eventParam, void* atkEvent, void* eventData);
 
-    uintptr_t g_getAddonByName    = 0;
-    uintptr_t g_getComponentButton = 0;
+    uintptr_t g_getAddonByName      = 0;
+    uintptr_t g_getComponentButton  = 0;
+    uintptr_t g_processChatBoxEntry = 0;
+    uintptr_t g_utf8Ctor            = 0;
+    uintptr_t g_utf8Dtor            = 0;
+    uintptr_t g_fireCallbackInt     = 0;
+    uintptr_t g_handleLogout        = 0;
 
     struct Pointers
     {
@@ -579,6 +584,82 @@ namespace
         }
     }
 
+    // ---- 游戏内登出 --------------------------------------------------------
+    // returnToTitle 在世界里调必崩, 所以这里走游戏自己的路: 发 /logout 文本命令,
+    // 确认那个 Yes/No, 然后等游戏倒数完自己回到角色选择界面。
+    using ProcessChatBoxEntryFn = void (*)(void* uiModule, void* message, void* a3, bool saveToHistory);
+    using Utf8CtorFn            = void* (*)(void* self);
+    using Utf8DtorFn            = void  (*)(void* self);
+    using FireCallbackIntFn     = bool  (*)(void* addon, int value);
+
+    int OpSendLogoutCommand(const Pointers* p)
+    {
+        __try
+        {
+            if (OpWhere(p) != 0)
+                return 0; // 不在世界里, 不用登出
+
+            // Utf8String 放栈上: "/logout" 只有 7 字节, 走的是它自带的内联缓冲, 不会另外分配堆内存
+            unsigned char message[offsets::UTF8_STRING_SIZE]{};
+
+            reinterpret_cast<Utf8CtorFn>(g_utf8Ctor)(message);
+            reinterpret_cast<SetStringFn>(g_setString)(message, "/logout");
+            reinterpret_cast<ProcessChatBoxEntryFn>(g_processChatBoxEntry)(p->uiModule, message, nullptr, false);
+            reinterpret_cast<Utf8DtorFn>(g_utf8Dtor)(message);
+
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] 发送 /logout 异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+
+    // 更底层的一条: 直接调游戏自己的登出处理函数, 不发文本命令也不弹确认框
+    using HandleLogoutFn = void (*)(void* agentLobby, bool isExiting, unsigned char countdown);
+
+    int OpDirectLogout(const Pointers* p)
+    {
+        __try
+        {
+            if (OpWhere(p) != 0)
+                return 0; // 不在世界里, 不用登出
+
+            // isExiting=false: 登出到角色选择, 而不是退出游戏
+            reinterpret_cast<HandleLogoutFn>(g_handleLogout)(p->agentLobby, false, 0);
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] HandleLogout 异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+
+    // 确认登出对话框。FireCallbackInt(0) = 「是」, 比按节点 id 找按钮稳
+    int OpConfirmYesNo(const Pointers* p)
+    {
+        __try
+        {
+            if (p->unitManager == nullptr)
+                return -1;
+
+            const auto addon = reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(p->unitManager, "SelectYesno", 1);
+
+            if (addon == nullptr)
+                return 0; // 对话框还没出来
+
+            reinterpret_cast<FireCallbackIntFn>(g_fireCallbackInt)(addon, offsets::SELECT_YESNO_YES);
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] 确认对话框异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+
     // 轮询期保活: 标题界面闲置久了会飘进片头动画（IdleTime 涨到两万上下就触发), DCTraveler 每帧把
     // IdleTime 归零, 我们按 500ms 一次。
     //
@@ -712,6 +793,71 @@ std::string GameReturnToTitle()
         return "FAIL not-at-charaselect";
 
     return "FAIL exception";
+}
+
+// 游戏内登出到角色选择界面。三步:
+//   1. 发 /logout —— 走游戏自己的登出流程, 而不是硬调 returnToTitle（那个在世界里必崩)
+//   2. 确认弹出来的 Yes/No
+//   3. 等游戏倒数完、真的到了角色选择界面
+std::string GameLogout(bool direct)
+{
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareCall(state, failure))
+        return failure;
+
+    {
+        auto captured = state;
+        auto step     = direct
+                            ? std::function<void()>([captured] { captured->result = OpDirectLogout(&captured->pointers); })
+                            : std::function<void()>([captured] { captured->result = OpSendLogoutCommand(&captured->pointers); });
+
+        if (!MainThreadRun(step, 5000))
+            return "FAIL mainthread-timeout";
+    }
+
+    if (state->result < 0)
+        return "FAIL exception";
+
+    if (state->result == 0)
+        return "OK already-out"; // 本来就不在世界里
+
+    LogF("[game] 已发起登出 (%s)", direct ? "HandleLogout 直调" : "/logout 文本命令");
+
+    // 直调那条不弹确认框, 只有文本命令那条要确认
+    bool confirmed = direct;
+
+    for (int i = 0; i < 60 && !confirmed; ++i)
+    {
+        auto step = std::make_shared<CallState>();
+        step->pointers = state->pointers;
+
+        if (MainThreadRun([step] { step->result = OpConfirmYesNo(&step->pointers); }, 3000) && step->result == 1)
+            confirmed = true;
+        else
+            Sleep(250);
+    }
+
+    if (!confirmed)
+        LogF("[game] ⚠ 没等到登出确认框（可能这个客户端不弹确认, 继续等界面变化)");
+
+    // 游戏登出有几秒倒数, 给 60 秒
+    for (int i = 0; i < 120; ++i)
+    {
+        auto step = std::make_shared<CallState>();
+        step->pointers = state->pointers;
+
+        if (MainThreadRun([step] { step->result = OpWhere(&step->pointers); }, 3000))
+        {
+            if (step->result == 2) { LogF("[game] LOGOUT 完成: 已到角色选择界面"); return "OK where=charaselect"; }
+            if (step->result == 1) { LogF("[game] LOGOUT 完成: 已到标题界面");     return "OK where=title"; }
+        }
+
+        Sleep(500);
+    }
+
+    return "FAIL logout-timeout";
 }
 
 std::string GameWhere()
@@ -956,6 +1102,11 @@ bool GameResolve()
     g_setString           = ScanText(offsets::UTF8_SET_STRING_SIG);
     g_getAddonByName      = ScanText(offsets::GET_ADDON_BY_NAME_SIG);
     g_getComponentButton  = ScanText(offsets::GET_COMPONENT_BUTTON_SIG);
+    g_processChatBoxEntry = ScanText(offsets::PROCESS_CHATBOX_ENTRY_SIG);
+    g_utf8Ctor            = ScanText(offsets::UTF8_CTOR_SIG);
+    g_utf8Dtor            = ScanText(offsets::UTF8_DTOR_SIG);
+    g_fireCallbackInt     = ScanText(offsets::FIRE_CALLBACK_INT_SIG);
+    g_handleLogout        = ScanText(offsets::AGENT_LOBBY_HANDLE_LOGOUT_SIG);
 
     LogF("[game] 模块基址=0x%p .text 解析结果:", reinterpret_cast<void*>(base));
     LogF("[game]   Framework 静态指针      RVA=0x%llX", static_cast<unsigned long long>(g_frameworkStatic     ? g_frameworkStatic     - base : 0));
@@ -965,9 +1116,16 @@ bool GameResolve()
     LogF("[game]   GetAddonByName          RVA=0x%llX", static_cast<unsigned long long>(g_getAddonByName      ? g_getAddonByName      - base : 0));
     LogF("[game]   GetComponentButtonById  RVA=0x%llX", static_cast<unsigned long long>(g_getComponentButton  ? g_getComponentButton  - base : 0));
     LogF("[game]   AtkStage 静态指针       RVA=0x%llX", static_cast<unsigned long long>(g_atkStageStatic      ? g_atkStageStatic      - base : 0));
+    LogF("[game]   ProcessChatBoxEntry     RVA=0x%llX", static_cast<unsigned long long>(g_processChatBoxEntry ? g_processChatBoxEntry - base : 0));
+    LogF("[game]   Utf8String::Ctor/Dtor   RVA=0x%llX / 0x%llX",
+         static_cast<unsigned long long>(g_utf8Ctor ? g_utf8Ctor - base : 0),
+         static_cast<unsigned long long>(g_utf8Dtor ? g_utf8Dtor - base : 0));
+    LogF("[game]   FireCallbackInt         RVA=0x%llX", static_cast<unsigned long long>(g_fireCallbackInt     ? g_fireCallbackInt     - base : 0));
+    LogF("[game]   AgentLobby::HandleLogout RVA=0x%llX", static_cast<unsigned long long>(g_handleLogout       ? g_handleLogout        - base : 0));
 
     g_resolved = g_frameworkStatic != 0 && g_returnToTitle != 0 && g_releaseLobbyContext != 0 && g_setString != 0 &&
-                 g_getAddonByName != 0 && g_getComponentButton != 0 && g_atkStageStatic != 0;
+                 g_getAddonByName != 0 && g_getComponentButton != 0 && g_atkStageStatic != 0 &&
+                 g_processChatBoxEntry != 0 && g_utf8Ctor != 0 && g_utf8Dtor != 0 && g_fireCallbackInt != 0;
 
     if (!g_resolved)
         LogF("[game] 有特征码没命中 —— 游戏版本变了或偏移库过期");

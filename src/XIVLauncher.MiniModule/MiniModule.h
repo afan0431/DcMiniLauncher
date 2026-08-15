@@ -51,7 +51,10 @@ std::string GameDump();    // 只读诊断: 摊开 Utf8String 头部 + 在 Netwo
 //   返回标题 → (等到标题界面) → 改主机名 → 作废大厅上下文 → 写新 SID → 点登录
 // ⚠ 只在角色选择/标题界面才会真的执行 —— 在世界里调 returnToTitle 实测必崩（见 game.cpp 注释）
 std::string GameReturnToTitle();
-std::string GameWhere(); // charaselect / title / ingame
+std::string GameWhere();  // charaselect / title / ingame
+// 游戏内登出到角色选择界面。direct=false 走 /logout 文本命令 + 确认框（等同玩家操作, 最保守);
+// direct=true 直接调 AgentLobby::HandleLogout（更底层, 不弹确认框)
+std::string GameLogout(bool direct);
 std::string GameSetHosts(const std::string& lobbyHost, const std::string& saveDataHost, const std::string& gmHost);
 std::string GameReleaseLobbyContext();
 std::string GameSetSid(const std::string& sid);

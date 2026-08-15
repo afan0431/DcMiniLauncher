@@ -106,6 +106,12 @@ namespace
         if (command == "WHERE")
             return GameWhere();
 
+        if (command == "LOGOUT")
+            return GameLogout(false); // /logout 文本命令 + 确认框
+
+        if (command == "LOGOUT DIRECT")
+            return GameLogout(true);  // 直接调 AgentLobby::HandleLogout
+
         if (command == "RETURNTITLE")
             return GameReturnToTitle();
 

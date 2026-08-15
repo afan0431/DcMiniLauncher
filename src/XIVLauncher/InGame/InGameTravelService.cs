@@ -37,6 +37,13 @@ public sealed class InGameTravelService(DCTravelClient client)
 
     private const int PIPE_CONNECT_TIMEOUT_MS = 10_000;
 
+    /// <summary>
+    ///     角色在世界里时用哪种方式登出。<c>LOGOUT</c> = 发 <c>/logout</c> 文本命令再确认对话框
+    ///     （等同玩家自己操作, 最保守）；<c>LOGOUT DIRECT</c> = 直接调 <c>AgentLobby::HandleLogout</c>
+    ///     （更底层, 不弹确认框）。两条都实现了, 改这一行就能换。
+    /// </summary>
+    private const string LOGOUT_COMMAND = "LOGOUT";
+
     /// <summary>状态查询连续失败这么多次就放弃（和启动器外部传送那套一致）</summary>
     private const int MAX_CONSECUTIVE_FAILURES = 3;
 
@@ -82,7 +89,17 @@ public sealed class InGameTravelService(DCTravelClient client)
             var where = await module.SendAsync("WHERE", cancellationToken).ConfigureAwait(false);
 
             if (where.Contains("where=ingame", StringComparison.Ordinal))
-                return InGameTravelResult.Failed("角色还在游戏内。请先登出到角色选择界面再换大区（在世界里强行返回标题会让客户端崩溃）");
+            {
+                // 角色还在世界里: 走游戏自己的登出流程回到角色选择界面, 再往下走。
+                // 绝不能在这里直接 RETURNTITLE —— 那个在世界里调必崩。
+                Report(progress, "角色在游戏内, 正在登出…");
+                await CommandAsync(module, LOGOUT_COMMAND, cancellationToken).ConfigureAwait(false);
+
+                where = await module.SendAsync("WHERE", cancellationToken).ConfigureAwait(false);
+
+                if (where.Contains("where=ingame", StringComparison.Ordinal))
+                    return InGameTravelResult.Failed("登出没成功, 角色仍在游戏内");
+            }
 
             if (!where.Contains("where=title", StringComparison.Ordinal))
             {

@@ -100,4 +100,23 @@ namespace offsets
 
     // AtkUnitBase::GetComponentButtonById —— Component/GUI/AtkUnitBase.cs:198
     inline constexpr const char* GET_COMPONENT_BUTTON_SIG   = "E8 ?? ?? ?? ?? 8D 3C 36";
+
+    // ---- 游戏内登出用 ------------------------------------------------------
+    // 角色还在世界里时不能调 returnToTitle（实测必崩), 得走游戏自己的登出流程:
+    // 发文本命令 /logout → 确认 Yes/No → 游戏倒数几秒后回到角色选择界面。
+    //
+    // UIModule::ProcessChatBoxEntry —— Client/UI/UIModule.cs:125
+    inline constexpr const char* PROCESS_CHATBOX_ENTRY_SIG  = "48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC 20 48 8B F2 48 8B F9 45 84 C9";
+    // Utf8String::Ctor / Dtor —— Client/System/String/Utf8String.cs:104,110
+    inline constexpr const char* UTF8_CTOR_SIG              = "E8 ?? ?? ?? ?? F7 C3";
+    inline constexpr const char* UTF8_DTOR_SIG              = "E8 ?? ?? ?? ?? C7 44 F5";
+    // AtkUnitBase::FireCallbackInt —— Component/GUI/AtkUnitBase.cs:214, 用它点 SelectYesno 的「是」
+    inline constexpr const char* FIRE_CALLBACK_INT_SIG      = "E9 ?? ?? ?? ?? 83 C3 F9";
+
+    inline constexpr int SELECT_YESNO_YES = 0; // FireCallbackInt(0) = 是
+
+    // 更底层的一条: AgentLobby::HandleLogout(bool isExiting, byte a3) —— Client/UI/Agent/AgentLobby.cs:102
+    // 这就是游戏自己在登出时调的处理函数, 不经聊天框、不弹确认框。
+    // isExiting=false 表示登出到角色选择（true 是直接退出游戏), a3 是大厅那边按帧算的倒数。
+    inline constexpr const char* AGENT_LOBBY_HANDLE_LOGOUT_SIG = "40 56 41 56 41 57 48 83 EC 40 80 B9";
 }
