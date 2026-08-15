@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -37,6 +38,13 @@ internal static class MinionAppStatusReporter
     /// <summary>GameStatus.GSRUNNING</summary>
     private const byte STATUS_RUNNING = 5;
 
+    /// <summary>
+    ///     GameStatus.GSNONE —— 它的状态机对这个状态直接 return（既不排队也不重启），
+    ///     正是「这一行没在跑」该有的样子。
+    ///     ⚠ 不要用 GSSTOPPING_ACCOUNT(-6)：那条分支会去 KillProcess + 杀 MinionLauncher_64 与 sdologin。
+    /// </summary>
+    private const byte STATUS_NONE = 0;
+
     /// <summary>MinionReceiveFilter 固定的包体长度</summary>
     private const int PACKET_LENGTH = 40;
 
@@ -58,17 +66,23 @@ internal static class MinionAppStatusReporter
     }
 
     /// <summary>
+    ///     本次启动我们替哪个账号报过状态 —— 游戏退出时要按同一个账号报「停机」
+    /// </summary>
+    private static readonly ConcurrentDictionary<int, MinionAccount> ReportedAccounts = [];
+
+    /// <summary>
     ///     报一次「运行中」。UDP 不保证送达, 所以隔一会儿补一次（种时间戳是幂等的, 多发无害）。
     /// </summary>
     public static async Task SeedRunningStatusAsync(MinionAccount account, Process gameProcess, CancellationToken cancellationToken)
     {
-        if (BuildPacket(account, (uint)gameProcess.Id) is not { } packet)
+        if (BuildPacket(account, (uint)gameProcess.Id, STATUS_RUNNING) is not { } packet)
         {
             Log.Warning("[Minion] 账号 UID 不是 32 位十六进制({Uid}), 无法给 MINIONAPP 报状态", account.Uid);
             return;
         }
 
-        Send(packet, account, gameProcess.Id);
+        ReportedAccounts[gameProcess.Id] = account;
+        Send(packet, account, gameProcess.Id, "运行中");
 
         try
         {
@@ -82,10 +96,29 @@ internal static class MinionAppStatusReporter
         if (gameProcess.HasExited)
             return;
 
-        Send(packet, account, gameProcess.Id);
+        Send(packet, account, gameProcess.Id, "运行中");
     }
 
-    private static void Send(byte[] packet, MinionAccount account, int gamePid)
+    /// <summary>
+    ///     游戏退出后报「停机」—— 不报的话 MINIONAPP 会把这一行转成「排队开始」并过一分钟自己拉新实例。
+    ///     只对本启动器报过状态的进程做, 不碰 MINIONAPP 自己管的会话。
+    /// </summary>
+    public static void ReportStopped(int gamePid)
+    {
+        if (!ReportedAccounts.TryRemove(gamePid, out var account))
+            return;
+
+        if (!IsMinionAppRunning())
+            return;
+
+        // PID 报 0 = 这一行没有对应进程
+        if (BuildPacket(account, 0, STATUS_NONE) is not { } packet)
+            return;
+
+        Send(packet, account, gamePid, "停机");
+    }
+
+    private static void Send(byte[] packet, MinionAccount account, int gamePid, string what)
     {
         try
         {
@@ -94,7 +127,8 @@ internal static class MinionAppStatusReporter
 
             Log.Information
             (
-                "[Minion] 已按 MINIONAPP 协议报「运行中」: 账号={Account}, PID={GamePid} → 127.0.0.1:{Port}（避免它把本客户端判成卡死杀掉）",
+                "[Minion] 已按 MINIONAPP 协议报「{What}」: 账号={Account}, PID={GamePid} → 127.0.0.1:{Port}",
+                what,
                 account.Label,
                 gamePid,
                 UDP_PORT
@@ -102,7 +136,7 @@ internal static class MinionAppStatusReporter
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "[Minion] 给 MINIONAPP 报状态失败, 客户端可能会被它当成卡死杀掉");
+            Log.Warning(ex, "[Minion] 给 MINIONAPP 报「{What}」失败", what);
         }
     }
 
@@ -111,7 +145,7 @@ internal static class MinionAppStatusReporter
     ///     —— 见 MINIONAPP.Core.Networking 的 MinionPackage.GetStatusMessage / MinionReceiveFilter。
     ///     KeyMd5 那 16 字节 MINIONAPP 收下但从不校验, 这里仍按 bot 的样子填 Keycode 的 MD5。
     /// </summary>
-    private static byte[]? BuildPacket(MinionAccount account, uint gamePid)
+    private static byte[]? BuildPacket(MinionAccount account, uint gamePid, byte status)
     {
         if (ParseUid(account.Uid) is not { } uid)
             return null;
@@ -123,7 +157,7 @@ internal static class MinionAppStatusReporter
             MD5.HashData(Encoding.ASCII.GetBytes(account.Keycode)).CopyTo(packet, UID_LENGTH);
 
         BitConverter.GetBytes(gamePid).CopyTo(packet, 32);
-        packet[36] = STATUS_RUNNING;
+        packet[36] = status;
 
         return packet;
     }

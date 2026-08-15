@@ -193,6 +193,9 @@ internal sealed class GameLaunchFlowHandler
         // 退出码是事后判断「玩家自己关的」还是「闪退」的唯一线索, 打成 Info 方便排查
         Log.Information("游戏进程已退出 (PID={ProcessID}, ExitCode=0x{ExitCode:X8})", launched.ProcessID, (uint)launched.ExitCode);
 
+        // 告诉 MINIONAPP 这一行停机了, 否则它会转成「排队开始」并过一分钟自己拉个新客户端
+        MinionAppStatusReporter.ReportStopped(launched.ProcessID);
+
         return launched;
     }
 
