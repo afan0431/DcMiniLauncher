@@ -214,23 +214,17 @@ public static class MinionAccounts
     }
 
     /// <summary>
-    ///     按启动页选中的分组与账号 UID 取账号, 并给出它在**本分组内的序号**。
-    ///     序号是 MINIONAPP 界面上那一组里的行号 —— 它的表格按分组分栏、组内按本文件顺序排,
-    ///     驱动它注入时要靠这个定位（见 <see cref="MinionAppAutomation" />）。
+    ///     按启动页选中的分组与账号 UID 取账号 —— 挂 Minion（F3）时用。
     ///     UID 对不上（Accounts.json 改过）就退回该分组的第一个账号, 免得配置一变就挂不上。
     /// </summary>
-    public static (MinionAccount? Account, int RowIndex) FindAccountInGroup(string? group, string? uid, string? installPath = null)
+    public static MinionAccount? FindAccount(string? group, string? uid, string? installPath = null)
     {
         var accountsInGroup = LoadAccounts(installPath)
                               .Where(account => string.Equals(account.Group?.Trim(), group?.Trim(), StringComparison.OrdinalIgnoreCase))
                               .ToList();
 
-        var index = accountsInGroup.FindIndex(account => string.Equals(account.Uid, uid, StringComparison.OrdinalIgnoreCase));
-
-        if (index < 0)
-            index = accountsInGroup.Count > 0 ? 0 : -1;
-
-        return index < 0 ? (null, -1) : (accountsInGroup[index], index);
+        return accountsInGroup.FirstOrDefault(account => string.Equals(account.Uid, uid, StringComparison.OrdinalIgnoreCase))
+               ?? accountsInGroup.FirstOrDefault();
     }
 
     private static string? ReadString(JsonElement element, string propertyName)
