@@ -83,7 +83,9 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
             //   GET  /dctravel/ingame-travel/areas    可选目标 + 拥挤度, 填下拉框用
             InGameTravelHandler        = inGameTravel.HandleAsync,
             InGameTravelStatusProvider = pid => pid is { } id ? InGameTravelJobs.Get(id) : (object)InGameTravelJobs.All(),
-            InGameTravelAreasProvider  = inGameTravel.QueryTargetsAsync
+            InGameTravelAreasProvider  = inGameTravel.QueryTargetsAsync,
+            //   GET/POST /dctravel/ingame-travel/settings  抄 DcTraveler 那四项设置
+            InGameTravelSettingsHandler = InGameTravelCoordinator.HandleSettings
         };
 
         _ = Listener.StartAsync();

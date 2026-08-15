@@ -33,6 +33,13 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
     /// </summary>
     public Func<CancellationToken, Task<object>>? InGameTravelAreasProvider { get; set; }
 
+    /// <summary>
+    ///     <c>GET/POST /dctravel/ingame-travel/settings</c> 的钩子 —— 游戏内 UI 抄的是 DcTraveler
+    ///     的设置页（自动重试 / 繁忙时自动换服务器 / 最大重试次数 / 重试间隔）。
+    ///     入参为 null 表示只读取, 非 null 表示写入后返回最新值。
+    /// </summary>
+    public Func<string?, object>? InGameTravelSettingsHandler { get; set; }
+
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -422,6 +429,39 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
                                ?? throw new InvalidOperationException("本启动器未启用游戏内换大区");
 
                 payload = await provider(listener.listenerCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                payload = new InGameTravelResponse { Ok = false, Message = UnwrapException(ex).Message };
+            }
+
+            await WriteJsonAsync(payload).ConfigureAwait(false);
+        }
+
+        /// <summary>读设置</summary>
+        [Route(HttpVerbs.Get, "/ingame-travel/settings")]
+        public async Task GetInGameTravelSettings() => await HandleSettingsAsync(null).ConfigureAwait(false);
+
+        /// <summary>写设置（整份提交, 字段与读取时一致）</summary>
+        [Route(HttpVerbs.Post, "/ingame-travel/settings")]
+        public async Task PostInGameTravelSettings()
+        {
+            using var reader = new StreamReader(Request.InputStream, Request.ContentEncoding ?? Encoding.UTF8);
+            var       body   = await reader.ReadToEndAsync().ConfigureAwait(false);
+
+            await HandleSettingsAsync(body).ConfigureAwait(false);
+        }
+
+        private async Task HandleSettingsAsync(string? body)
+        {
+            object payload;
+
+            try
+            {
+                var handler = listener.InGameTravelSettingsHandler
+                              ?? throw new InvalidOperationException("本启动器未启用游戏内换大区");
+
+                payload = handler(body);
             }
             catch (Exception ex)
             {

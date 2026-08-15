@@ -1,4 +1,5 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
+using System.Text.Json;
 using Serilog;
 using XIVLauncher.DCTravel;
 using XIVLauncher.Login.Models;
@@ -91,26 +92,71 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
 
         return new
         {
-            ok        = true,
-            character = located.Character?.Name ?? "",
-            current   = new { area = sourceGroup.AreaName, group = sourceGroup.GroupName },
+            ok         = true,
+            character  = located.Character?.Name ?? "",
+            // 标题界面要能选角色 —— 那时候游戏里没有任何角色信息, 只能靠这份列表
+            characters = located.All.Select(x => new { name = x.Name, area = x.AreaName, group = x.GroupName }),
+            current    = new { area = sourceGroup.AreaName, group = sourceGroup.GroupName },
             areas = targets.Select(area => new
             {
-                area   = area.AreaName,
+                area = area.AreaName,
+                // 大区级拥挤度: 0=通畅 1=热门 2=火爆, 其它=繁忙（词表抄 DcTraveler 的 WindowStyles.GetAreaStatus）
+                stateCode = area.State,
+                state = area.State switch
+                {
+                    0 => "通畅",
+                    1 => "热门",
+                    2 => "火爆",
+                    _ => "繁忙"
+                },
                 groups = area.GroupList.Select(group => new
                 {
                     group     = group.GroupName,
                     queueTime = group.QueueTime,
-                    // 直接给 UI 一个能显示的词, 免得 Lua 那边再抄一遍判定规则
+                    // 服务器级词表同样抄 DcTraveler 的 WindowStyles.GetQueueStatus,
+                    // 免得游戏内 UI 再抄一遍判定规则（抄一遍就会有一天对不上）
                     state = group.QueueTime switch
                     {
-                        null    => "未知",
-                        0       => "通畅",
-                        < 0     => "繁忙",
-                        var min => $"排队约 {min} 分钟"
+                        null              => "读取中",
+                        0                 => "通畅",
+                        < 0               => "火爆",
+                        var min           => $"{min} 分钟"
                     }
                 })
             })
+        };
+    }
+
+    /// <summary>
+    ///     读/写换大区的行为设置（四项与 DcTraveler 设置页一一对应）。
+    ///     <paramref name="body" /> 为 null 表示只读, 否则整份写入后返回最新值。
+    /// </summary>
+    public static object HandleSettings(string? body)
+    {
+        if (!string.IsNullOrWhiteSpace(body))
+        {
+            var incoming = JsonSerializer.Deserialize<InGameTravelSettings>(body, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+            if (incoming != null)
+            {
+                InGameTravelSettings.Current.Apply(incoming);
+                Log.Information("[InGameTravel] 设置已更新: 自动重试={Retry} 繁忙自动换服={Switch} 最大重试={Max} 间隔={Delay}s",
+                                InGameTravelSettings.Current.EnableAutoRetry,
+                                InGameTravelSettings.Current.AllowSwitchToAvailableWorld,
+                                InGameTravelSettings.Current.MaxRetryCount,
+                                InGameTravelSettings.Current.RetryDelaySeconds);
+            }
+        }
+
+        var settings = InGameTravelSettings.Current;
+
+        return new
+        {
+            ok                          = true,
+            enableAutoRetry             = settings.EnableAutoRetry,
+            allowSwitchToAvailableWorld = settings.AllowSwitchToAvailableWorld,
+            maxRetryCount               = settings.MaxRetryCount,
+            retryDelaySeconds           = settings.RetryDelaySeconds
         };
     }
 
@@ -210,7 +256,16 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         public static TravelContext Failed(string error) => new(null, null, null, null, error);
     }
 
-    private sealed record LocatedCharacter(DCTravelCharacter? Character, DCTravelGroup? Group, string? Error);
+    /// <summary>账号下的一个角色, 及它现在所在的大区/服务器 —— 标题界面选角色用</summary>
+    public sealed record CharacterEntry(string Name, string AreaName, string GroupName);
+
+    private sealed record LocatedCharacter
+    (
+        DCTravelCharacter? Character,
+        DCTravelGroup?     Group,
+        string?            Error,
+        List<CharacterEntry> All
+    );
 
     /// <summary>
     ///     按角色名把角色找出来, 顺带确定它现在在哪个服务器（= 正向传送的源服务器 / 返回时要带的当前服务器）。
@@ -223,6 +278,7 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         DCTravelCharacter? character  = null;
         DCTravelGroup?     group      = null;
         var                candidates = new List<string>();
+        var                all        = new List<CharacterEntry>();
 
         foreach (var area in sourceAreas)
         {
@@ -245,12 +301,13 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
                 foreach (var role in roles)
                 {
                     candidates.Add($"{role.Name}@{candidateGroup.GroupName}");
+                    all.Add(new CharacterEntry(role.Name, area.AreaName, candidateGroup.GroupName));
 
                     if (!string.IsNullOrWhiteSpace(wantedName) && !string.Equals(role.Name, wantedName, StringComparison.Ordinal))
                         continue;
 
                     if (character != null)
-                        return new LocatedCharacter(null, null, $"这个账号下有多个角色, 请指定 character: {string.Join(", ", candidates)}");
+                        return new LocatedCharacter(null, null, $"这个账号下有多个角色, 请指定 character: {string.Join(", ", candidates)}", all);
 
                     character = role;
                     group     = candidateGroup;
@@ -261,9 +318,9 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         if (character == null || group == null)
             return new LocatedCharacter(null, null, candidates.Count == 0
                                                         ? "没查到任何可传送的角色"
-                                                        : $"没找到角色 {wantedName}, 可选: {string.Join(", ", candidates)}");
+                                                        : $"没找到角色 {wantedName}, 可选: {string.Join(", ", candidates)}", all);
 
-        return new LocatedCharacter(character, group, null);
+        return new LocatedCharacter(character, group, null, all);
     }
 
     private async Task<TravelContext> ResolveContextAsync(DCTravelListener.InGameTravelRequest request, CancellationToken cancellationToken)

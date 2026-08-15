@@ -51,9 +51,9 @@ public sealed class InGameTravelService(DCTravelClient client)
     /// <summary>跨大区冷却 60 秒 —— 与 DcTraveler 的 <c>TravelCooldownGate</c> 一致</summary>
     private static readonly TimeSpan COOLDOWN = TimeSpan.FromSeconds(60);
 
-    /// <summary>重试间隔与次数取 DcTraveler 的默认配置（RetryDelaySeconds=60, MaxRetryCount=20）</summary>
-    private static readonly TimeSpan RETRY_DELAY     = TimeSpan.FromSeconds(60);
-    private const           int      MAX_RETRY_COUNT = 20;
+    /// <summary>重试次数/间隔/是否自动换服务器都可配, 默认值与 DcTraveler 一致（见 InGameTravelSettings）</summary>
+    private static TimeSpan RetryDelay    => TimeSpan.FromSeconds(InGameTravelSettings.Current.RetryDelaySeconds);
+    private static int      MaxRetryCount  => InGameTravelSettings.Current.EnableAutoRetry ? InGameTravelSettings.Current.MaxRetryCount : 0;
 
     /// <summary>上次下单时刻（UTC ticks）。冷却是账号侧的, 所以整个启动器共用一个。</summary>
     private static long lastOrderTicks;
@@ -318,7 +318,7 @@ public sealed class InGameTravelService(DCTravelClient client)
     {
         string? lastFailure = null;
 
-        for (var attempt = 0; attempt <= MAX_RETRY_COUNT; ++attempt)
+        for (var attempt = 0; attempt <= MaxRetryCount; ++attempt)
         {
             await WaitForCooldownAsync(progress, cancellationToken).ConfigureAwait(false);
 
@@ -327,7 +327,7 @@ public sealed class InGameTravelService(DCTravelClient client)
 
             Report(progress, attempt == 0
                                  ? $"正在提交超域旅行订单（目标 {targetGroup.AreaName}/{targetGroup.GroupName}）…"
-                                 : $"第 {attempt}/{MAX_RETRY_COUNT} 次重试（目标 {targetGroup.AreaName}/{targetGroup.GroupName}）…");
+                                 : $"第 {attempt}/{MaxRetryCount} 次重试（目标 {targetGroup.AreaName}/{targetGroup.GroupName}）…");
 
             string orderId;
 
@@ -340,7 +340,7 @@ public sealed class InGameTravelService(DCTravelClient client)
             {
                 lastFailure = ex.Message;
 
-                if (!IsRetryable(lastFailure) || attempt == MAX_RETRY_COUNT)
+                if (!IsRetryable(lastFailure) || attempt == MaxRetryCount)
                     return $"下单失败: {lastFailure}";
 
                 await WaitBeforeRetryAsync(lastFailure, attempt + 1, progress, cancellationToken).ConfigureAwait(false);
@@ -354,7 +354,7 @@ public sealed class InGameTravelService(DCTravelClient client)
             if (lastFailure == null)
                 return null; // 成功
 
-            if (!IsRetryable(lastFailure) || attempt == MAX_RETRY_COUNT)
+            if (!IsRetryable(lastFailure) || attempt == MaxRetryCount)
                 return lastFailure;
 
             await WaitBeforeRetryAsync(lastFailure, attempt + 1, progress, cancellationToken).ConfigureAwait(false);
@@ -384,8 +384,8 @@ public sealed class InGameTravelService(DCTravelClient client)
 
             var latest = area.GroupList.FirstOrDefault(x => x.GroupID == requestedTargetGroup.GroupID) ?? requestedTargetGroup;
 
-            // 只有「繁忙」(<0) 才换; 排队 N 分钟(>0) 说明能排上, 照常下单
-            if (latest.QueueTime is not < 0)
+            // 只有「火爆」(<0) 才换; 排队 N 分钟(>0) 说明能排上, 照常下单
+            if (latest.QueueTime is not < 0 || !InGameTravelSettings.Current.AllowSwitchToAvailableWorld)
                 return latest;
 
             var available = area.GroupList
@@ -419,14 +419,14 @@ public sealed class InGameTravelService(DCTravelClient client)
 
     private static async Task WaitBeforeRetryAsync(string failure, int attempt, IProgress<string>? progress, CancellationToken cancellationToken)
     {
-        var until = DateTimeOffset.UtcNow + RETRY_DELAY;
+        var until = DateTimeOffset.UtcNow + RetryDelay;
 
         while (DateTimeOffset.UtcNow < until)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             var remaining = (until - DateTimeOffset.UtcNow).TotalSeconds;
-            Report(progress, $"{failure} —— 第 {attempt}/{MAX_RETRY_COUNT} 次重试, {remaining:F0} 秒后继续");
+            Report(progress, $"{failure} —— 第 {attempt}/{MaxRetryCount} 次重试, {remaining:F0} 秒后继续");
 
             await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
         }
