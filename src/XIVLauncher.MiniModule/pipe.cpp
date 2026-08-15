@@ -70,6 +70,13 @@ namespace
         if (command == "MAINTHREAD")
             return HandleMainThread();
 
+        // 只读自检: 解析特征码 + 顺着 Framework 读到大厅主机名, 用来核对偏移对不对
+        if (command == "PROBE")
+            return GameProbe();
+
+        if (command == "DUMP")
+            return GameDump();
+
         if (command == "UNLOAD")
         {
             g_stop.store(true);

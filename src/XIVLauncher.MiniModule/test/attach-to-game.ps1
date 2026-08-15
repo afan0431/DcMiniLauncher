@@ -88,7 +88,8 @@ function Send-ModuleCommand
     $Pipe.Write($payload, 0, $payload.Length)
     $Pipe.Flush()
 
-    $buffer = New-Object byte[] 1024
+    # 消息模式管道: 缓冲区比整条回应小会直接读失败, PROBE/DUMP 的回应上千字节
+    $buffer = New-Object byte[] 8192
     $read   = $Pipe.Read($buffer, 0, $buffer.Length)
     return [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
 }
@@ -124,6 +125,13 @@ try
 
     if ($mainThread -match 'same=1') { Write-Host '[生死闸] 通过: 窗口线程 = 进程主线程' -ForegroundColor Green }
     else { Write-Host '[生死闸] 窗口线程不是主线程, 换服要改走 Framework::Tick hook' -ForegroundColor Yellow }
+
+    # 只读探针: 顺着 Framework 一路读到大厅主机名。读出来的主机名能和当前所连大区对上 = 偏移是对的
+    $probe = Send-ModuleCommand -Pipe $pipe -Command 'PROBE'
+    Write-Host "`nPROBE → $probe`n"
+
+    $dump = Send-ModuleCommand -Pipe $pipe -Command 'DUMP'
+    Write-Host "DUMP  → $dump`n"
 
     if (-not $KeepLoaded) { Write-Host "UNLOAD  → $(Send-ModuleCommand -Pipe $pipe -Command 'UNLOAD')" }
 }

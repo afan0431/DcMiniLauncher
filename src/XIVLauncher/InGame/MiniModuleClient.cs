@@ -38,7 +38,8 @@ public sealed class MiniModuleClient(int gameProcessId) : IDisposable
         await this.stream.WriteAsync(payload, cancellationToken).ConfigureAwait(false);
         await this.stream.FlushAsync(cancellationToken).ConfigureAwait(false);
 
-        var buffer = new byte[1024];
+        // 管道是消息模式: 缓冲区比整条回应小会直接读失败, 所以留够（PROBE/DUMP 的回应上千字节）
+        var buffer = new byte[8192];
         var read   = await this.stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
 
         if (read <= 0)

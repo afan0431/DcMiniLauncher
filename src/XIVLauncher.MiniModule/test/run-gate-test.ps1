@@ -93,7 +93,7 @@ function Send-ModuleCommand
     $Pipe.Write($payload, 0, $payload.Length)
     $Pipe.Flush()
 
-    $buffer = New-Object byte[] 1024
+    $buffer = New-Object byte[] 8192
     $read   = $Pipe.Read($buffer, 0, $buffer.Length)
     return [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
 }

@@ -33,7 +33,7 @@ foreach ($dir in @($objDir, $outDir)) {
 # 游戏进程里不保证有对应版本的 VC 运行时 DLL, 所以静态链接 (/MT), 让模块自带
 $optimize = if ($Configuration -eq 'Debug') { '/Od /DDEBUG' } else { '/O2 /DNDEBUG' }
 
-$sources  = 'dllmain.cpp log.cpp mainthread.cpp pipe.cpp'
+$sources  = 'dllmain.cpp log.cpp mainthread.cpp pipe.cpp sigscan.cpp game.cpp'
 
 # ⚠ /Fo 的目录必须以 `/` 收尾, 不能是 `\`: MSVC 的 argv 解析把 `\"` 当转义引号,
 #   写成 /Fo"…obj\" 会把后面的源文件名一起吞进同一个参数 (报 D8003 缺少源文件名)
