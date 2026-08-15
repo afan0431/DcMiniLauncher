@@ -109,6 +109,9 @@ namespace
         if (command == "RELEASE")
             return GameReleaseLobbyContext();
 
+        if (command == "TITLEREADY")
+            return GameTitleReady();
+
         if (command == "LOGIN")
             return GameLogin();
 

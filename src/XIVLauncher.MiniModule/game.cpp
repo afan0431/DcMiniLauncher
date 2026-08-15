@@ -471,6 +471,23 @@ namespace
         }
     }
 
+    // returnToTitle 是异步的（游戏要花几秒回到标题）, 编排侧靠这个判断什么时候能往下走
+    int OpTitleReady(const Pointers* p)
+    {
+        __try
+        {
+            const auto unitManager = reinterpret_cast<uint8_t*>(p->uiModule) +
+                                     offsets::UI_MODULE_RAPTURE_ATK_MODULE +
+                                     offsets::RAPTURE_ATK_MODULE_UNIT_MANAGER;
+
+            return reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(unitManager, "_TitleMenu", 1) != nullptr ? 1 : 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+    }
+
     // GameFunctions.LoginInGame: 给 _TitleMenu 的 4 号按钮发一次 ButtonClick
     int OpLogin(const Pointers* p)
     {
@@ -628,6 +645,24 @@ std::string GameSetSid(const std::string& sid)
     LogF("[game] SETSID 写入 %d 字节", static_cast<int>(sid.size()));
 
     return result == 1 ? "OK" : "FAIL exception";
+}
+
+std::string GameTitleReady()
+{
+    Pointers    pointers{};
+    std::string failure;
+
+    if (!PrepareCall(&pointers, failure))
+        return failure;
+
+    int result = -1;
+    if (!MainThreadRun([&] { result = OpTitleReady(&pointers); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    if (result < 0)
+        return "FAIL exception";
+
+    return result == 1 ? "OK ready=1" : "OK ready=0";
 }
 
 std::string GameLogin()

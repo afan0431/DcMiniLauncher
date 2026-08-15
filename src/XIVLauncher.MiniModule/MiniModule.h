@@ -52,6 +52,7 @@ std::string GameReturnToTitle();
 std::string GameSetHosts(const std::string& lobbyHost, const std::string& saveDataHost, const std::string& gmHost);
 std::string GameReleaseLobbyContext();
 std::string GameSetSid(const std::string& sid);
+std::string GameTitleReady(); // returnToTitle 是异步的, 编排侧靠它等到标题界面
 std::string GameLogin();
 std::string GameKeepAlive(bool enable); // 轮询期把 AgentLobby.IdleTime 定期归零, 免得挂在标题界面被踢
 
