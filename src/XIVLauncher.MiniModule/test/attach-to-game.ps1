@@ -17,7 +17,12 @@ param(
     # 盯梢模式: 先开保活（免得标题界面闲置久了飘进片头动画, 那时 _TitleMenu 是不存在的),
     # 然后轮询 TITLEREADY 直到认出标题菜单, 顺便把已加载的 addon 列出来。
     [switch]$TitleWatch,
-    [int]$WatchSeconds = 90
+    [int]$WatchSeconds = 90,
+    # 进程里已经有模块时先让它卸载再注入新的 —— 改完代码验证时用, 免得测的还是旧那版
+    [switch]$Reload,
+    # 停在标题菜单时跑: RELEASE(作废大厅上下文) → LOGIN(点开始游戏), 主机名和 SID 都不动,
+    # 于是等价于「用全新连接登录同一个大区」—— 真实换服流程去掉换服那两步的版本。
+    [switch]$LoginTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -105,6 +110,24 @@ function Send-ModuleCommand
 }
 
 $already = @($process.Modules | Where-Object { $_.ModuleName -eq 'MiniLauncherModule.dll' }).Count
+
+if ($already -gt 0 -and $Reload)
+{
+    Write-Host '[重载] 进程里已有模块, 先让它卸载'
+
+    $old = New-Object System.IO.Pipes.NamedPipeClientStream('.', "minilauncher-$ProcessId", [System.IO.Pipes.PipeDirection]::InOut)
+    $old.Connect(10000)
+    $old.ReadMode = [System.IO.Pipes.PipeTransmissionMode]::Message
+
+    try { Write-Host "  UNLOAD → $(Send-ModuleCommand -Pipe $old -Command 'UNLOAD')" }
+    finally { $old.Dispose() }
+
+    Start-Sleep -Milliseconds 1500
+    $process.Refresh()
+    $already = @($process.Modules | Where-Object { $_.ModuleName -eq 'MiniLauncherModule.dll' }).Count
+
+    if ($already -gt 0) { throw '旧模块没能卸载干净, 不敢重复注入' }
+}
 
 if ($already -eq 0)
 {
@@ -264,6 +287,67 @@ try
         Write-Host "  ADDONS → $addons"
 
         Write-Host "  KEEPALIVE OFF → $(Send-ModuleCommand -Pipe $pipe -Command 'KEEPALIVE OFF')"
+        Write-Host ''
+    }
+
+    if ($LoginTest)
+    {
+        Write-Host '--- RELEASE + LOGIN 自检 (主机名与 SID 都不动) ---' -ForegroundColor Cyan
+
+        $ready = Send-ModuleCommand -Pipe $pipe -Command 'TITLEREADY'
+
+        if ($ready -notmatch 'ready=1')
+        {
+            Write-Host "  [跳过] 现在不在标题菜单 ($ready)" -ForegroundColor Yellow
+        }
+        else
+        {
+            $before = Send-ModuleCommand -Pipe $pipe -Command 'PROBE'
+            if ($before -match 'ctx=(\S+) state=(\d+)') { Write-Host "  RELEASE 前: ctx=$($Matches[1]) state=$($Matches[2])" }
+
+            Write-Host "  RELEASE → $(Send-ModuleCommand -Pipe $pipe -Command 'RELEASE')"
+
+            $after = Send-ModuleCommand -Pipe $pipe -Command 'PROBE'
+            if ($after -match 'ctx=(\S+) state=(\d+)')
+            {
+                Write-Host "  RELEASE 后: ctx=$($Matches[1]) state=$($Matches[2])"
+                if ($Matches[2] -eq '0') { Write-Host '  [OK] LobbyUIClient 的 Context/State 已清零' -ForegroundColor Green }
+                else { Write-Host '  [!!] State 没被清零' -ForegroundColor Red }
+            }
+
+            # 保活开着, 免得后面等登录的时候飘进片头动画
+            $null = Send-ModuleCommand -Pipe $pipe -Command 'KEEPALIVE ON'
+            Write-Host "  LOGIN → $(Send-ModuleCommand -Pipe $pipe -Command 'LOGIN')"
+
+            # 登录成功的判据: 标题菜单消失, 角色选择相关 addon 出现
+            $deadline = (Get-Date).AddSeconds(60)
+            $done     = $false
+
+            while ((Get-Date) -lt $deadline)
+            {
+                Start-Sleep -Seconds 3
+                $addons = Send-ModuleCommand -Pipe $pipe -Command 'ADDONS'
+
+                if ($addons -match 'CharaSelect|_CharaSelectListMenu|CharaSelectWorldServer')
+                {
+                    Write-Host '  [OK] 出现角色选择界面 —— 全新连接登录成功' -ForegroundColor Green
+                    Write-Host "  ADDONS → $addons"
+                    $done = $true
+                    break
+                }
+
+                if ($addons -match '_TitleConnect|NowLoading') { Write-Host "  [$(Get-Date -Format HH:mm:ss)] 连接中…" }
+            }
+
+            if (-not $done)
+            {
+                Write-Host '  [!!] 60 秒内没等到角色选择界面 —— 看游戏画面上是什么提示' -ForegroundColor Red
+                Write-Host "  ADDONS → $(Send-ModuleCommand -Pipe $pipe -Command 'ADDONS')"
+            }
+
+            $null = Send-ModuleCommand -Pipe $pipe -Command 'KEEPALIVE OFF'
+        }
+
         Write-Host ''
     }
 

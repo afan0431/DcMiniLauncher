@@ -11,7 +11,7 @@
 #include <string>
 
 // 模块版本, 通过 pipe 的 VERSION 命令回给启动器, 便于确认注进去的是哪一版
-#define MINIMODULE_VERSION "0.1.0-gate"
+#define MINIMODULE_VERSION "0.2.0-travel"
 
 // ---- 日志 (log.cpp) ----------------------------------------------------------
 // 日志落在 %TEMP%\minilauncher-module-<pid>.log —— 游戏目录不保证可写, 且这里天然按 PID 分开
