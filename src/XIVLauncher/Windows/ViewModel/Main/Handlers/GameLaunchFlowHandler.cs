@@ -156,8 +156,9 @@ internal sealed class GameLaunchFlowHandler
         if (gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion))
             await AttachMinionAsync(launched, gamePath, dalamudOk).ConfigureAwait(false);
 
-        // F4: 登记这个客户端, 好让外部触发（bot 的 HTTP 请求 / 界面）能找到它
-        RunningGameRegistry.Register(launched.UnderlyingProcess, gameLaunchContext.InGameAgents);
+        // F4: 登记这个客户端, 好让外部触发（bot 的 HTTP 请求 / 游戏内 UI）能找到它;
+        //     端口一并落盘 —— 游戏内 UI 读不到 XL.DcTraveler 那个游戏参数
+        RunningGameRegistry.Register(launched.UnderlyingProcess, gameLaunchContext.InGameAgents, gameLaunchContext.DcTravelPort);
 
         // F4: 只要挂了 Minion 就注入自家模块 —— 「只 Minion」和「都注」两种模式都要能用。
         // 「都注」时与 Dalamud 共存: 我们换的是 Framework 虚表里的 Tick 项, 随后照常调原函数,

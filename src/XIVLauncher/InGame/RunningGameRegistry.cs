@@ -17,16 +17,49 @@ public static class RunningGameRegistry
 
     private static readonly ConcurrentDictionary<int, Entry> ENTRIES = new();
 
-    public static void Register(Process process, InGameAgents agents)
+    /// <summary>
+    ///     游戏内 UI（Afan/Minion 的 Lua）要知道往哪个端口发请求。插件是从游戏参数
+    ///     <c>XL.DcTraveler</c> 读的, 但 Minion 的 Lua 读不到游戏参数 —— 所以按 PID 落一个小文件,
+    ///     Lua 用 <c>io.open</c> 就能读到。多开时各是各的。
+    /// </summary>
+    public static string PortFilePath(int processId) =>
+        Path.Combine(Path.GetTempPath(), $"minilauncher-dctravel-{processId}.port");
+
+    public static void Register(Process process, InGameAgents agents, int dcTravelPort = 0)
     {
         ENTRIES[process.Id] = new Entry(process, agents);
         Log.Debug("[RunningGame] 登记 PID={Pid} agents={Agents}", process.Id, agents);
+
+        if (dcTravelPort <= 0)
+            return;
+
+        try
+        {
+            File.WriteAllText(PortFilePath(process.Id), dcTravelPort.ToString());
+            Log.Debug("[RunningGame] 端口文件已写: {Path} = {Port}", PortFilePath(process.Id), dcTravelPort);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[RunningGame] 写端口文件失败, 游戏内 UI 将找不到启动器");
+        }
     }
 
     public static void Unregister(int processId)
     {
         if (ENTRIES.TryRemove(processId, out _))
             Log.Debug("[RunningGame] 注销 PID={Pid}", processId);
+
+        try
+        {
+            var path = PortFilePath(processId);
+
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[RunningGame] 删端口文件失败 PID={Pid}", processId);
+        }
     }
 
     /// <summary>
