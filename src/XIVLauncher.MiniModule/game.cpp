@@ -456,11 +456,24 @@ namespace
         }
     }
 
-    // 当前处在哪个界面: 2=角色选择, 1=标题菜单, 0=在世界里(或过场中), -1=读不到
+    // 当前处在哪: 3=在游戏里, 2=角色选择, 1=标题菜单, 0=都不是(片头动画/读盘/过场), -1=读不到
+    //
+    // ⚠ 「在游戏里」必须读 AgentLobby.IsLoggedIn, 不能靠 addon 反推。2026-08-15 实测:
+    //   客户端闲置后会飘进片头动画, 那时 _TitleMenu / _CharaSelectListMenu 都不在,
+    //   旧写法（两个都没有就算 ingame）会把动画误判成在游戏里 —— 编排就会在动画里去调登出。
     int OpWhere(const Pointers* p)
     {
         __try
         {
+            if (p->agentLobby != nullptr)
+            {
+                const auto loggedIn = ReadAt<unsigned char>(p->agentLobby, offsets::AGENT_LOBBY_IS_LOGGED_IN);
+                const auto inZone   = ReadAt<unsigned char>(p->agentLobby, offsets::AGENT_LOBBY_IS_LOGGED_INTO_ZONE);
+
+                if (loggedIn != 0 || inZone != 0)
+                    return 3;
+            }
+
             if (p->unitManager == nullptr)
                 return -1;
 
@@ -596,7 +609,7 @@ namespace
     {
         __try
         {
-            if (OpWhere(p) != 0)
+            if (OpWhere(p) != 3)
                 return 0; // 不在世界里, 不用登出
 
             // Utf8String 放栈上: "/logout" 只有 7 字节, 走的是它自带的内联缓冲, 不会另外分配堆内存
@@ -623,7 +636,7 @@ namespace
     {
         __try
         {
-            if (OpWhere(p) != 0)
+            if (OpWhere(p) != 3)
                 return 0; // 不在世界里, 不用登出
 
             // isExiting=false: 登出到角色选择, 而不是退出游戏
@@ -875,9 +888,10 @@ std::string GameWhere()
 
     switch (state->result)
     {
+        case 3:  return "OK where=ingame";
         case 2:  return "OK where=charaselect";
         case 1:  return "OK where=title";
-        case 0:  return "OK where=ingame";
+        case 0:  return "OK where=busy"; // 片头动画 / 读盘 / 过场 —— 什么都别做, 等它稳定
         default: return "FAIL unknown";
     }
 }

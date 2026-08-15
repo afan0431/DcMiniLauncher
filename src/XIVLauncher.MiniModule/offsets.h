@@ -37,6 +37,12 @@ namespace offsets
     inline constexpr uintptr_t AGENT_LOBBY_GAME_SESSION = 0xDC8;  // :34  Utf8String, 即 DEV.TestSID
     inline constexpr uintptr_t AGENT_LOBBY_IDLE_TIME    = 0x12A8; // :65  long
 
+    // :74/:75 —— 判断「是否真在游戏里」的可靠信号。
+    // ⚠ 别用 addon 猜: 片头动画播放时 _TitleMenu 和 _CharaSelectListMenu 都不在,
+    //   光看 addon 会把「动画中」误判成「在游戏里」, 那样编排会在动画里去调登出。
+    inline constexpr uintptr_t AGENT_LOBBY_IS_LOGGED_IN        = 0x12D8;
+    inline constexpr uintptr_t AGENT_LOBBY_IS_LOGGED_INTO_ZONE = 0x12D9;
+
     // LobbyData.LobbyUIClient 在 LobbyData+0x8 (AgentLobby.cs:110), 而 DCTraveler 的
     // LobbyUIClientExposed 把 Context 定在 +0x18、State 定在 +0x158 —— 折算到 AgentLobby 基址:
     inline constexpr uintptr_t AGENT_LOBBY_UI_CLIENT         = AGENT_LOBBY_LOBBY_DATA + 0x8;   // 0x48
