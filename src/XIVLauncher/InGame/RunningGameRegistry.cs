@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO;
 using Serilog;
 using XIVLauncher.Login.Models;
 
@@ -38,6 +39,9 @@ public static class RunningGameRegistry
 
         if (processId is { } pid)
         {
+            if (!ENTRIES.ContainsKey(pid))
+                AdoptOrphans();
+
             if (ENTRIES.TryGetValue(pid, out var wanted))
             {
                 error = null;
@@ -47,6 +51,8 @@ public static class RunningGameRegistry
             error = $"PID {pid} 不是本启动器起的游戏客户端（或它已经退出了）";
             return null;
         }
+
+        AdoptOrphans();
 
         var alive = ENTRIES.Values.ToArray();
 
@@ -63,6 +69,40 @@ public static class RunningGameRegistry
             default:
                 error = $"当前开着 {alive.Length} 个客户端（PID: {string.Join(", ", alive.Select(x => x.Process.Id))}）, 请指定 pid";
                 return null;
+        }
+    }
+
+    /// <summary>
+    ///     认领「本启动器上一次运行起的、现在还活着的」客户端。
+    ///     登记表在内存里, 启动器一重启就空了 —— 而游戏还开着、模块还注在里面, 那种时候
+    ///     游戏内换大区本该照样能用（无人值守场景下启动器被重启是常态）。
+    ///     判据是模块的命名管道还在: <c>\\.\pipe\minilauncher-&lt;pid&gt;</c> 存在 = 那个进程里有我们的模块。
+    /// </summary>
+    private static void AdoptOrphans()
+    {
+        string[] pipes;
+
+        try
+        {
+            pipes = Directory.GetFiles(@"\\.\pipe\", "minilauncher-*");
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[RunningGame] 枚举命名管道失败");
+            return;
+        }
+
+        foreach (var process in Process.GetProcessesByName("ffxiv_dx11"))
+        {
+            if (ENTRIES.ContainsKey(process.Id))
+                continue;
+
+            if (!pipes.Any(x => x.EndsWith($"minilauncher-{process.Id}", StringComparison.Ordinal)))
+                continue;
+
+            // 认领来的客户端不知道当初以什么模式起的; 但管道在就说明模块在, 换服要的能力齐了
+            ENTRIES[process.Id] = new Entry(process, InGameAgents.Minion);
+            Log.Information("[RunningGame] 认领了上次留下的客户端 PID={Pid}（模块管道仍在）", process.Id);
         }
     }
 
