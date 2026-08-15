@@ -16,10 +16,22 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
     public DCTravelClient DCTravelClient { get; }
 
     /// <summary>
-    ///     处理 <c>/dctravel/ingame-travel</c> 的钩子（F4）。由启动器在「只 Minion」模式下装上 ——
+    ///     处理 <c>/dctravel/ingame-travel</c> 的钩子（F4）。由启动器装上 ——
     ///     本项目不认识注入模块那一套, 所以行为由上层注入, 监听器只负责收发。
     /// </summary>
     public Func<InGameTravelRequest, CancellationToken, Task<InGameTravelResponse>>? InGameTravelHandler { get; set; }
+
+    /// <summary>
+    ///     <c>GET /dctravel/ingame-travel/status</c> 的钩子 —— 游戏内 UI 靠它显示「正在排队/正在登录…」。
+    ///     参数是 pid（可空: 不给就返回全部客户端的状态）, 返回值直接序列化成 JSON。
+    /// </summary>
+    public Func<int?, object>? InGameTravelStatusProvider { get; set; }
+
+    /// <summary>
+    ///     <c>GET /dctravel/ingame-travel/areas</c> 的钩子 —— 游戏内 UI 用它填大区/服务器下拉,
+    ///     顺带拿到每个服务器的拥挤度（queueTime: 0=通畅, &lt;0=繁忙, &gt;0=排队分钟数）。
+    /// </summary>
+    public Func<CancellationToken, Task<object>>? InGameTravelAreasProvider { get; set; }
 
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
@@ -271,6 +283,12 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
         public string? Group     { get; set; }
         public string? Character { get; set; }
         public int?    Pid       { get; set; }
+
+        /// <summary>true = 返回原大区（不需要 area/group，目标记在当初那张跨区订单里）</summary>
+        public bool Back { get; set; }
+
+        /// <summary>true = 一直等到换完才回应；默认立刻返回, 进度用 /ingame-travel/status 查</summary>
+        public bool Wait { get; set; }
     }
 
     public sealed class InGameTravelResponse
@@ -367,6 +385,57 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
             var json = JsonSerializer.Serialize(response, SerializerOptions);
             Response.ContentType = "application/json";
             Response.StatusCode  = response.Ok ? 200 : 500;
+            await Response.OutputStream.WriteAsync(Encoding.UTF8.GetBytes(json)).ConfigureAwait(false);
+        }
+
+        /// <summary>游戏内 UI 轮询进度用。<c>?pid=1234</c> 查单个客户端, 不给就返回全部。</summary>
+        [Route(HttpVerbs.Get, "/ingame-travel/status")]
+        public async Task GetInGameTravelStatus()
+        {
+            object payload;
+
+            try
+            {
+                var provider = listener.InGameTravelStatusProvider
+                               ?? throw new InvalidOperationException("本启动器未启用游戏内换大区");
+
+                int? pid = int.TryParse(Request.QueryString["pid"], out var parsed) ? parsed : null;
+                payload = provider(pid);
+            }
+            catch (Exception ex)
+            {
+                payload = new InGameTravelResponse { Ok = false, Message = UnwrapException(ex).Message };
+            }
+
+            await WriteJsonAsync(payload).ConfigureAwait(false);
+        }
+
+        /// <summary>游戏内 UI 填下拉框用: 可选的目标大区/服务器 + 每个服务器的拥挤度。</summary>
+        [Route(HttpVerbs.Get, "/ingame-travel/areas")]
+        public async Task GetInGameTravelAreas()
+        {
+            object payload;
+
+            try
+            {
+                var provider = listener.InGameTravelAreasProvider
+                               ?? throw new InvalidOperationException("本启动器未启用游戏内换大区");
+
+                payload = await provider(listener.listenerCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                payload = new InGameTravelResponse { Ok = false, Message = UnwrapException(ex).Message };
+            }
+
+            await WriteJsonAsync(payload).ConfigureAwait(false);
+        }
+
+        private async Task WriteJsonAsync(object payload)
+        {
+            var json = JsonSerializer.Serialize(payload, SerializerOptions);
+            Response.ContentType = "application/json";
+            Response.StatusCode  = 200;
             await Response.OutputStream.WriteAsync(Encoding.UTF8.GetBytes(json)).ConfigureAwait(false);
         }
 

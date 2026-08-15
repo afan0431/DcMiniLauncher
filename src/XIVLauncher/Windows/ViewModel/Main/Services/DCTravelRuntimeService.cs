@@ -73,11 +73,17 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         DcTravelPort = APIHelper.GetAvailablePort();
 
         // 无论初始化是否成功, 始终启动监听器 —— 游戏内插件可通过 RPC 错误区分维护状态
+        var inGameTravel = new InGameTravelCoordinator(Client);
+
         Listener = new DCTravelListener(Client, DcTravelPort, false)
         {
-            // F4: /dctravel/ingame-travel —— bot 用普通 HTTP 就能让已经在跑的客户端原地换大区。
-            // 该客户端注了 Dalamud 的话协调器会拒绝（那种模式由 DcTraveler 插件负责）。
-            InGameTravelHandler = new InGameTravelCoordinator(Client).HandleAsync
+            // F4: 游戏内换大区的三条接口 —— bot / 游戏内 UI 用普通 HTTP 就能驱动:
+            //   POST /dctravel/ingame-travel          发起（默认立刻返回, 传 wait:true 才同步等）
+            //   GET  /dctravel/ingame-travel/status   查进度（游戏内 UI 显示「正在排队…」靠它）
+            //   GET  /dctravel/ingame-travel/areas    可选目标 + 拥挤度, 填下拉框用
+            InGameTravelHandler        = inGameTravel.HandleAsync,
+            InGameTravelStatusProvider = pid => pid is { } id ? InGameTravelJobs.Get(id) : (object)InGameTravelJobs.All(),
+            InGameTravelAreasProvider  = inGameTravel.QueryTargetsAsync
         };
 
         _ = Listener.StartAsync();

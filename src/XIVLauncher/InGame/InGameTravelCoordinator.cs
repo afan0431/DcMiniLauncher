@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Serilog;
 using XIVLauncher.DCTravel;
 using XIVLauncher.Login.Models;
@@ -30,24 +31,29 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             if (!game.Agents.HasFlag(InGameAgents.Minion))
                 return Failed("该客户端没有挂 Minion, 游戏内模块不会被注入");
 
-            var context = await ResolveContextAsync(request, cancellationToken).ConfigureAwait(false);
+            if (InGameTravelJobs.IsRunning(game.Process.Id))
+                return Failed("这个客户端已经有一次换大区在进行中");
+
+            var context = request.Back
+                              ? await ResolveReturnContextAsync(request, cancellationToken).ConfigureAwait(false)
+                              : await ResolveContextAsync(request, cancellationToken).ConfigureAwait(false);
 
             if (context.Error != null)
                 return Failed(context.Error);
 
-            var service = new InGameTravelService(client);
+            var pid    = game.Process.Id;
+            var target = $"{context.TargetArea!.AreaName}/{context.TargetGroup!.GroupName}";
 
-            var result = await service.TravelAsync
-                               (
-                                   game.Process,
-                                   context.SourceGroup!,
-                                   context.TargetGroup!,
-                                   context.Character!,
-                                   context.TargetArea!,
-                                   null,
-                                   cancellationToken
-                               ).ConfigureAwait(false);
+            InGameTravelJobs.Begin(pid, target);
 
+            var run = RunAsync(game.Process, context, request.Back);
+
+            // 默认不等: 整个流程要几十秒到几分钟, 游戏内 UI 靠 /ingame-travel/status 轮询进度。
+            // 想同步等结果（比如手工测试）就传 "wait": true
+            if (!request.Wait)
+                return new DCTravelListener.InGameTravelResponse { Ok = true, Message = $"已开始: {target}（用 /dctravel/ingame-travel/status 查进度）" };
+
+            var result = await run.ConfigureAwait(false);
             return new DCTravelListener.InGameTravelResponse { Ok = result.Ok, Message = result.Message };
         }
         catch (OperationCanceledException)
@@ -61,6 +67,134 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         }
     }
 
+    /// <summary>
+    ///     游戏内 UI 填下拉框用: 当前角色能去的大区/服务器, 附每个服务器的拥挤度。
+    ///     <c>queueTime</c>: 0=通畅, &lt;0=繁忙, &gt;0=预计排队分钟数。
+    /// </summary>
+    public async Task<object> QueryTargetsAsync(CancellationToken cancellationToken)
+    {
+        var located = await LocateCharacterAsync(null, cancellationToken).ConfigureAwait(false);
+
+        // 多角色时定位会失败, 但下拉框仍然要能填 —— 退而用任意一个源服务器去问目标列表
+        var sourceGroup = located.Group;
+
+        if (sourceGroup == null)
+        {
+            var sourceAreas = await client.QueryGroupListTravelSource().ConfigureAwait(false);
+            sourceGroup = sourceAreas.SelectMany(x => x.GroupList).FirstOrDefault();
+
+            if (sourceGroup == null)
+                return new { ok = false, message = located.Error ?? "拿不到可用的源服务器" };
+        }
+
+        var targets = await client.QueryGroupListTravelTarget(sourceGroup.AreaID, sourceGroup.GroupID).ConfigureAwait(false);
+
+        return new
+        {
+            ok        = true,
+            character = located.Character?.Name ?? "",
+            current   = new { area = sourceGroup.AreaName, group = sourceGroup.GroupName },
+            areas = targets.Select(area => new
+            {
+                area   = area.AreaName,
+                groups = area.GroupList.Select(group => new
+                {
+                    group     = group.GroupName,
+                    queueTime = group.QueueTime,
+                    // 直接给 UI 一个能显示的词, 免得 Lua 那边再抄一遍判定规则
+                    state = group.QueueTime switch
+                    {
+                        null    => "未知",
+                        0       => "通畅",
+                        < 0     => "繁忙",
+                        var min => $"排队约 {min} 分钟"
+                    }
+                })
+            })
+        };
+    }
+
+    /// <summary>跑一次换服, 把每一步的进度写进 <see cref="InGameTravelJobs" /> 供 UI 轮询。</summary>
+    private async Task<InGameTravelResult> RunAsync(Process gameProcess, TravelContext context, bool isBack)
+    {
+        var pid      = gameProcess.Id;
+        var progress = new Progress<string>(text => InGameTravelJobs.Report(pid, text));
+
+        try
+        {
+            var service = new InGameTravelService(client);
+
+            var result = isBack
+                             ? await service.TravelBackAsync(gameProcess, context.SourceGroup!, context.ReturnOrderId!,
+                                                             context.TargetArea!, progress, CancellationToken.None).ConfigureAwait(false)
+                             : await service.TravelAsync(gameProcess, context.SourceGroup!, context.TargetGroup!,
+                                                         context.Character!, context.TargetArea!, progress, CancellationToken.None).ConfigureAwait(false);
+
+            InGameTravelJobs.End(pid, result.Ok, result.Message);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[InGameTravel] 换大区任务异常");
+            InGameTravelJobs.End(pid, false, ex.Message);
+            return InGameTravelResult.Failed(ex.Message);
+        }
+    }
+
+    /// <summary>
+    ///     「返回原大区」的解析。和正向不同, 它不需要选目标 —— 目标就是当初出发的那个大区,
+    ///     记在跨区订单里（<c>QueryMigrationOrders</c> 的 <c>sourceAreaName</c>）。
+    ///     提交时要带上角色**现在所在**的服务器（<c>TravelBack</c> 的 groupId/Code/Name）。
+    /// </summary>
+    private async Task<TravelContext> ResolveReturnContextAsync(DCTravelListener.InGameTravelRequest request, CancellationToken cancellationToken)
+    {
+        var located = await LocateCharacterAsync(request.Character, cancellationToken).ConfigureAwait(false);
+
+        if (located.Error != null)
+            return TravelContext.Failed(located.Error);
+
+        var character    = located.Character!;
+        var currentGroup = located.Group!;
+
+        // 翻订单列表找这个角色还在「做客」的那一单
+        DCTravelMigrationOrder? travelling = null;
+
+        for (var page = 1; page <= 20 && travelling == null; ++page)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var orders = await client.QueryMigrationOrders(page).ConfigureAwait(false);
+
+            travelling = orders.Orders.FirstOrDefault(x => string.Equals(x.ContentID, character.ContentID, StringComparison.Ordinal));
+
+            if (page >= orders.TotalPageNum)
+                break;
+        }
+
+        if (travelling == null)
+            return TravelContext.Failed($"没找到角色 {character.Name} 的跨区订单 —— 它可能本来就在原大区");
+
+        var loginAreas = await LoginArea.Get().ConfigureAwait(false);
+        var homeArea   = loginAreas.FirstOrDefault(x => string.Equals(x.AreaName, travelling.SourceAreaName, StringComparison.Ordinal));
+
+        if (homeArea == null)
+            return TravelContext.Failed($"拿不到原大区 {travelling.SourceAreaName} 的登录主机名");
+
+        Log.Information("[InGameTravel] 返回原大区: {Character}@{Current} → {Home}/{HomeGroup} (订单 {OrderId})",
+                        character.Name, currentGroup.GroupName, travelling.SourceAreaName, travelling.SourceGroupName, travelling.OrderID);
+
+        // TargetGroup 这里只用于显示; 真正提交返回单只需要 currentGroup + 订单号
+        var homeGroup = new DCTravelGroup
+        {
+            AreaID    = 0,
+            AreaName  = travelling.SourceAreaName,
+            GroupName = travelling.SourceGroupName,
+            GroupCode = string.Empty
+        };
+
+        return new TravelContext(currentGroup, homeGroup, character, homeArea, null) { ReturnOrderId = travelling.OrderID };
+    }
+
     private sealed record TravelContext
     (
         DCTravelGroup?     SourceGroup,
@@ -70,21 +204,29 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         string?            Error
     )
     {
+        /// <summary>「返回原大区」时要提交的那张跨区订单号</summary>
+        public string? ReturnOrderId { get; init; }
+
         public static TravelContext Failed(string error) => new(null, null, null, null, error);
     }
 
-    private async Task<TravelContext> ResolveContextAsync(DCTravelListener.InGameTravelRequest request, CancellationToken cancellationToken)
+    private sealed record LocatedCharacter(DCTravelCharacter? Character, DCTravelGroup? Group, string? Error);
+
+    /// <summary>
+    ///     按角色名把角色找出来, 顺带确定它现在在哪个服务器（= 正向传送的源服务器 / 返回时要带的当前服务器）。
+    ///     不给角色名时要求这个账号下只有一个角色 —— 多个还硬选就可能把别的号传走。
+    /// </summary>
+    private async Task<LocatedCharacter> LocateCharacterAsync(string? wantedName, CancellationToken cancellationToken)
     {
         var sourceAreas = await client.QueryGroupListTravelSource().ConfigureAwait(false);
 
-        // 1. 找角色 —— 顺带就确定了它在哪个大区哪个服务器（= 源服务器）
-        DCTravelCharacter? character   = null;
-        DCTravelGroup?     sourceGroup = null;
-        var                candidates  = new List<string>();
+        DCTravelCharacter? character  = null;
+        DCTravelGroup?     group      = null;
+        var                candidates = new List<string>();
 
         foreach (var area in sourceAreas)
         {
-            foreach (var group in area.GroupList)
+            foreach (var candidateGroup in area.GroupList)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -92,37 +234,50 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
 
                 try
                 {
-                    roles = await client.QueryRoleList(area.AreaID, group.GroupID).ConfigureAwait(false);
+                    roles = await client.QueryRoleList(area.AreaID, candidateGroup.GroupID).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    Log.Debug(ex, "[InGameTravel] 查角色失败 A={AreaID} G={GroupID}, 跳过", area.AreaID, group.GroupID);
+                    Log.Debug(ex, "[InGameTravel] 查角色失败 A={AreaID} G={GroupID}, 跳过", area.AreaID, candidateGroup.GroupID);
                     continue;
                 }
 
                 foreach (var role in roles)
                 {
-                    candidates.Add($"{role.Name}@{group.GroupName}");
+                    candidates.Add($"{role.Name}@{candidateGroup.GroupName}");
 
-                    if (!string.IsNullOrWhiteSpace(request.Character) &&
-                        !string.Equals(role.Name, request.Character, StringComparison.Ordinal))
+                    if (!string.IsNullOrWhiteSpace(wantedName) && !string.Equals(role.Name, wantedName, StringComparison.Ordinal))
                         continue;
 
-                    // 没指定角色名时只允许有一个候选, 免得挑错人把别的号换走
                     if (character != null)
-                        return TravelContext.Failed($"这个账号下有多个角色, 请指定 character: {string.Join(", ", candidates)}");
+                        return new LocatedCharacter(null, null, $"这个账号下有多个角色, 请指定 character: {string.Join(", ", candidates)}");
 
-                    character   = role;
-                    sourceGroup = group;
+                    character = role;
+                    group     = candidateGroup;
                 }
             }
         }
 
-        if (character == null || sourceGroup == null)
-            return TravelContext.Failed(candidates.Count == 0
-                                            ? "没查到任何可传送的角色"
-                                            : $"没找到角色 {request.Character}, 可选: {string.Join(", ", candidates)}");
+        if (character == null || group == null)
+            return new LocatedCharacter(null, null, candidates.Count == 0
+                                                        ? "没查到任何可传送的角色"
+                                                        : $"没找到角色 {wantedName}, 可选: {string.Join(", ", candidates)}");
 
+        return new LocatedCharacter(character, group, null);
+    }
+
+    private async Task<TravelContext> ResolveContextAsync(DCTravelListener.InGameTravelRequest request, CancellationToken cancellationToken)
+    {
+        var sourceAreas = await client.QueryGroupListTravelSource().ConfigureAwait(false);
+
+        // 1. 找角色 —— 顺带就确定了它在哪个大区哪个服务器（= 源服务器）
+        var located = await LocateCharacterAsync(request.Character, cancellationToken).ConfigureAwait(false);
+
+        if (located.Error != null)
+            return TravelContext.Failed(located.Error);
+
+        var character   = located.Character!;
+        var sourceGroup = located.Group!;
         // 2. 目标大区/服务器
         var targetAreas = await client.QueryGroupListTravelTarget(sourceGroup.AreaID, sourceGroup.GroupID).ConfigureAwait(false);
 

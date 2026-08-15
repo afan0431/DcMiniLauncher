@@ -88,8 +88,14 @@ public sealed class InGameTravelService(DCTravelClient client)
 
         try
         {
-            return await TravelCoreAsync(gameProcess, sourceGroup, targetGroup, character, targetArea, progress, cancellationToken)
-                       .ConfigureAwait(false);
+            return await TravelCoreAsync
+                       (
+                           gameProcess,
+                           targetArea,
+                           ct => SubmitWithRetryAsync(sourceGroup, targetGroup, character, progress, ct),
+                           progress,
+                           cancellationToken
+                       ).ConfigureAwait(false);
         }
         finally
         {
@@ -97,15 +103,92 @@ public sealed class InGameTravelService(DCTravelClient client)
         }
     }
 
-    private async Task<InGameTravelResult> TravelCoreAsync
+    /// <summary>
+    ///     返回原大区。与正向的区别只在「在线那半」：不是下新单, 而是拿当初那张跨区订单提交返回
+    ///     （<c>TravelBack</c>, 要带上角色**现在所在**的服务器）。进程内那半完全一样。
+    ///     DcTraveler 对返回单不做自动重试（<c>DefaultTravelRetryPolicy</c>: IsBack 时 EnableRetry=false）,
+    ///     这里也不重试, 但冷却照等。
+    /// </summary>
+    public async Task<InGameTravelResult> TravelBackAsync
     (
         Process            gameProcess,
-        DCTravelGroup      sourceGroup,
-        DCTravelGroup      targetGroup,
-        DCTravelCharacter  character,
-        LoginArea          targetArea,
+        DCTravelGroup      currentGroup,
+        string             returnOrderId,
+        LoginArea          homeArea,
         IProgress<string>? progress,
         CancellationToken  cancellationToken
+    )
+    {
+        if (string.IsNullOrWhiteSpace(homeArea.AreaLobby) ||
+            string.IsNullOrWhiteSpace(homeArea.AreaConfigUpload) ||
+            string.IsNullOrWhiteSpace(homeArea.AreaGM))
+            return InGameTravelResult.Failed($"原大区 {homeArea.AreaName} 缺少主机名信息");
+
+        var gate = TRAVEL_GATES.GetOrAdd(gameProcess.Id, _ => new SemaphoreSlim(1, 1));
+
+        if (!await gate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            return InGameTravelResult.Failed("这个客户端已经有一次换大区在进行中");
+
+        try
+        {
+            return await TravelCoreAsync
+                       (
+                           gameProcess,
+                           homeArea,
+                           ct => SubmitReturnAsync(currentGroup, returnOrderId, progress, ct),
+                           progress,
+                           cancellationToken
+                       ).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    /// <summary>提交返回单并轮询到完成。返回 null 表示成功, 否则是失败原因。</summary>
+    private async Task<string?> SubmitReturnAsync
+    (
+        DCTravelGroup      currentGroup,
+        string             returnOrderId,
+        IProgress<string>? progress,
+        CancellationToken  cancellationToken
+    )
+    {
+        await WaitForCooldownAsync(progress, cancellationToken).ConfigureAwait(false);
+
+        Report(progress, "正在提交返回原大区的申请…");
+
+        string orderId;
+
+        try
+        {
+            orderId = await client.TravelBack(returnOrderId, currentGroup.GroupID, currentGroup.GroupCode, currentGroup.GroupName)
+                                  .ConfigureAwait(false);
+            MarkOrdered();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return $"提交返回申请失败: {ex.Message}";
+        }
+
+        Log.Information("[InGameTravel] 返回订单号 {OrderId}（原单 {Source}, 当前服务器 {Group}）",
+                        orderId, returnOrderId, currentGroup.GroupName);
+
+        return await WaitForOrderAsync(orderId, progress, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     换服的进程内那半 —— 正向和返回完全一样, 区别只在传进来的 <paramref name="submitAsync" />
+    ///     （下新单 / 提交返回单）和落点大区。
+    /// </summary>
+    private async Task<InGameTravelResult> TravelCoreAsync
+    (
+        Process                                            gameProcess,
+        LoginArea                                          targetArea,
+        Func<CancellationToken, Task<string?>>             submitAsync,
+        IProgress<string>?                                 progress,
+        CancellationToken                                  cancellationToken
     )
     {
         var injectError = MiniModuleInjector.Inject(gameProcess);
@@ -169,9 +252,8 @@ public sealed class InGameTravelService(DCTravelClient client)
 
             try
             {
-                // 3. 下单 + 轮询到「完成」（带冷却与重试, 语义抄自 DcTraveler, 见下面各方法注释）
-                var ordered = await SubmitWithRetryAsync(sourceGroup, targetGroup, character, progress, cancellationToken)
-                                  .ConfigureAwait(false);
+                // 3. 在线那半: 下新单 / 提交返回单, 然后轮询到「完成」
+                var ordered = await submitAsync(cancellationToken).ConfigureAwait(false);
 
                 if (ordered != null)
                     return InGameTravelResult.Failed(ordered);
