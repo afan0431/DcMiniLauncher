@@ -106,6 +106,9 @@ namespace
         if (command == "WHERE")
             return GameWhere();
 
+        if (command == "SKIPMOVIE")
+            return GameSkipMovie();
+
         if (command == "LOGOUT")
             return GameLogout(false); // /logout 文本命令 + 确认框
 

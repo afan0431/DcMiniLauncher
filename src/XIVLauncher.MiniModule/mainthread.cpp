@@ -77,6 +77,10 @@ namespace
 
     char HookedTick(void* framework)
     {
+        // ⚠ 计数必须**包住**对原函数的调用, 直到本函数真的要返回才减。
+        //   早先的写法是「先减再 return original(...)」—— 那时线程其实还在本模块的代码里跑,
+        //   卸载端却看到计数已归零, FreeLibrary 一解除映射, 这条 return 就落进空地址。
+        //   2026-08-15 一次「UNLOAD 之后进程消失、且没有崩溃转储」多半就是它。
         g_insideHook.fetch_add(1);
 
         g_tickThread = GetCurrentThreadId();
@@ -84,10 +88,11 @@ namespace
 
         const auto original = g_originalTick;
 
-        g_insideHook.fetch_sub(1);
-
         // 卸载时可能刚好把 g_originalTick 清了; 那种情况下什么都不做比跳空地址强
-        return original != nullptr ? original(framework) : 1;
+        const char result = original != nullptr ? original(framework) : 1;
+
+        g_insideHook.fetch_sub(1);
+        return result;
     }
 
     bool PatchVTable(void* newFunction, void** previous)
@@ -190,6 +195,9 @@ bool MainThreadUninstall()
         LogF("[mainthread] ⚠ 仍有调用停在 hook 里, 卸载不安全");
         return false;
     }
+
+    // 再多等几帧: 计数归零只说明没人在 hook 体内, 但可能还有线程停在返回路径上
+    Sleep(200);
 
     g_installed.store(false);
     g_originalTick = nullptr;

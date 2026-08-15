@@ -873,6 +873,72 @@ std::string GameLogout(bool direct)
     return "FAIL logout-timeout";
 }
 
+namespace
+{
+    struct FindWindowContext { DWORD processId; HWND found; };
+
+    BOOL CALLBACK FindWindowProc(HWND hwnd, LPARAM param)
+    {
+        auto* context = reinterpret_cast<FindWindowContext*>(param);
+
+        DWORD owner = 0;
+        GetWindowThreadProcessId(hwnd, &owner);
+
+        if (owner != context->processId)
+            return TRUE;
+
+        wchar_t className[64]{};
+        GetClassNameW(hwnd, className, 64);
+
+        if (lstrcmpiW(className, L"FFXIVGAME") != 0)
+            return TRUE;
+
+        context->found = hwnd;
+        return FALSE;
+    }
+
+    HWND FindGameWindow()
+    {
+        FindWindowContext context {GetCurrentProcessId(), nullptr};
+        EnumWindows(FindWindowProc, reinterpret_cast<LPARAM>(&context));
+        return context.found;
+    }
+}
+
+// 结束片头动画。客户端在标题界面闲置久了（IdleTime 涨到两万上下）会自己飘进去, 刚启动时也会先放一段;
+// 动画期间 _TitleMenu 不存在, 换服那几步全都做不了。
+//
+// 游戏没有「跳过动画」的可调函数 —— 那东西就是任意输入就结束。所以这里给游戏窗口投一次 ESC,
+// 和玩家按键走的是同一条消息路径（PostMessage 是异步的, 不占主线程)。
+std::string GameSkipMovie()
+{
+    const HWND hwnd = FindGameWindow();
+
+    if (hwnd == nullptr)
+        return "FAIL no-window";
+
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        const auto where = GameWhere();
+
+        if (where.find("where=title") != std::string::npos ||
+            where.find("where=charaselect") != std::string::npos ||
+            where.find("where=ingame") != std::string::npos)
+        {
+            LogF("[game] SKIPMOVIE: %s (投了 %d 次 ESC)", where.c_str(), attempt);
+            return where;
+        }
+
+        PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0x00010001);
+        PostMessageW(hwnd, WM_KEYUP,   VK_ESCAPE, 0xC0010001);
+
+        Sleep(500);
+    }
+
+    LogF("[game] SKIPMOVIE: 投了 20 次 ESC 仍没回到可操作界面");
+    return "FAIL still-busy";
+}
+
 std::string GameWhere()
 {
     CallStatePtr state;

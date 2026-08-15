@@ -88,6 +88,14 @@ public sealed class InGameTravelService(DCTravelClient client)
             //      所以角色还在游戏内时, 这里直接拒绝, 由调用方（bot / 用户）先用正常途径登出。
             var where = await module.SendAsync("WHERE", cancellationToken).ConfigureAwait(false);
 
+            // 片头动画/读盘期间什么都做不了（_TitleMenu 都不存在）。模块会给游戏窗口投 ESC 把动画结束掉,
+            // 不需要人工干预。客户端在标题界面闲置久了就会飘进动画, 无人值守时这是常态。
+            if (where.Contains("where=busy", StringComparison.Ordinal))
+            {
+                Report(progress, "客户端在播片头动画, 正在跳过…");
+                where = await module.SendAsync("SKIPMOVIE", cancellationToken).ConfigureAwait(false);
+            }
+
             if (where.Contains("where=ingame", StringComparison.Ordinal))
             {
                 // 角色还在世界里: 走游戏自己的登出流程回到角色选择界面, 再往下走。
@@ -234,6 +242,9 @@ public sealed class InGameTravelService(DCTravelClient client)
 
             if (response.Contains("ready=1", StringComparison.Ordinal))
                 return true;
+
+            // 等的过程中也可能飘进片头动画（返回标题后闲置)，顺手让模块把它跳掉
+            await module.SendAsync("SKIPMOVIE", cancellationToken).ConfigureAwait(false);
 
             Report(progress, "等待回到标题界面…");
             await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
