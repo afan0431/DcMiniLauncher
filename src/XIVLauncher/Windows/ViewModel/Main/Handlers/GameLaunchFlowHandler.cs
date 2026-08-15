@@ -159,9 +159,10 @@ internal sealed class GameLaunchFlowHandler
         // F4: 登记这个客户端, 好让外部触发（bot 的 HTTP 请求 / 界面）能找到它
         RunningGameRegistry.Register(launched.UnderlyingProcess, gameLaunchContext.InGameAgents);
 
-        // F4: 只有「只 Minion」这一种模式需要我们自己的游戏内模块 ——
-        // 注了 Dalamud 的模式由现成的 DcTraveler 插件换服, 都不注的模式不提供跨大区
-        if (gameLaunchContext.InGameAgents == InGameAgents.Minion)
+        // F4: 只要挂了 Minion 就注入自家模块 —— 「只 Minion」和「都注」两种模式都要能用。
+        // 「都注」时与 Dalamud 共存: 我们换的是 Framework 虚表里的 Tick 项, 随后照常调原函数,
+        // Dalamud 装在函数体上的 inline hook 仍在链上, 两边不冲突。
+        if (gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion))
             await RunMiniModuleGateAsync(launched).ConfigureAwait(false);
 
         Log.Debug("等待游戏进程退出");

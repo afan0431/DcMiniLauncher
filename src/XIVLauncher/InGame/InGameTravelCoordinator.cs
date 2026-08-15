@@ -25,9 +25,10 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             if (game == null)
                 return Failed(resolveError ?? "找不到目标客户端");
 
-            // 注了 Dalamud 的客户端由现成的 DcTraveler 插件换服, 我们不去抢
-            if (game.Agents.HasFlag(InGameAgents.Dalamud))
-                return Failed("该客户端注了 Dalamud, 请用 DcTraveler 插件换大区");
+            // 「都注」也走这条路: 用户要的是两个平台共存时 mini 这套照样可用。
+            // 注了 Dalamud 时 DcTraveler 插件也能换服, 两者别同时用就行（这里不去替用户拦）。
+            if (!game.Agents.HasFlag(InGameAgents.Minion))
+                return Failed("该客户端没有挂 Minion, 游戏内模块不会被注入");
 
             var context = await ResolveContextAsync(request, cancellationToken).ConfigureAwait(false);
 

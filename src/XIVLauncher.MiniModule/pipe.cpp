@@ -103,6 +103,9 @@ namespace
             return GameDump();
 
         // ---- 换服原语 ----------------------------------------------------
+        if (command == "WHERE")
+            return GameWhere();
+
         if (command == "RETURNTITLE")
             return GameReturnToTitle();
 

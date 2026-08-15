@@ -8,6 +8,8 @@
 
 #include <atomic>
 #include <cstdio>
+#include <memory>
+#include <utility>
 
 namespace
 {
@@ -244,13 +246,14 @@ std::string GameDump()
     if (!GameResolve())
         return "FAIL sigscan-failed";
 
-    ProbeData data{};
-    bool      ok = false;
+    auto shared = std::make_shared<std::pair<ProbeData, bool>>();
 
-    if (!MainThreadRun([&] { ok = ProbeRaw(&data); }, 3000))
+    if (!MainThreadRun([shared] { shared->second = ProbeRaw(&shared->first); }, 3000))
         return "FAIL mainthread-timeout";
 
-    if (!ok || data.networkModule == nullptr || data.agentLobby == nullptr)
+    const ProbeData& data = shared->first;
+
+    if (!shared->second || data.networkModule == nullptr || data.agentLobby == nullptr)
         return "FAIL probe-failed";
 
     char active[256]{}, lobby0[256]{}, saveData[256]{}, session[256]{};
@@ -277,8 +280,17 @@ std::string GameDump()
                                    static_cast<unsigned long long>(hits[i]));
     }
 
-    char devGm[160]{}, devSaveData[160]{}, devLobby01[160]{};
-    MainThreadRun([&] { CopyDevConfigHosts(data.framework, devGm, devSaveData, devLobby01, sizeof(devGm)); }, 3000);
+    struct DevHosts { char gm[160]; char saveData[160]; char lobby01[160]; void* framework; };
+
+    auto dev = std::make_shared<DevHosts>();
+    dev->gm[0] = dev->saveData[0] = dev->lobby01[0] = '\0';
+    dev->framework = data.framework;
+
+    MainThreadRun([dev] { CopyDevConfigHosts(dev->framework, dev->gm, dev->saveData, dev->lobby01, sizeof(dev->gm)); }, 3000);
+
+    const char* devGm        = dev->gm;
+    const char* devSaveData  = dev->saveData;
+    const char* devLobby01   = dev->lobby01;
 
     char response[1600];
     _snprintf_s(response, sizeof(response), _TRUNCATE,
@@ -439,10 +451,43 @@ namespace
         }
     }
 
+    // 当前处在哪个界面: 2=角色选择, 1=标题菜单, 0=在世界里(或过场中), -1=读不到
+    int OpWhere(const Pointers* p)
+    {
+        __try
+        {
+            if (p->unitManager == nullptr)
+                return -1;
+
+            const auto find = reinterpret_cast<GetAddonByNameFn>(g_getAddonByName);
+
+            if (find(p->unitManager, "_CharaSelectListMenu", 1) != nullptr)
+                return 2;
+
+            if (find(p->unitManager, "_TitleMenu", 1) != nullptr)
+                return 1;
+
+            return 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+    }
+
     int OpReturnToTitle(const Pointers* p)
     {
         __try
         {
+            // ⚠ 2026-08-15 两次实测: **在世界里**调这个函数必崩 (C0000005, 崩在主线程 tick 里),
+            //   换成 Tick hook 也一样 —— 它不是执行点的问题, 而是 returnToTitle 属于大厅上下文,
+            //   在世界里根本不该被调。DCTraveler 的判定与此一致 (TravelContextResolver.cs:66):
+            //   只有 _CharaSelectListMenu 存在时它才 ReturnToTitle。这里照抄那条闸。
+            const int where = OpWhere(p);
+
+            if (where != 2 && where != 1)
+                return 0; // 不在角色选择/标题界面 -> 拒绝执行
+
             reinterpret_cast<ReturnToTitleFn>(g_returnToTitle)(p->agentLobby);
             return 1;
         }
@@ -549,11 +594,13 @@ namespace
 
         while (g_keepAlive.load())
         {
-            Pointers pointers{};
-            MainThreadRun([&]
+            // 堆上传值捕获: 超时的 job 可能下一帧才被 tick 跑到, 那时这轮循环早结束了
+            auto state = std::make_shared<Pointers>();
+
+            MainThreadRun([state]
             {
-                if (GetPointers(&pointers))
-                    OpResetIdleTime(&pointers);
+                if (GetPointers(state.get()))
+                    OpResetIdleTime(state.get());
             }, 1000);
 
             Sleep(500);
@@ -563,8 +610,27 @@ namespace
         return 0;
     }
 
+    // 派到主线程去跑的 job, 捕获的东西必须自己活着 —— 超时之后调用方就返回了, 而 job 可能
+    // 下一帧才被 tick 跑到; 早期版本按引用捕栈变量, 那就是往野指针上写。统一放堆上传值捕获。
+    struct CallState
+    {
+        Pointers  pointers{};
+        ProbeData probe{};
+        int       result = -1;
+        bool      ok     = false;
+
+        std::string lobbyHost;
+        std::string saveDataHost;
+        std::string gmHost;
+
+        char  text[1400]{};
+        void* unitManager = nullptr;
+    };
+
+    using CallStatePtr = std::shared_ptr<CallState>;
+
     // 所有换服命令共用的前置: 特征码解析 + 指针取全, 缺一不可
-    bool PrepareCall(Pointers* pointers, std::string& failure)
+    bool PrepareCall(CallStatePtr& state, std::string& failure)
     {
         if (!GameResolve())
         {
@@ -572,14 +638,16 @@ namespace
             return false;
         }
 
-        bool ok = false;
-        if (!MainThreadRun([&] { ok = GetPointers(pointers); }, 3000))
+        state = std::make_shared<CallState>();
+        auto captured = state;
+
+        if (!MainThreadRun([captured] { captured->ok = GetPointers(&captured->pointers); }, 3000))
         {
             failure = "FAIL mainthread-timeout";
             return false;
         }
 
-        if (!ok)
+        if (!state->ok)
         {
             failure = "FAIL pointers-unavailable";
             return false;
@@ -591,54 +659,97 @@ namespace
 
 std::string GameSetHosts(const std::string& lobbyHost, const std::string& saveDataHost, const std::string& gmHost)
 {
-    Pointers    pointers{};
-    std::string failure;
+    CallStatePtr state;
+    std::string  failure;
 
-    if (!PrepareCall(&pointers, failure))
+    if (!PrepareCall(state, failure))
         return failure;
 
-    int written = -1;
-    if (!MainThreadRun([&] { written = OpSetHosts(&pointers, lobbyHost.c_str(), saveDataHost.c_str(), gmHost.c_str()); }, 5000))
+    state->lobbyHost    = lobbyHost;
+    state->saveDataHost = saveDataHost;
+    state->gmHost       = gmHost;
+
+    auto captured = state;
+
+    if (!MainThreadRun([captured]
+        {
+            captured->result = OpSetHosts(&captured->pointers,
+                                          captured->lobbyHost.c_str(),
+                                          captured->saveDataHost.c_str(),
+                                          captured->gmHost.c_str());
+        }, 5000))
         return "FAIL mainthread-timeout";
 
-    if (written < 0)
+    if (state->result < 0)
         return "FAIL exception";
 
-    LogF("[game] SETHOSTS lobby=%s sdb=%s gm=%s → 写了 %d 处", lobbyHost.c_str(), saveDataHost.c_str(), gmHost.c_str(), written);
+    LogF("[game] SETHOSTS lobby=%s sdb=%s gm=%s → 写了 %d 处",
+         lobbyHost.c_str(), saveDataHost.c_str(), gmHost.c_str(), state->result);
 
     char response[64];
-    _snprintf_s(response, sizeof(response), _TRUNCATE, "OK written=%d", written);
+    _snprintf_s(response, sizeof(response), _TRUNCATE, "OK written=%d", state->result);
     return response;
 }
 
 std::string GameReturnToTitle()
 {
-    Pointers    pointers{};
-    std::string failure;
+    CallStatePtr state;
+    std::string  failure;
 
-    if (!PrepareCall(&pointers, failure))
+    if (!PrepareCall(state, failure))
         return failure;
 
-    int result = -1;
-    if (!MainThreadRun([&] { result = OpReturnToTitle(&pointers); }, 5000))
+    auto captured = state;
+
+    if (!MainThreadRun([captured] { captured->result = OpReturnToTitle(&captured->pointers); }, 5000))
         return "FAIL mainthread-timeout";
 
-    return result == 1 ? "OK" : "FAIL exception";
+    if (state->result == 1)
+        return "OK";
+
+    // 拒绝执行不是错误, 是保护 —— 调用方（编排）该先让角色以正常途径登出到角色选择界面
+    if (state->result == 0)
+        return "FAIL not-at-charaselect";
+
+    return "FAIL exception";
+}
+
+std::string GameWhere()
+{
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareCall(state, failure))
+        return failure;
+
+    auto captured = state;
+
+    if (!MainThreadRun([captured] { captured->result = OpWhere(&captured->pointers); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    switch (state->result)
+    {
+        case 2:  return "OK where=charaselect";
+        case 1:  return "OK where=title";
+        case 0:  return "OK where=ingame";
+        default: return "FAIL unknown";
+    }
 }
 
 std::string GameReleaseLobbyContext()
 {
-    Pointers    pointers{};
-    std::string failure;
+    CallStatePtr state;
+    std::string  failure;
 
-    if (!PrepareCall(&pointers, failure))
+    if (!PrepareCall(state, failure))
         return failure;
 
-    int result = -1;
-    if (!MainThreadRun([&] { result = OpRelease(&pointers); }, 5000))
+    auto captured = state;
+
+    if (!MainThreadRun([captured] { captured->result = OpRelease(&captured->pointers); }, 5000))
         return "FAIL mainthread-timeout";
 
-    return result == 1 ? "OK" : "FAIL exception";
+    return state->result == 1 ? "OK" : "FAIL exception";
 }
 
 std::string GameSetSid(const std::string& sid)
@@ -646,20 +757,22 @@ std::string GameSetSid(const std::string& sid)
     if (sid.empty())
         return "FAIL empty-sid";
 
-    Pointers    pointers{};
-    std::string failure;
+    CallStatePtr state;
+    std::string  failure;
 
-    if (!PrepareCall(&pointers, failure))
+    if (!PrepareCall(state, failure))
         return failure;
 
-    int result = -1;
-    if (!MainThreadRun([&] { result = OpSetSid(&pointers, sid.c_str()); }, 5000))
+    state->lobbyHost = sid; // 借这个字段带过去, 免得闭包捕引用
+    auto captured    = state;
+
+    if (!MainThreadRun([captured] { captured->result = OpSetSid(&captured->pointers, captured->lobbyHost.c_str()); }, 5000))
         return "FAIL mainthread-timeout";
 
     // ⚠ 不打印 sid 本身, 那是登录票据
     LogF("[game] SETSID 写入 %d 字节", static_cast<int>(sid.size()));
 
-    return result == 1 ? "OK" : "FAIL exception";
+    return state->result == 1 ? "OK" : "FAIL exception";
 }
 
 namespace
@@ -714,24 +827,26 @@ namespace
 
 std::string GameListAddons()
 {
-    Pointers    pointers{};
-    std::string failure;
+    CallStatePtr state;
+    std::string  failure;
 
-    if (!PrepareCall(&pointers, failure))
+    if (!PrepareCall(state, failure))
         return failure;
 
-    char  names[1400]{};
-    void* unitManager = nullptr;
-    int   listed      = -1;
+    auto captured = state;
 
-    if (!MainThreadRun([&] { listed = OpListAddons(&pointers, names, sizeof(names), &unitManager); }, 5000))
+    if (!MainThreadRun([captured]
+        {
+            captured->result = OpListAddons(&captured->pointers, captured->text, sizeof(captured->text), &captured->unitManager);
+        }, 5000))
         return "FAIL mainthread-timeout";
 
-    if (listed < 0)
+    if (state->result < 0)
         return "FAIL exception";
 
     char response[1600];
-    _snprintf_s(response, sizeof(response), _TRUNCATE, "OK unitManager=0x%p listed=%d %s", unitManager, listed, names);
+    _snprintf_s(response, sizeof(response), _TRUNCATE, "OK unitManager=0x%p listed=%d %s",
+                state->unitManager, state->result, state->text);
 
     LogF("[game] ADDONS → %s", response);
     return response;
@@ -739,36 +854,38 @@ std::string GameListAddons()
 
 std::string GameTitleReady()
 {
-    Pointers    pointers{};
-    std::string failure;
+    CallStatePtr state;
+    std::string  failure;
 
-    if (!PrepareCall(&pointers, failure))
+    if (!PrepareCall(state, failure))
         return failure;
 
-    int result = -1;
-    if (!MainThreadRun([&] { result = OpTitleReady(&pointers); }, 3000))
+    auto captured = state;
+
+    if (!MainThreadRun([captured] { captured->result = OpTitleReady(&captured->pointers); }, 3000))
         return "FAIL mainthread-timeout";
 
-    if (result < 0)
+    if (state->result < 0)
         return "FAIL exception";
 
-    return result == 1 ? "OK ready=1" : "OK ready=0";
+    return state->result == 1 ? "OK ready=1" : "OK ready=0";
 }
 
 std::string GameLogin()
 {
-    Pointers    pointers{};
-    std::string failure;
+    CallStatePtr state;
+    std::string  failure;
 
-    if (!PrepareCall(&pointers, failure))
+    if (!PrepareCall(state, failure))
         return failure;
 
-    int result = -1;
-    if (!MainThreadRun([&] { result = OpLogin(&pointers); }, 5000))
+    auto captured = state;
+
+    if (!MainThreadRun([captured] { captured->result = OpLogin(&captured->pointers); }, 5000))
         return "FAIL mainthread-timeout";
 
-    if (result == 1) return "OK";
-    if (result == 0) return "FAIL no-title-menu"; // 不在标题界面
+    if (state->result == 1) return "OK";
+    if (state->result == 0) return "FAIL no-title-menu"; // 不在标题界面
     return "FAIL exception";
 }
 
@@ -810,6 +927,21 @@ void GameStopKeepAlive()
     g_keepAliveThread = nullptr;
 }
 
+void* GameFrameworkPointer()
+{
+    if (g_frameworkStatic == 0)
+        return nullptr;
+
+    __try
+    {
+        return *reinterpret_cast<void**>(g_frameworkStatic);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+}
+
 bool GameResolve()
 {
     if (g_resolved)
@@ -848,15 +980,17 @@ std::string GameProbe()
     if (!GameResolve())
         return "FAIL sigscan-failed";
 
-    ProbeData data{};
+    // 结构体是主线程在维护的, 读也放到主线程上, 免得读到半个正在被改的指针。
+    // 堆上传值捕获: 超时的 job 可能下一帧才跑, 那时这里的栈已经没了
+    auto shared = std::make_shared<std::pair<ProbeData, bool>>();
 
-    // 结构体是主线程在维护的, 读也放到主线程上, 免得读到半个正在被改的指针
-    bool ok = false;
-    if (!MainThreadRun([&] { ok = ProbeRaw(&data); }, 3000))
+    if (!MainThreadRun([shared] { shared->second = ProbeRaw(&shared->first); }, 3000))
         return "FAIL mainthread-timeout";
 
-    if (!ok)
+    if (!shared->second)
         return "FAIL probe-exception";
+
+    const ProbeData& data = shared->first;
 
     const uintptr_t base = ModuleBase();
 

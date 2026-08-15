@@ -19,6 +19,9 @@ namespace offsets
     inline constexpr int         FRAMEWORK_INSTANCE_SIG_OFFSET = 3;
 
     // ---- Framework ---------------------------------------------------------
+    // Framework.cs:149 [VirtualFunction(4)] bool Tick() —— 我们换掉这一项来取得每帧的主线程执行点
+    inline constexpr int FRAMEWORK_TICK_VF = 4;
+
     inline constexpr uintptr_t FRAMEWORK_DEV_CONFIG           = 0x0460; // Framework.cs:38
     inline constexpr uintptr_t FRAMEWORK_NETWORK_MODULE_PROXY = 0x1678; // Framework.cs:53
     inline constexpr uintptr_t FRAMEWORK_UI_MODULE            = 0x2B68; // Framework.cs:103

@@ -41,14 +41,17 @@ uintptr_t ScanText(const char* signature);                     // 命中 E8/E9 �
 uintptr_t ScanStaticAddress(const char* signature, int offset); // RIP 相对寻址的静态地址
 
 // ---- 游戏结构体 (game.cpp) --------------------------------------------------
-bool        GameResolve(); // 解析特征码, 只做一次
+bool        GameResolve();          // 解析特征码, 只做一次
+void*       GameFrameworkPointer(); // Framework 实例; 还没建起来时返回 nullptr
 std::string GameProbe();   // 只读自检: 把关键指针和当前大厅主机名读出来核对偏移
 std::string GameDump();    // 只读诊断: 摊开 Utf8String 头部 + 在 NetworkModule 里反查主机名
 
 // ---- 换服原语 (game.cpp) ----------------------------------------------------
 // 时序规格 = DCTraveler 的 GameFunctions.cs。每条独立, 编排在启动器那边:
 //   返回标题 → (等到标题界面) → 改主机名 → 作废大厅上下文 → 写新 SID → 点登录
+// ⚠ 只在角色选择/标题界面才会真的执行 —— 在世界里调 returnToTitle 实测必崩（见 game.cpp 注释）
 std::string GameReturnToTitle();
+std::string GameWhere(); // charaselect / title / ingame
 std::string GameSetHosts(const std::string& lobbyHost, const std::string& saveDataHost, const std::string& gmHost);
 std::string GameReleaseLobbyContext();
 std::string GameSetSid(const std::string& sid);

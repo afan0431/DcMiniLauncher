@@ -74,9 +74,22 @@ public sealed class InGameTravelService(DCTravelClient client)
 
         try
         {
-            // 1. 先回标题 —— 角色不下线, 迁移做不了
-            Report(progress, "正在返回标题界面…");
-            await CommandAsync(module, "RETURNTITLE", cancellationToken).ConfigureAwait(false);
+            // 0. 先看角色在哪。
+            //    ⚠ 硬约束（2026-08-15 两次实测, 两次都把客户端搞崩）: returnToTitle 属于大厅上下文,
+            //      **在世界里调用必崩**（C0000005, 崩在主线程 tick 里; 换执行点没用)。
+            //      DcTraveler 的判定与此一致: 只有 _CharaSelectListMenu 存在时它才 ReturnToTitle。
+            //      所以角色还在游戏内时, 这里直接拒绝, 由调用方（bot / 用户）先用正常途径登出。
+            var where = await module.SendAsync("WHERE", cancellationToken).ConfigureAwait(false);
+
+            if (where.Contains("where=ingame", StringComparison.Ordinal))
+                return InGameTravelResult.Failed("角色还在游戏内。请先登出到角色选择界面再换大区（在世界里强行返回标题会让客户端崩溃）");
+
+            if (!where.Contains("where=title", StringComparison.Ordinal))
+            {
+                // 在角色选择界面 —— 退回标题, 换服那几步要在标题界面做
+                Report(progress, "正在返回标题界面…");
+                await CommandAsync(module, "RETURNTITLE", cancellationToken).ConfigureAwait(false);
+            }
 
             if (!await WaitForTitleAsync(module, progress, cancellationToken).ConfigureAwait(false))
                 return InGameTravelResult.Failed("等不到标题界面");

@@ -370,9 +370,9 @@ public sealed partial class DCTravelViewModel : ObservableObject
     }
 
     /// <summary>
-    ///     本次传送能不能走「游戏内换服」（F4）。条件是本启动器正好起着一个客户端, 且它是
-    ///     「只 Minion」模式 —— 注了 Dalamud 的由 DcTraveler 插件负责, 什么都没注的没有执行者。
-    ///     不满足就返回 null, 走原来的外部传送（传送完再启动游戏）。
+    ///     本次传送能不能走「游戏内换服」（F4）。条件是本启动器正好起着一个客户端、且它挂了 Minion
+    ///     —— 「只 Minion」和「都注」两种模式都算, 因为模块在这两种模式下都会被注入。
+    ///     什么都没注的模式没有执行者, 走原来的外部传送（传送完再启动游戏）。
     /// </summary>
     private static RunningGameRegistry.Entry? TryGetInGameTarget()
     {
@@ -381,7 +381,7 @@ public sealed partial class DCTravelViewModel : ObservableObject
         if (game == null)
             return null;
 
-        if (game.Agents != InGameAgents.Minion)
+        if (!game.Agents.HasFlag(InGameAgents.Minion))
             return null;
 
         return MiniModuleInjector.ModulePath.Exists ? game : null;

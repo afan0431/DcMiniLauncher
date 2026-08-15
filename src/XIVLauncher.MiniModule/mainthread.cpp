@@ -1,10 +1,15 @@
-// 在游戏主线程上执行代码
+// 在游戏主线程上执行代码 —— 挂 Framework::Tick 的虚表项
 //
-// 手法: 给游戏窗口（类名 FFXIVGAME）子类化 WndProc + PostMessage 自定义消息。
-// 窗口消息一定在「创建该窗口的线程」上被派发, 所以回调天然跑在那个线程上, 零偏移零特征码。
-// 这一步同时把「窗口线程」和「进程主线程（创建时间最早的线程）」两个 id 都记下来,
-// 实测核对二者是否同一个 —— 这正是本轮生死闸要回答的问题。
+// ⚠ 2026-08-15 血的教训: 第一版走的是「子类化游戏窗口 WndProc + PostMessage」。它零偏移零特征码,
+//   过生死闸够用, 在角色选择页调 returnToTitle 也没事 —— 但**从游戏内**调 returnToTitle 会闪退:
+//   崩溃包显示 C0000005 崩在主线程的 Framework tick 里 (栈上就是 tick), 就在调用后 1.6 秒。
+//   消息泵那个点并不是游戏状态机能承受重量级状态转换的地方。计划原本写的就是「hook 每帧函数
+//   (如 Framework::Tick) 在主线程上执行」, 这次老实照做。
+//
+// 手法: Framework 的 Tick 是虚表第 4 号 (ClientStructs Framework.cs:149)。改虚表项比 inline hook
+// 简单得多, 也不用引第三方库; 我们在原函数之前把队列里的活干完, 然后照常调原函数。
 #include "MiniModule.h"
+#include "offsets.h"
 
 #include <atomic>
 #include <memory>
@@ -14,8 +19,7 @@
 
 namespace
 {
-    // WM_APP + 'ML'
-    constexpr UINT WM_MINILAUNCHER_RUN = WM_APP + 0x4D4C;
+    using TickFn = char (*)(void* framework);
 
     struct Job
     {
@@ -24,47 +28,18 @@ namespace
         std::atomic<bool>     abandoned {false};
     };
 
-    HWND     g_window       = nullptr;
-    DWORD    g_windowThread = 0;
-    WNDPROC  g_originalProc = nullptr;
+    void*   g_framework    = nullptr;
+    void**  g_vtable       = nullptr;
+    TickFn  g_originalTick = nullptr;
+    DWORD   g_tickThread   = 0;
 
-    std::mutex                             g_queueMutex;
-    std::vector<std::shared_ptr<Job>>      g_queue;
+    std::atomic<int>  g_insideHook {0};
+    std::atomic<bool> g_installed  {false};
 
-    struct FindWindowContext
-    {
-        DWORD processId;
-        HWND  found;
-    };
+    std::mutex                        g_queueMutex;
+    std::vector<std::shared_ptr<Job>> g_queue;
 
-    BOOL CALLBACK FindWindowProc(HWND hwnd, LPARAM param)
-    {
-        auto* context = reinterpret_cast<FindWindowContext*>(param);
-
-        DWORD owner = 0;
-        GetWindowThreadProcessId(hwnd, &owner);
-
-        if (owner != context->processId)
-            return TRUE;
-
-        wchar_t className[64]{};
-        GetClassNameW(hwnd, className, 64);
-
-        if (lstrcmpiW(className, L"FFXIVGAME") != 0)
-            return TRUE;
-
-        context->found = hwnd;
-        return FALSE;
-    }
-
-    HWND FindGameWindow()
-    {
-        FindWindowContext context {GetCurrentProcessId(), nullptr};
-        EnumWindows(FindWindowProc, reinterpret_cast<LPARAM>(&context));
-        return context.found;
-    }
-
-    // 绝不能让异常顺着 WndProc 冒回游戏 —— 那是直接把游戏搞崩。
+    // 绝不能让异常顺着 tick 冒回游戏。
     // ⚠ 单独一个函数: 带 __try 的函数里不能有需要展开的 C++ 对象 (MSVC C2712)
     void RunGuarded(const std::function<void()>& work)
     {
@@ -84,6 +59,10 @@ namespace
 
         {
             std::lock_guard<std::mutex> lock(g_queueMutex);
+
+            if (g_queue.empty())
+                return;
+
             pending.swap(g_queue);
         }
 
@@ -96,88 +75,135 @@ namespace
         }
     }
 
-    LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+    char HookedTick(void* framework)
     {
-        if (message == WM_MINILAUNCHER_RUN)
+        g_insideHook.fetch_add(1);
+
+        g_tickThread = GetCurrentThreadId();
+        DrainQueue();
+
+        const auto original = g_originalTick;
+
+        g_insideHook.fetch_sub(1);
+
+        // 卸载时可能刚好把 g_originalTick 清了; 那种情况下什么都不做比跳空地址强
+        return original != nullptr ? original(framework) : 1;
+    }
+
+    bool PatchVTable(void* newFunction, void** previous)
+    {
+        DWORD oldProtect = 0;
+        auto* slot       = &g_vtable[offsets::FRAMEWORK_TICK_VF];
+
+        if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect))
         {
-            DrainQueue();
-            return 0;
+            LogF("[mainthread] VirtualProtect 失败 err=%lu", GetLastError());
+            return false;
         }
 
-        return CallWindowProcW(g_originalProc, hwnd, message, wParam, lParam);
+        if (previous != nullptr)
+            *previous = *slot;
+
+        *slot = newFunction;
+
+        DWORD ignored = 0;
+        VirtualProtect(slot, sizeof(void*), oldProtect, &ignored);
+
+        return true;
     }
 }
 
 bool MainThreadInstall()
 {
-    // 注入时机由启动器控制（等到窗口出现之后), 但仍留一段重试, 免得抢跑就直接判死
-    for (int attempt = 0; attempt < 120 && g_window == nullptr; ++attempt)
-    {
-        g_window = FindGameWindow();
+    if (g_installed.load())
+        return true;
 
-        if (g_window == nullptr)
+    if (!GameResolve())
+    {
+        LogF("[mainthread] 特征码没解析出来, 无法挂 tick");
+        return false;
+    }
+
+    // 刚注入时 Framework 可能还没建起来, 给一段重试
+    for (int attempt = 0; attempt < 120 && g_framework == nullptr; ++attempt)
+    {
+        g_framework = GameFrameworkPointer();
+
+        if (g_framework == nullptr)
             Sleep(500);
     }
 
-    if (g_window == nullptr)
+    if (g_framework == nullptr)
     {
-        LogF("[mainthread] 没找到游戏窗口 (class=FFXIVGAME), 无法建立主线程通道");
+        LogF("[mainthread] 拿不到 Framework 实例");
         return false;
     }
 
-    g_windowThread = GetWindowThreadProcessId(g_window, nullptr);
+    g_vtable = *reinterpret_cast<void***>(g_framework);
 
-    g_originalProc = reinterpret_cast<WNDPROC>(
-        SetWindowLongPtrW(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookedWndProc)));
-
-    if (g_originalProc == nullptr)
-    {
-        LogF("[mainthread] 子类化窗口失败 err=%lu", GetLastError());
-        g_window = nullptr;
+    if (!PatchVTable(reinterpret_cast<void*>(&HookedTick), reinterpret_cast<void**>(&g_originalTick)))
         return false;
-    }
 
-    LogF("[mainthread] 已子类化游戏窗口 hwnd=0x%p 窗口线程=%lu 进程主线程=%lu",
-         g_window, g_windowThread, ProcessMainThreadId());
+    g_installed.store(true);
+    LogF("[mainthread] 已挂上 Framework::Tick (framework=0x%p vtable=0x%p 原函数=0x%p)",
+         g_framework, g_vtable, reinterpret_cast<void*>(g_originalTick));
 
     return true;
 }
 
 bool MainThreadUninstall()
 {
-    if (g_window == nullptr || g_originalProc == nullptr)
+    if (!g_installed.load())
         return true;
 
-    // 只在当前 WndProc 还是我们自己时才还原 —— 若之后又有别人（比如 bot 的 overlay）套了一层,
-    // 强行还原会把它那层一起抹掉
-    const auto current = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(g_window, GWLP_WNDPROC));
+    void* current = nullptr;
 
-    if (current != HookedWndProc)
     {
-        LogF("[mainthread] 当前 WndProc 已被别人接管, 不还原（避免连带抹掉别人那层), 模块只能留在进程里");
+        DWORD oldProtect = 0;
+        auto* slot       = &g_vtable[offsets::FRAMEWORK_TICK_VF];
+
+        if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect))
+        {
+            current = *slot;
+
+            // 别人又在我们之上套了一层就不还原 —— 强行还原会把它那层一起抹掉
+            if (current == reinterpret_cast<void*>(&HookedTick))
+                *slot = reinterpret_cast<void*>(g_originalTick);
+
+            DWORD ignored = 0;
+            VirtualProtect(slot, sizeof(void*), oldProtect, &ignored);
+        }
+    }
+
+    if (current != reinterpret_cast<void*>(&HookedTick))
+    {
+        LogF("[mainthread] 虚表项已被别人接管, 不还原, 模块只能留在进程里");
         return false;
     }
 
-    SetWindowLongPtrW(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_originalProc));
+    // 还原之后可能仍有一帧正卡在我们的 hook 里, 等它出来再谈卸载
+    for (int i = 0; i < 200 && g_insideHook.load() > 0; ++i)
+        Sleep(10);
 
-    // 还原之后可能仍有一次派发正卡在我们的 WndProc 里。发一条同步消息等窗口线程走完一轮,
-    // 回来时就能确定没有任何调用栈还停在本模块代码上, 卸载才是安全的
-    DWORD_PTR result = 0;
-    SendMessageTimeoutW(g_window, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 5000, &result);
+    if (g_insideHook.load() > 0)
+    {
+        LogF("[mainthread] ⚠ 仍有调用停在 hook 里, 卸载不安全");
+        return false;
+    }
 
-    LogF("[mainthread] 已还原游戏窗口 WndProc");
+    g_installed.store(false);
+    g_originalTick = nullptr;
 
-    g_window       = nullptr;
-    g_originalProc = nullptr;
+    LogF("[mainthread] 已还原 Framework::Tick");
     return true;
 }
 
 bool MainThreadRun(const std::function<void()>& work, DWORD timeoutMs)
 {
-    if (g_window == nullptr)
+    if (!g_installed.load())
         return false;
 
-    if (GetCurrentThreadId() == g_windowThread)
+    if (GetCurrentThreadId() == g_tickThread && g_insideHook.load() > 0)
     {
         work();
         return true;
@@ -195,26 +221,17 @@ bool MainThreadRun(const std::function<void()>& work, DWORD timeoutMs)
         g_queue.push_back(job);
     }
 
-    if (!PostMessageW(g_window, WM_MINILAUNCHER_RUN, 0, 0))
-    {
-        LogF("[mainthread] PostMessage 失败 err=%lu", GetLastError());
-        job->abandoned.store(true);
-        CloseHandle(job->done);
-        return false;
-    }
-
     const bool ok = WaitForSingleObject(job->done, timeoutMs) == WAIT_OBJECT_0;
 
     if (!ok)
     {
-        // 超时: job 可能还排在队里。标记作废让派发端跳过执行, shared_ptr 保证对象活到那时,
-        // 所以这里绝不能直接销毁 —— 事件句柄留给派发端最后 SetEvent 用完由 shared_ptr 析构收
+        // 超时: job 可能还排在队里。标记作废让 tick 跳过它。
+        // ⚠ 调用方给的闭包一律要求「捕获的东西自己活着」(shared_ptr 传值), 因为这里没法保证
+        //   tick 不会在下一帧才碰它 —— 早期版本闭包按引用捕栈变量, 超时后就是写野指针。
         job->abandoned.store(true);
         LogF("[mainthread] 等待主线程执行超时 (%lums)", timeoutMs);
     }
-
-    // done 句柄的所有权仍在 job 里; 这里只有在确定没人再碰它时才关
-    if (ok)
+    else
     {
         CloseHandle(job->done);
         job->done = nullptr;
@@ -223,8 +240,8 @@ bool MainThreadRun(const std::function<void()>& work, DWORD timeoutMs)
     return ok;
 }
 
-HWND  MainThreadWindow()       { return g_window; }
-DWORD MainThreadWindowThread() { return g_windowThread; }
+HWND  MainThreadWindow()       { return nullptr; } // 不再依赖窗口
+DWORD MainThreadWindowThread() { return g_tickThread; }
 
 DWORD ProcessMainThreadId()
 {
