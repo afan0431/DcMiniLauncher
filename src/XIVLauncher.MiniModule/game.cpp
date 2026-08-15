@@ -12,6 +12,7 @@
 namespace
 {
     uintptr_t g_frameworkStatic     = 0;
+    uintptr_t g_atkStageStatic      = 0;
     uintptr_t g_returnToTitle       = 0;
     uintptr_t g_releaseLobbyContext = 0;
     uintptr_t g_setString           = 0;
@@ -316,6 +317,7 @@ namespace
         void* uiModule;
         void* agentLobby;
         void* networkModule;
+        void* unitManager; // AtkStage → RaptureAtkUnitManager, 找 addon 用
     };
 
     bool GetPointers(Pointers* out)
@@ -346,6 +348,15 @@ namespace
             const auto proxy = ReadAt<void*>(out->framework, offsets::FRAMEWORK_NETWORK_MODULE_PROXY);
             if (proxy != nullptr)
                 out->networkModule = ReadAt<void*>(proxy, offsets::NETWORK_MODULE_PROXY_MODULE);
+
+            // addon 相关的走 AtkStage, 取不到不算失败（换服那几步用不着它）
+            if (g_atkStageStatic != 0)
+            {
+                const auto stage = *reinterpret_cast<void**>(g_atkStageStatic);
+
+                if (stage != nullptr)
+                    out->unitManager = ReadAt<void*>(stage, offsets::ATK_STAGE_UNIT_MANAGER);
+            }
 
             return out->agentLobby != nullptr && out->networkModule != nullptr;
         }
@@ -476,11 +487,10 @@ namespace
     {
         __try
         {
-            const auto unitManager = reinterpret_cast<uint8_t*>(p->uiModule) +
-                                     offsets::UI_MODULE_RAPTURE_ATK_MODULE +
-                                     offsets::RAPTURE_ATK_MODULE_UNIT_MANAGER;
+            if (p->unitManager == nullptr)
+                return -1;
 
-            return reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(unitManager, "_TitleMenu", 1) != nullptr ? 1 : 0;
+            return reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(p->unitManager, "_TitleMenu", 1) != nullptr ? 1 : 0;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -493,11 +503,10 @@ namespace
     {
         __try
         {
-            const auto unitManager = reinterpret_cast<uint8_t*>(p->uiModule) +
-                                     offsets::UI_MODULE_RAPTURE_ATK_MODULE +
-                                     offsets::RAPTURE_ATK_MODULE_UNIT_MANAGER;
+            if (p->unitManager == nullptr)
+                return -1;
 
-            const auto addon = reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(unitManager, "_TitleMenu", 1);
+            const auto addon = reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(p->unitManager, "_TitleMenu", 1);
             if (addon == nullptr)
                 return 0; // 不在标题界面
 
@@ -525,8 +534,14 @@ namespace
         }
     }
 
-    // 轮询期保活: 标题界面挂久了会被踢, DCTraveler 每帧把 IdleTime 归零, 我们按 500ms 一次
+    // 轮询期保活: 标题界面闲置久了会飘进片头动画（IdleTime 涨到两万上下就触发), DCTraveler 每帧把
+    // IdleTime 归零, 我们按 500ms 一次。
+    //
+    // ⚠ 这条线程必须在卸载模块之前 join 掉。2026-08-15 实测教训: 先 KEEPALIVE OFF 再立刻 UNLOAD,
+    //   线程可能还停在 Sleep(500) 里, 而 FreeLibraryAndExitThread 已经把模块代码页解除映射 ——
+    //   它一醒来就跳进空地址, 直接把游戏带走。
     std::atomic<bool> g_keepAlive {false};
+    HANDLE            g_keepAliveThread = nullptr;
 
     DWORD WINAPI KeepAliveProc(LPVOID)
     {
@@ -647,6 +662,81 @@ std::string GameSetSid(const std::string& sid)
     return result == 1 ? "OK" : "FAIL exception";
 }
 
+namespace
+{
+    // 诊断: TITLEREADY 说找不到 _TitleMenu 时, 用它区分「确实没这个 addon」和「unitManager 指针就不对」。
+    // 能列出一串合理的 addon 名 = 指针对; 一个都列不出来 = 偏移错。
+    int OpListAddons(const Pointers* p, char* out, size_t capacity, void** unitManagerOut)
+    {
+        __try
+        {
+            const auto unitManager = reinterpret_cast<uint8_t*>(p->unitManager);
+            *unitManagerOut = unitManager;
+
+            if (unitManager == nullptr)
+                return -1;
+
+            const auto list    = unitManager + offsets::ATK_UNIT_MANAGER_ALL_LOADED;
+            const auto count   = ReadAt<unsigned short>(list, offsets::ATK_UNIT_LIST_COUNT);
+            const auto entries = reinterpret_cast<void**>(list + offsets::ATK_UNIT_LIST_ENTRIES);
+
+            int written = _snprintf_s(out, capacity, _TRUNCATE, "count=%u:", count);
+            int listed  = 0;
+
+            for (unsigned short i = 0; i < count && i < 256 && listed < 40; ++i)
+            {
+                const auto addon = entries[i];
+                if (addon == nullptr)
+                    continue;
+
+                const auto name = reinterpret_cast<const char*>(reinterpret_cast<uint8_t*>(addon) + offsets::ATK_UNIT_BASE_NAME);
+
+                if (name[0] == '\0')
+                    continue;
+
+                const int room = static_cast<int>(capacity) - written;
+                if (room < 40)
+                    break;
+
+                written += _snprintf_s(out + written, static_cast<size_t>(room), _TRUNCATE, " %.31s", name);
+                ++listed;
+            }
+
+            return listed;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] 枚举 addon 异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+}
+
+std::string GameListAddons()
+{
+    Pointers    pointers{};
+    std::string failure;
+
+    if (!PrepareCall(&pointers, failure))
+        return failure;
+
+    char  names[1400]{};
+    void* unitManager = nullptr;
+    int   listed      = -1;
+
+    if (!MainThreadRun([&] { listed = OpListAddons(&pointers, names, sizeof(names), &unitManager); }, 5000))
+        return "FAIL mainthread-timeout";
+
+    if (listed < 0)
+        return "FAIL exception";
+
+    char response[1600];
+    _snprintf_s(response, sizeof(response), _TRUNCATE, "OK unitManager=0x%p listed=%d %s", unitManager, listed, names);
+
+    LogF("[game] ADDONS → %s", response);
+    return response;
+}
+
 std::string GameTitleReady()
 {
     Pointers    pointers{};
@@ -687,22 +777,37 @@ std::string GameKeepAlive(bool enable)
     if (enable == g_keepAlive.load())
         return enable ? "OK already-on" : "OK already-off";
 
-    g_keepAlive.store(enable);
-
     if (enable)
     {
-        const HANDLE thread = CreateThread(nullptr, 0, KeepAliveProc, nullptr, 0, nullptr);
+        g_keepAlive.store(true);
+        g_keepAliveThread = CreateThread(nullptr, 0, KeepAliveProc, nullptr, 0, nullptr);
 
-        if (thread == nullptr)
+        if (g_keepAliveThread == nullptr)
         {
             g_keepAlive.store(false);
             return "FAIL cannot-start-thread";
         }
 
-        CloseHandle(thread);
+        return "OK";
     }
 
+    GameStopKeepAlive();
     return "OK";
+}
+
+void GameStopKeepAlive()
+{
+    g_keepAlive.store(false);
+
+    if (g_keepAliveThread == nullptr)
+        return;
+
+    // 必须等它真的退出来 —— 见上面 g_keepAliveThread 的说明
+    if (WaitForSingleObject(g_keepAliveThread, 5000) != WAIT_OBJECT_0)
+        LogF("[game] ⚠ 保活线程没能在 5 秒内退出, 此时卸载模块是不安全的");
+
+    CloseHandle(g_keepAliveThread);
+    g_keepAliveThread = nullptr;
 }
 
 bool GameResolve()
@@ -713,6 +818,7 @@ bool GameResolve()
     const uintptr_t base = ModuleBase();
 
     g_frameworkStatic     = ScanStaticAddress(offsets::FRAMEWORK_INSTANCE_SIG, offsets::FRAMEWORK_INSTANCE_SIG_OFFSET);
+    g_atkStageStatic      = ScanStaticAddress(offsets::ATK_STAGE_SIG, offsets::ATK_STAGE_SIG_OFFSET);
     g_returnToTitle       = ScanText(offsets::RETURN_TO_TITLE_SIG);
     g_releaseLobbyContext = ScanText(offsets::RELEASE_LOBBY_CONTEXT_SIG);
     g_setString           = ScanText(offsets::UTF8_SET_STRING_SIG);
@@ -726,9 +832,10 @@ bool GameResolve()
     LogF("[game]   Utf8String::SetString   RVA=0x%llX", static_cast<unsigned long long>(g_setString           ? g_setString           - base : 0));
     LogF("[game]   GetAddonByName          RVA=0x%llX", static_cast<unsigned long long>(g_getAddonByName      ? g_getAddonByName      - base : 0));
     LogF("[game]   GetComponentButtonById  RVA=0x%llX", static_cast<unsigned long long>(g_getComponentButton  ? g_getComponentButton  - base : 0));
+    LogF("[game]   AtkStage 静态指针       RVA=0x%llX", static_cast<unsigned long long>(g_atkStageStatic      ? g_atkStageStatic      - base : 0));
 
     g_resolved = g_frameworkStatic != 0 && g_returnToTitle != 0 && g_releaseLobbyContext != 0 && g_setString != 0 &&
-                 g_getAddonByName != 0 && g_getComponentButton != 0;
+                 g_getAddonByName != 0 && g_getComponentButton != 0 && g_atkStageStatic != 0;
 
     if (!g_resolved)
         LogF("[game] 有特征码没命中 —— 游戏版本变了或偏移库过期");

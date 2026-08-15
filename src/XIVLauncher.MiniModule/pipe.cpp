@@ -112,6 +112,9 @@ namespace
         if (command == "TITLEREADY")
             return GameTitleReady();
 
+        if (command == "ADDONS")
+            return GameListAddons();
+
         if (command == "LOGIN")
             return GameLogin();
 

@@ -10,7 +10,14 @@ param(
     [switch]$KeepLoaded,
     # 幂等写自检: 把读到的主机名原样写回去, 再读回来核对。验证 SetString + DevConfig 遍历这条写入路径,
     # 但因为写的值和原值完全一样, 对正在跑的客户端没有任何语义影响。不碰 RETURNTITLE/RELEASE。
-    [switch]$SafeWriteTest
+    [switch]$SafeWriteTest,
+    # 客户端停在标题界面时跑: 验 TITLEREADY / KEEPALIVE / RETURNTITLE。
+    # 不点登录、不改主机名、不写 SID —— 那三条要么需要真订单, 要么会让客户端拿已用过的票据去登录。
+    [switch]$TitleTest,
+    # 盯梢模式: 先开保活（免得标题界面闲置久了飘进片头动画, 那时 _TitleMenu 是不存在的),
+    # 然后轮询 TITLEREADY 直到认出标题菜单, 顺便把已加载的 addon 列出来。
+    [switch]$TitleWatch,
+    [int]$WatchSeconds = 90
 )
 
 $ErrorActionPreference = 'Stop'
@@ -185,6 +192,78 @@ try
         # 不在标题界面时应当明确回 no-title-menu, 而不是崩或超时 —— 验证 GetAddonByName/按钮查找这条路
         $login = Send-ModuleCommand -Pipe $pipe -Command 'LOGIN'
         Write-Host "  LOGIN (当前不在标题界面) → $login"
+        Write-Host ''
+    }
+
+    if ($TitleTest)
+    {
+        Write-Host '--- 标题界面自检 (不点登录, 不改主机名) ---' -ForegroundColor Cyan
+
+        $ready = Send-ModuleCommand -Pipe $pipe -Command 'TITLEREADY'
+        Write-Host "  TITLEREADY → $ready"
+
+        if ($ready -match 'ready=1') { Write-Host '  [OK] 认出了标题界面' -ForegroundColor Green }
+        else { Write-Host '  [!!] 没认出标题界面 —— 编排会一直等下去' -ForegroundColor Red }
+
+        # 保活: 开着的时候 IdleTime 应当被反复归零, 关掉之后它会重新涨上去
+        Write-Host "  KEEPALIVE ON → $(Send-ModuleCommand -Pipe $pipe -Command 'KEEPALIVE ON')"
+        Start-Sleep -Seconds 3
+
+        $duringA = Send-ModuleCommand -Pipe $pipe -Command 'PROBE'
+        Start-Sleep -Seconds 2
+        $duringB = Send-ModuleCommand -Pipe $pipe -Command 'PROBE'
+
+        Write-Host "  KEEPALIVE OFF → $(Send-ModuleCommand -Pipe $pipe -Command 'KEEPALIVE OFF')"
+        Start-Sleep -Seconds 4
+        $after = Send-ModuleCommand -Pipe $pipe -Command 'PROBE'
+
+        $idleA = if ($duringA -match 'idleTime=(-?\d+)') { [int]$Matches[1] } else { -1 }
+        $idleB = if ($duringB -match 'idleTime=(-?\d+)') { [int]$Matches[1] } else { -1 }
+        $idleC = if ($after   -match 'idleTime=(-?\d+)') { [int]$Matches[1] } else { -1 }
+
+        Write-Host "  idleTime: 保活中=$idleA / $idleB, 停保活 4 秒后=$idleC"
+
+        if ($idleC -gt $idleB) { Write-Host '  [OK] 保活确实在压着 IdleTime (停掉后就涨回去了)' -ForegroundColor Green }
+        else { Write-Host '  [?] IdleTime 没按预期变化, 需人工确认这个字段在标题界面是否会自增' -ForegroundColor Yellow }
+
+        # 已经在标题界面了, 再调一次 returnToTitle 应当是安全的空操作 —— 验它不崩
+        Write-Host "  RETURNTITLE → $(Send-ModuleCommand -Pipe $pipe -Command 'RETURNTITLE')"
+        Start-Sleep -Seconds 2
+        Write-Host "  TITLEREADY (调用后) → $(Send-ModuleCommand -Pipe $pipe -Command 'TITLEREADY')"
+        Write-Host ''
+    }
+
+    if ($TitleWatch)
+    {
+        Write-Host '--- 盯梢标题菜单 (已开保活, 请退出片头动画) ---' -ForegroundColor Cyan
+        Write-Host "  KEEPALIVE ON → $(Send-ModuleCommand -Pipe $pipe -Command 'KEEPALIVE ON')"
+
+        $deadline = (Get-Date).AddSeconds($WatchSeconds)
+        $ready    = $false
+        $last     = ''
+
+        while ((Get-Date) -lt $deadline -and -not $ready)
+        {
+            $response = Send-ModuleCommand -Pipe $pipe -Command 'TITLEREADY'
+
+            if ($response -ne $last)
+            {
+                Write-Host "  [$(Get-Date -Format HH:mm:ss)] TITLEREADY → $response"
+                $last = $response
+            }
+
+            if ($response -match 'ready=1') { $ready = $true; break }
+            Start-Sleep -Seconds 2
+        }
+
+        if ($ready) { Write-Host '  [OK] 认出了标题菜单' -ForegroundColor Green }
+        else { Write-Host "  [!!] $WatchSeconds 秒内没等到 ready=1" -ForegroundColor Red }
+
+        # 不管认没认出来都把 addon 列出来: 列得出一串合理名字 = unitManager 指针是对的
+        $addons = Send-ModuleCommand -Pipe $pipe -Command 'ADDONS'
+        Write-Host "  ADDONS → $addons"
+
+        Write-Host "  KEEPALIVE OFF → $(Send-ModuleCommand -Pipe $pipe -Command 'KEEPALIVE OFF')"
         Write-Host ''
     }
 

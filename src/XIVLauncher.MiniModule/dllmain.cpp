@@ -19,6 +19,9 @@ namespace
 
         PipeServerRun();
 
+        // 顺序要紧: 先把自己起的线程收干净, 再谈还原窗口和卸载自己
+        GameStopKeepAlive();
+
         const bool restored = MainThreadUninstall();
 
         LogF("=== MiniLauncher 模块退出 (窗口已还原=%d) ===", restored ? 1 : 0);

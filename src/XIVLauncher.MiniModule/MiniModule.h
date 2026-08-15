@@ -53,8 +53,12 @@ std::string GameSetHosts(const std::string& lobbyHost, const std::string& saveDa
 std::string GameReleaseLobbyContext();
 std::string GameSetSid(const std::string& sid);
 std::string GameTitleReady(); // returnToTitle 是异步的, 编排侧靠它等到标题界面
+std::string GameListAddons(); // 只读诊断: 列出已加载的 addon, 用来排查找不到 _TitleMenu 的原因
 std::string GameLogin();
-std::string GameKeepAlive(bool enable); // 轮询期把 AgentLobby.IdleTime 定期归零, 免得挂在标题界面被踢
+std::string GameKeepAlive(bool enable); // 轮询期把 AgentLobby.IdleTime 定期归零, 免得标题界面飘进片头动画
+
+// ⚠ 卸载模块前必须调: 保活线程还在跑的时候 FreeLibrary = 它醒来跳进已解除映射的代码页, 直接把游戏带走
+void GameStopKeepAlive();
 
 // ---- 命名管道服务端 (pipe.cpp) ----------------------------------------------
 // \\.\pipe\minilauncher-<pid> —— 按 PID 分开, 天然满足「多开不串」

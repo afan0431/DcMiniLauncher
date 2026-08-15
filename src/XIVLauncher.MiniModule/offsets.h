@@ -61,14 +61,24 @@ namespace offsets
     inline constexpr size_t    CONFIG_ENTRY_SIZE   = 0x38;
 
     // ---- UI: 在标题界面点「开始游戏」 --------------------------------------
-    // UIModule.cs:108  [FieldOffset(0xD2670 - 0x10)] RaptureAtkModule
-    inline constexpr uintptr_t UI_MODULE_RAPTURE_ATK_MODULE = 0xD2670 - 0x10;
-    // RaptureAtkModule.cs:51  [FieldOffset(0x13430 - 0x10)] RaptureAtkUnitManager
-    // RaptureAtkUnitManager 继承 AtkUnitManager, 地址可直接当 AtkUnitManager* 用
-    inline constexpr uintptr_t RAPTURE_ATK_MODULE_UNIT_MANAGER = 0x13430 - 0x10;
+    // AtkUnitManager 走 AtkStage 拿, 不走 UIModule 那条长链 ——
+    // ⚠ 2026-08-15 实测: UIModule+0xD2660 → +0x13420 那条算出来的指针是错的
+    //   (AllLoadedUnitsList.Count 读出来是 0, 一个 addon 都列不出来)。
+    //   AtkStage 只有「静态指针 → +0x20」两步, 短且是 CS 自己 AtkStage.Instance() 的走法。
+    // Component/GUI/AtkStage.cs:15
+    inline constexpr const char* ATK_STAGE_SIG        = "48 8B 05 ?? ?? ?? ?? 4C 8B 40 18 45 8B 40 18";
+    inline constexpr int         ATK_STAGE_SIG_OFFSET = 3;
+    // AtkStage.cs:20 —— RaptureAtkUnitManager 继承 AtkUnitManager, 可直接当 AtkUnitManager* 用
+    inline constexpr uintptr_t ATK_STAGE_UNIT_MANAGER = 0x20;
 
     inline constexpr uintptr_t ATK_COMPONENT_BASE_RES_NODE = 0xA0; // AtkComponentBase.cs:16
     inline constexpr uintptr_t ATK_RES_NODE_EVENT_MANAGER  = 0x18; // AtkResNode.cs:18, +0 即 AtkEvent*
+
+    // 诊断用: 枚举已加载的 addon —— AtkUnitManager.cs:27 / AtkUnitList.cs:8,9 / AtkUnitBase.cs:16
+    inline constexpr uintptr_t ATK_UNIT_MANAGER_ALL_LOADED = 0x6900;
+    inline constexpr uintptr_t ATK_UNIT_LIST_ENTRIES       = 0x08;
+    inline constexpr uintptr_t ATK_UNIT_LIST_COUNT         = 0x808;
+    inline constexpr uintptr_t ATK_UNIT_BASE_NAME          = 0x08;
 
     inline constexpr int ATK_UNIT_BASE_RECEIVE_EVENT_VF = 2;  // AtkEventListener.cs:15
     inline constexpr int ATK_EVENT_TYPE_BUTTON_CLICK    = 25; // AtkEvent.cs:32
