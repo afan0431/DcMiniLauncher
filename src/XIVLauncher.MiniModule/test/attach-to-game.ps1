@@ -7,7 +7,10 @@
 
 param(
     [int]$ProcessId = 0,
-    [switch]$KeepLoaded
+    [switch]$KeepLoaded,
+    # 幂等写自检: 把读到的主机名原样写回去, 再读回来核对。验证 SetString + DevConfig 遍历这条写入路径,
+    # 但因为写的值和原值完全一样, 对正在跑的客户端没有任何语义影响。不碰 RETURNTITLE/RELEASE。
+    [switch]$SafeWriteTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -132,6 +135,58 @@ try
 
     $dump = Send-ModuleCommand -Pipe $pipe -Command 'DUMP'
     Write-Host "DUMP  → $dump`n"
+
+    if ($SafeWriteTest)
+    {
+        Write-Host '--- 幂等写自检 (写回原值, 不改变任何东西) ---' -ForegroundColor Cyan
+
+        $problems = @()
+
+        if ($probe -notmatch 'activeLobbyHost=(\S+)')      { $problems += '没读到 activeLobbyHost' }  else { $lobbyHost = $Matches[1] }
+        if ($probe -notmatch 'saveDataBankHost=(\S+)')     { $problems += '没读到 saveDataBankHost' } else { $saveHost  = $Matches[1] }
+        if ($dump  -notmatch 'GMServerHost=([^\s}]+)')     { $problems += '没读到 GMServerHost' }     else { $gmHost    = $Matches[1] }
+
+        if ($problems.Count -gt 0)
+        {
+            $problems | ForEach-Object { Write-Host "  [跳过] $_" -ForegroundColor Yellow }
+        }
+        else
+        {
+            Write-Host "  原值: lobby=$lobbyHost sdb=$saveHost gm=$gmHost"
+
+            $written = Send-ModuleCommand -Pipe $pipe -Command "SETHOSTS $lobbyHost $saveHost $gmHost"
+            Write-Host "  SETHOSTS → $written"
+
+            # 写完读回来: 三个 NetworkModule 字段 + DevConfig 三项都必须还是原值
+            $after     = Send-ModuleCommand -Pipe $pipe -Command 'PROBE'
+            $afterDump = Send-ModuleCommand -Pipe $pipe -Command 'DUMP'
+
+            $checks = @(
+                @{ Name = 'activeLobbyHost';  Ok = ($after -match "activeLobbyHost=$([regex]::Escape($lobbyHost))") }
+                @{ Name = 'lobbyHost0';       Ok = ($after -match "lobbyHost0=$([regex]::Escape($lobbyHost))") }
+                @{ Name = 'saveDataBankHost'; Ok = ($after -match "saveDataBankHost=$([regex]::Escape($saveHost))") }
+                @{ Name = 'devConfig.LobbyHost01';      Ok = ($afterDump -match "LobbyHost01=$([regex]::Escape($lobbyHost))") }
+                @{ Name = 'devConfig.GMServerHost';     Ok = ($afterDump -match "GMServerHost=$([regex]::Escape($gmHost))") }
+                @{ Name = 'devConfig.SaveDataBankHost'; Ok = ($afterDump -match "SaveDataBankHost=$([regex]::Escape($saveHost))") }
+            )
+
+            foreach ($check in $checks)
+            {
+                if ($check.Ok) { Write-Host "  [OK] $($check.Name) 写回后值不变" -ForegroundColor Green }
+                else           { Write-Host "  [!!] $($check.Name) 写完对不上了" -ForegroundColor Red }
+            }
+
+            if ($written -notmatch 'written=(\d+)' -or [int]$Matches[1] -lt 6)
+            {
+                Write-Host "  [!!] SETHOSTS 只写了 $written —— DevConfig 那三项没找全" -ForegroundColor Red
+            }
+        }
+
+        # 不在标题界面时应当明确回 no-title-menu, 而不是崩或超时 —— 验证 GetAddonByName/按钮查找这条路
+        $login = Send-ModuleCommand -Pipe $pipe -Command 'LOGIN'
+        Write-Host "  LOGIN (当前不在标题界面) → $login"
+        Write-Host ''
+    }
 
     if (-not $KeepLoaded) { Write-Host "UNLOAD  → $(Send-ModuleCommand -Pipe $pipe -Command 'UNLOAD')" }
 }

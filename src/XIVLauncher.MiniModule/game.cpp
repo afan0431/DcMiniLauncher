@@ -177,6 +177,44 @@ namespace
         }
     }
 
+    // 读出 DevConfig 里那三项当前值。幂等写自检要拿它们原样写回去, 所以必须能先读到
+    void CopyDevConfigHosts(void* framework, char* gm, char* saveData, char* lobby01, size_t capacity)
+    {
+        gm[0] = saveData[0] = lobby01[0] = '\0';
+
+        __try
+        {
+            const auto devConfig = reinterpret_cast<uint8_t*>(framework) + offsets::FRAMEWORK_DEV_CONFIG;
+            const auto count     = ReadAt<unsigned int>(devConfig, offsets::CONFIG_BASE_COUNT);
+            const auto entries   = ReadAt<uint8_t*>(devConfig, offsets::CONFIG_BASE_ENTRIES);
+
+            if (entries == nullptr)
+                return;
+
+            for (unsigned int i = 0; i < count; ++i)
+            {
+                auto* entry = entries + static_cast<size_t>(i) * offsets::CONFIG_ENTRY_SIZE;
+
+                const auto name  = ReadAt<const char*>(entry, offsets::CONFIG_ENTRY_NAME);
+                const auto value = ReadAt<void*>(entry, offsets::CONFIG_ENTRY_VALUE);
+
+                if (name == nullptr || value == nullptr)
+                    continue;
+
+                if (strcmp(name, "GMServerHost") == 0)
+                    CopyUtf8String(value, gm, capacity);
+                else if (strcmp(name, "SaveDataBankHost") == 0)
+                    CopyUtf8String(value, saveData, capacity);
+                else if (strcmp(name, "LobbyHost01") == 0)
+                    CopyUtf8String(value, lobby01, capacity);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] 读 DevConfig 主机项异常 code=0x%08X", GetExceptionCode());
+        }
+    }
+
     // 在一段内存里找 ASCII 子串, 用来在偏移存疑时反查字段真正在哪
     int FindAscii(uint8_t* begin, size_t size, const char* needle, uintptr_t* hits, int maxHits)
     {
@@ -238,9 +276,17 @@ std::string GameDump()
                                    static_cast<unsigned long long>(hits[i]));
     }
 
-    char response[1280];
-    _snprintf_s(response, sizeof(response), _TRUNCATE, "OK %s %s %s %s ffxivInNetworkModule=%s",
-                active, lobby0, saveData, session, hitText);
+    char devGm[160]{}, devSaveData[160]{}, devLobby01[160]{};
+    MainThreadRun([&] { CopyDevConfigHosts(data.framework, devGm, devSaveData, devLobby01, sizeof(devGm)); }, 3000);
+
+    char response[1600];
+    _snprintf_s(response, sizeof(response), _TRUNCATE,
+                "OK %s %s %s %s ffxivInNetworkModule=%s "
+                "devConfig{GMServerHost=%s SaveDataBankHost=%s LobbyHost01=%s}",
+                active, lobby0, saveData, session, hitText,
+                devGm[0]        ? devGm        : "(空)",
+                devSaveData[0]  ? devSaveData  : "(空)",
+                devLobby01[0]   ? devLobby01   : "(空)");
 
     LogF("[game] DUMP → %s", response);
     return response;
