@@ -64,6 +64,9 @@ public static class MinionAttacher
     /// <summary>MinionLauncher attach 完会自己退出; 超时视为卡住</summary>
     private static readonly TimeSpan LAUNCHER_TIMEOUT = TimeSpan.FromMinutes(3);
 
+    /// <summary>等 MINIONAPP 把它那一行的 PID 刷成我们的游戏进程的上限</summary>
+    private static readonly TimeSpan MINION_APP_INJECT_TIMEOUT = TimeSpan.FromSeconds(90);
+
     /// <summary>
     ///     按启动页选中的分组/账号, 把 MinionLauncher 挂到 <paramref name="gameProcess" /> 上。
     ///     不抛异常, 失败信息在返回值里（挂不上不该连累已经起来的游戏）。
@@ -79,16 +82,13 @@ public static class MinionAttacher
     )
     {
         var installPath = MinionAccounts.InstallPath;
-        var launcherExe = MinionAccounts.GetLauncherExePath(installPath);
-
-        if (!File.Exists(launcherExe))
-            return MinionAttachResult.Failed($"未找到 {launcherExe}（在「设置 → Minion」里指定 Minion 安装目录）");
 
         MinionAccount? account;
+        int            rowIndex;
 
         try
         {
-            account = MinionAccounts.FindAccount(App.Settings.MinionGroup, App.Settings.MinionAccountUid, installPath);
+            (account, rowIndex) = MinionAccounts.FindAccountInGroup(App.Settings.MinionGroup, App.Settings.MinionAccountUid, installPath);
         }
         catch (Exception ex)
         {
@@ -97,27 +97,6 @@ public static class MinionAttacher
 
         if (account == null)
             return MinionAttachResult.Failed($"Minion 分组 {App.Settings.MinionGroup ?? "(未选择)"} 下没有账号, 请在启动页重新选择分组");
-
-        if (ResolveGameExePath(account, gamePath, gameProcess) is not { } gameExePath)
-            return MinionAttachResult.Failed
-            (
-                $"找不到可用的游戏 exe 给 -path 用（Accounts.json 里写的是 {account.PathToExe ?? "(空)"}, 本机不存在; " +
-                $"启动器的游戏目录 {gamePath?.FullName ?? "(未配置)"} 下也没找到）"
-            );
-
-        var botPath = Path.Combine(installPath, BOT_DIR_NAME);
-        var datPath = GetDatPath(botPath, account.UseBetaFiles);
-
-        if (!File.Exists(datPath))
-            return MinionAttachResult.Failed
-            (
-                account.UseBetaFiles
-                    ? $"该账号勾了 beta, 但找不到 beta 的 bot 文件 {datPath}（用 MINIONAPP 起一次 beta 账号让它下载）"
-                    : $"找不到 bot 文件 {datPath}"
-            );
-
-        if (BuildArguments(account, botPath, datPath, gameExePath, gameProcess.Id) is not { } arguments)
-            return MinionAttachResult.Failed(DescribeMissingFields(account));
 
         await WaitForGameWindowAsync(gameProcess, cancellationToken).ConfigureAwait(false);
 
@@ -142,6 +121,102 @@ public static class MinionAttacher
 
         if (gameProcess.HasExited)
             return MinionAttachResult.Failed("游戏进程已退出, 没有可挂载的目标");
+
+        // MINIONAPP 开着时必须由它发起注入, 否则它认不下这个会话, 十几秒后会把客户端杀掉
+        // （见 MinionAppAutomation 的说明）
+        if (MinionAppAutomation.IsRunning())
+            return InjectViaMinionApp(account, rowIndex, gameProcess.Id, cancellationToken);
+
+        return await SpawnLauncherAsync(account, installPath, gamePath, gameProcess, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     MINIONAPP 在跑 —— 点它自己那一行的「注入」, 让会话归它所有
+    /// </summary>
+    private static MinionAttachResult InjectViaMinionApp(MinionAccount account, int rowIndex, int gamePid, CancellationToken cancellationToken)
+    {
+        Log.Information
+        (
+            "[Minion] 检测到 MINIONAPP 正在运行, 改由它发起注入: 分组={Group}, 组内第 {Row} 行, 账号={Account}, beta={UseBeta}",
+            account.Group,
+            rowIndex + 1,
+            account.Label,
+            account.UseBetaFiles
+        );
+
+        MinionAppInjectResult result;
+
+        try
+        {
+            result = MinionAppAutomation.Inject
+            (
+                account.Group,
+                rowIndex,
+                account.UseBetaFiles,
+                account.Keycode,
+                gamePid,
+                MINION_APP_INJECT_TIMEOUT,
+                cancellationToken
+            );
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[Minion] 驱动 MINIONAPP 注入时出错");
+            return MinionAttachResult.Failed($"驱动 MINIONAPP 注入失败: {ex.Message}");
+        }
+
+        if (!result.Ok)
+            return MinionAttachResult.Failed
+            (
+                $"""
+                 {result.Error}
+
+                 MINIONAPP 正在运行时, 必须由它发起注入 —— 我们自己挂的会话它认不下来, 会在十几秒后杀掉游戏。
+                 可以在 MINIONAPP 里手动点该账号的「注入」, 或退出 MINIONAPP 后由启动器自己挂。
+                 """
+            );
+
+        Log.Information("[Minion] MINIONAPP 已接管本次注入; bot 是否真的在跑以游戏内 overlay / 新 bot 日志为准");
+        return MinionAttachResult.Succeeded();
+    }
+
+    /// <summary>
+    ///     MINIONAPP 没开 —— 自己拉 MinionLauncher（probe-P1 验证过的路径）
+    /// </summary>
+    private static async Task<MinionAttachResult> SpawnLauncherAsync
+    (
+        MinionAccount     account,
+        string            installPath,
+        DirectoryInfo?    gamePath,
+        Process           gameProcess,
+        CancellationToken cancellationToken
+    )
+    {
+        var launcherExe = MinionAccounts.GetLauncherExePath(installPath);
+
+        if (!File.Exists(launcherExe))
+            return MinionAttachResult.Failed($"未找到 {launcherExe}（在「设置 → Minion」里指定 Minion 安装目录）");
+
+        if (ResolveGameExePath(account, gamePath, gameProcess) is not { } gameExePath)
+            return MinionAttachResult.Failed
+            (
+                $"找不到可用的游戏 exe 给 -path 用（Accounts.json 里写的是 {account.PathToExe ?? "(空)"}, 本机不存在; " +
+                $"启动器的游戏目录 {gamePath?.FullName ?? "(未配置)"} 下也没找到）"
+            );
+
+        var botPath = Path.Combine(installPath, BOT_DIR_NAME);
+        var datPath = GetDatPath(botPath, account.UseBetaFiles);
+
+        if (!File.Exists(datPath))
+            return MinionAttachResult.Failed
+            (
+                account.UseBetaFiles
+                    ? $"该账号勾了 beta, 但找不到 beta 的 bot 文件 {datPath}（用 MINIONAPP 起一次 beta 账号让它下载）"
+                    : $"找不到 bot 文件 {datPath}"
+            );
+
+        if (BuildArguments(account, botPath, datPath, gameExePath, gameProcess.Id) is not { } arguments)
+            return MinionAttachResult.Failed(DescribeMissingFields(account));
 
         Log.Information
         (
