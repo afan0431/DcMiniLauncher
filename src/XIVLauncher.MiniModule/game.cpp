@@ -650,6 +650,24 @@ namespace
         }
     }
 
+    // 是不是正在放片头动画。判据是 MovieStaffList 这个 addon 在不在 ——
+    // 实测动画期间它在、标题菜单时不在。
+    // ⚠ 不能用「where==busy」当判据: 登录读盘、过场也都是 busy, 那时候投 ESC 是误伤。
+    int OpIsTitleMovie(const Pointers* p)
+    {
+        __try
+        {
+            if (p->unitManager == nullptr)
+                return -1;
+
+            return reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(p->unitManager, "MovieStaffList", 1) != nullptr ? 1 : 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+    }
+
     // 确认登出对话框。FireCallbackInt(0) = 「是」, 比按节点 id 找按钮稳
     int OpConfirmYesNo(const Pointers* p)
     {
@@ -673,36 +691,6 @@ namespace
         }
     }
 
-    // 轮询期保活: 标题界面闲置久了会飘进片头动画（IdleTime 涨到两万上下就触发), DCTraveler 每帧把
-    // IdleTime 归零, 我们按 500ms 一次。
-    //
-    // ⚠ 这条线程必须在卸载模块之前 join 掉。2026-08-15 实测教训: 先 KEEPALIVE OFF 再立刻 UNLOAD,
-    //   线程可能还停在 Sleep(500) 里, 而 FreeLibraryAndExitThread 已经把模块代码页解除映射 ——
-    //   它一醒来就跳进空地址, 直接把游戏带走。
-    std::atomic<bool> g_keepAlive {false};
-    HANDLE            g_keepAliveThread = nullptr;
-
-    DWORD WINAPI KeepAliveProc(LPVOID)
-    {
-        LogF("[game] 保活线程启动");
-
-        while (g_keepAlive.load())
-        {
-            // 堆上传值捕获: 超时的 job 可能下一帧才被 tick 跑到, 那时这轮循环早结束了
-            auto state = std::make_shared<Pointers>();
-
-            MainThreadRun([state]
-            {
-                if (GetPointers(state.get()))
-                    OpResetIdleTime(state.get());
-            }, 1000);
-
-            Sleep(500);
-        }
-
-        LogF("[game] 保活线程退出");
-        return 0;
-    }
 
     // 派到主线程去跑的 job, 捕获的东西必须自己活着 —— 超时之后调用方就返回了, 而 job 可能
     // 下一帧才被 tick 跑到; 早期版本按引用捕栈变量, 那就是往野指针上写。统一放堆上传值捕获。
@@ -1115,42 +1103,125 @@ std::string GameLogin()
     return "FAIL exception";
 }
 
-std::string GameKeepAlive(bool enable)
+namespace
 {
-    if (enable == g_keepAlive.load())
-        return enable ? "OK already-on" : "OK already-off";
+    // 标题界面守卫（常驻, 默认开）:
+    //   在标题菜单 → 每 500ms 把 AgentLobby.IdleTime 归零, 它就永远飘不进片头动画
+    //                （闲置到两万上下才触发, 归零等于永远够不着; DCTraveler 也是这么防的）
+    //   已经在动画里（含刚启动那段开机动画）→ 给游戏窗口投一次 ESC 退出来
+    //   在游戏内 / 角色选择界面 → 什么都不做
+    //
+    // WHY 常驻而不是换服时才开: 挂机时客户端多半停在标题, 一旦飘进动画,
+    //   _TitleMenu 就不存在, 之后任何换服操作都得先把它弄出来 —— 那是白白多出来的一段等待。
+    //
+    // ⚠ 这条线程必须在卸载模块之前 join 掉。2026-08-15 实测教训: 先关掉再立刻 UNLOAD,
+    //   线程可能还停在 Sleep(500) 里, 而 FreeLibraryAndExitThread 已经把模块代码页解除映射 ——
+    //   它一醒来就跳进空地址, 直接把游戏带走。
+    std::atomic<bool> g_titleGuard   {true};  // 行为开关（可经 KEEPALIVE ON/OFF 改）
+    std::atomic<bool> g_guardRunning {false}; // 线程活着没
+    HANDLE            g_guardThread = nullptr;
 
-    if (enable)
+    DWORD WINAPI TitleGuardProc(LPVOID)
     {
-        g_keepAlive.store(true);
-        g_keepAliveThread = CreateThread(nullptr, 0, KeepAliveProc, nullptr, 0, nullptr);
+        LogF("[game] 标题守卫线程启动（防止飘进片头动画）");
 
-        if (g_keepAliveThread == nullptr)
+        bool lastMovie = false;
+
+        while (g_guardRunning.load())
         {
-            g_keepAlive.store(false);
-            return "FAIL cannot-start-thread";
+            if (g_titleGuard.load())
+            {
+                // 堆上传值捕获: 超时的 job 可能下一帧才被 tick 跑到, 那时这轮循环早结束了
+                auto state = std::make_shared<CallState>();
+
+                MainThreadRun([state]
+                {
+                    if (!GetPointers(&state->pointers))
+                        return;
+
+                    const int where = OpWhere(&state->pointers);
+                    state->result   = where;
+
+                    if (where == 1)                       // 标题菜单: 压住 IdleTime
+                        OpResetIdleTime(&state->pointers);
+                    else if (where == 0)                  // 什么界面都不是: 看是不是在放动画
+                        state->result = OpIsTitleMovie(&state->pointers) == 1 ? -10 : where;
+                }, 1000);
+
+                const bool inMovie = state->result == -10;
+
+                if (inMovie)
+                {
+                    if (!lastMovie)
+                        LogF("[game] 检测到片头动画, 自动投 ESC 退出");
+
+                    const HWND hwnd = FindGameWindow();
+
+                    if (hwnd != nullptr)
+                    {
+                        PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0x00010001);
+                        PostMessageW(hwnd, WM_KEYUP,   VK_ESCAPE, 0xC0010001);
+                    }
+                }
+
+                lastMovie = inMovie;
+            }
+
+            Sleep(500);
         }
 
-        return "OK";
+        LogF("[game] 标题守卫线程退出");
+        return 0;
+    }
+}
+
+/// 启动常驻的标题守卫线程。模块一注进来就该开着 —— 挂机时客户端多半停在标题界面,
+/// 让它飘进片头动画等于给后续每一次换服都白加一段等待。
+bool GameStartTitleGuard()
+{
+    if (g_guardRunning.load())
+        return true;
+
+    g_guardRunning.store(true);
+    g_guardThread = CreateThread(nullptr, 0, TitleGuardProc, nullptr, 0, nullptr);
+
+    if (g_guardThread == nullptr)
+    {
+        g_guardRunning.store(false);
+        LogF("[game] 标题守卫线程起不来 err=%lu", GetLastError());
+        return false;
     }
 
-    GameStopKeepAlive();
-    return "OK";
+    return true;
+}
+
+/// KEEPALIVE ON/OFF 现在只是开关守卫的行为（线程一直在）。
+/// 保留这条命令是因为换服编排里会显式开一次, 且它能在需要时把守卫关掉。
+std::string GameKeepAlive(bool enable)
+{
+    const bool was = g_titleGuard.load();
+    g_titleGuard.store(enable);
+
+    if (enable && !g_guardRunning.load() && !GameStartTitleGuard())
+        return "FAIL cannot-start-thread";
+
+    LogF("[game] 标题守卫 %s", enable ? "开" : "关");
+    return was == enable ? (enable ? "OK already-on" : "OK already-off") : "OK";
 }
 
 void GameStopKeepAlive()
 {
-    g_keepAlive.store(false);
+    g_guardRunning.store(false);
 
-    if (g_keepAliveThread == nullptr)
+    if (g_guardThread == nullptr)
         return;
 
-    // 必须等它真的退出来 —— 见上面 g_keepAliveThread 的说明
-    if (WaitForSingleObject(g_keepAliveThread, 5000) != WAIT_OBJECT_0)
-        LogF("[game] ⚠ 保活线程没能在 5 秒内退出, 此时卸载模块是不安全的");
+    // 必须等它真的退出来 —— 见 TitleGuardProc 上面的说明
+    if (WaitForSingleObject(g_guardThread, 5000) != WAIT_OBJECT_0)
+        LogF("[game] ⚠ 标题守卫线程没能在 5 秒内退出, 此时卸载模块是不安全的");
 
-    CloseHandle(g_keepAliveThread);
-    g_keepAliveThread = nullptr;
+    CloseHandle(g_guardThread);
+    g_guardThread = nullptr;
 }
 
 void* GameFrameworkPointer()

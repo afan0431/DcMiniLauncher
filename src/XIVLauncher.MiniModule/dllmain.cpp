@@ -16,6 +16,8 @@ namespace
 
         if (!mainThreadOk)
             LogF("[module] 主线程通道未建立, 只能应答 PING/VERSION");
+        else
+            GameStartTitleGuard(); // 常驻: 别让客户端停在标题时飘进片头动画
 
         PipeServerRun();
 

@@ -62,7 +62,10 @@ std::string GameSetSid(const std::string& sid);
 std::string GameTitleReady(); // returnToTitle 是异步的, 编排侧靠它等到标题界面
 std::string GameListAddons(); // 只读诊断: 列出已加载的 addon, 用来排查找不到 _TitleMenu 的原因
 std::string GameLogin();
-std::string GameKeepAlive(bool enable); // 轮询期把 AgentLobby.IdleTime 定期归零, 免得标题界面飘进片头动画
+// 标题守卫（常驻, 默认开）: 停在标题菜单时把 AgentLobby.IdleTime 压住 → 永远飘不进片头动画;
+// 已经在动画里（含开机那段）则自动投 ESC 退出来。KEEPALIVE ON/OFF 只是开关它的行为。
+bool        GameStartTitleGuard();
+std::string GameKeepAlive(bool enable);
 
 // ⚠ 卸载模块前必须调: 保活线程还在跑的时候 FreeLibrary = 它醒来跳进已解除映射的代码页, 直接把游戏带走
 void GameStopKeepAlive();
