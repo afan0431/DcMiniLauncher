@@ -45,6 +45,16 @@ bool        GameResolve(); // 解析特征码, 只做一次
 std::string GameProbe();   // 只读自检: 把关键指针和当前大厅主机名读出来核对偏移
 std::string GameDump();    // 只读诊断: 摊开 Utf8String 头部 + 在 NetworkModule 里反查主机名
 
+// ---- 换服原语 (game.cpp) ----------------------------------------------------
+// 时序规格 = DCTraveler 的 GameFunctions.cs。每条独立, 编排在启动器那边:
+//   返回标题 → (等到标题界面) → 改主机名 → 作废大厅上下文 → 写新 SID → 点登录
+std::string GameReturnToTitle();
+std::string GameSetHosts(const std::string& lobbyHost, const std::string& saveDataHost, const std::string& gmHost);
+std::string GameReleaseLobbyContext();
+std::string GameSetSid(const std::string& sid);
+std::string GameLogin();
+std::string GameKeepAlive(bool enable); // 轮询期把 AgentLobby.IdleTime 定期归零, 免得挂在标题界面被踢
+
 // ---- 命名管道服务端 (pipe.cpp) ----------------------------------------------
 // \\.\pipe\minilauncher-<pid> —— 按 PID 分开, 天然满足「多开不串」
 // 阻塞运行, 收到 UNLOAD/进程退出才返回

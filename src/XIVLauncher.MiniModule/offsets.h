@@ -60,6 +60,20 @@ namespace offsets
     inline constexpr uintptr_t CONFIG_ENTRY_VALUE  = 0x20; // union, 字符串项存 Utf8String*
     inline constexpr size_t    CONFIG_ENTRY_SIZE   = 0x38;
 
+    // ---- UI: 在标题界面点「开始游戏」 --------------------------------------
+    // UIModule.cs:108  [FieldOffset(0xD2670 - 0x10)] RaptureAtkModule
+    inline constexpr uintptr_t UI_MODULE_RAPTURE_ATK_MODULE = 0xD2670 - 0x10;
+    // RaptureAtkModule.cs:51  [FieldOffset(0x13430 - 0x10)] RaptureAtkUnitManager
+    // RaptureAtkUnitManager 继承 AtkUnitManager, 地址可直接当 AtkUnitManager* 用
+    inline constexpr uintptr_t RAPTURE_ATK_MODULE_UNIT_MANAGER = 0x13430 - 0x10;
+
+    inline constexpr uintptr_t ATK_COMPONENT_BASE_RES_NODE = 0xA0; // AtkComponentBase.cs:16
+    inline constexpr uintptr_t ATK_RES_NODE_EVENT_MANAGER  = 0x18; // AtkResNode.cs:18, +0 即 AtkEvent*
+
+    inline constexpr int ATK_UNIT_BASE_RECEIVE_EVENT_VF = 2;  // AtkEventListener.cs:15
+    inline constexpr int ATK_EVENT_TYPE_BUTTON_CLICK    = 25; // AtkEvent.cs:32
+    inline constexpr int TITLE_MENU_LOGIN_BUTTON_ID     = 4;  // DCTraveler GameFunctions.LoginInGame
+
     // ---- 函数特征码 --------------------------------------------------------
     // 前两条抄自 DCTraveler 的 GameFunctions.cs 静态构造; 都以 E8 开头, 需按调用目标解析
     inline constexpr const char* RETURN_TO_TITLE_SIG        = "E8 ?? ?? ?? ?? C6 87 ?? ?? ?? ?? ?? 33 C0";
@@ -67,4 +81,10 @@ namespace offsets
 
     // Utf8String::SetString —— Utf8String.cs:113
     inline constexpr const char* UTF8_SET_STRING_SIG        = "E8 ?? ?? ?? ?? 4D 39 2E";
+
+    // AtkUnitManager::GetAddonByName —— Component/GUI/AtkUnitManager.cs:95
+    inline constexpr const char* GET_ADDON_BY_NAME_SIG      = "E8 ?? ?? ?? ?? 48 8B F8 41 B0 01";
+
+    // AtkUnitBase::GetComponentButtonById —— Component/GUI/AtkUnitBase.cs:198
+    inline constexpr const char* GET_COMPONENT_BUTTON_SIG   = "E8 ?? ?? ?? ?? 8D 3C 36";
 }

@@ -6,6 +6,7 @@
 #include "MiniModule.h"
 #include "offsets.h"
 
+#include <atomic>
 #include <cstdio>
 
 namespace
@@ -245,6 +246,384 @@ std::string GameDump()
     return response;
 }
 
+// =============================================================================
+// 换服原语 —— 时序规格 = DCTraveler 的 GameFunctions.cs, 逐条搬成 C++。
+// 每条都是独立命令, 编排（什么时候返回标题、等多久、什么时候点登录）留给启动器,
+// 这样每一步都能单独观察, 也符合「在线那半留在 C#, native 只被命令」的分工。
+// =============================================================================
+
+namespace
+{
+    using SetStringFn          = void  (*)(void* utf8String, const char* value);
+    using ReturnToTitleFn      = void  (*)(void* agentLobby);
+    using ReleaseLobbyFn       = void  (*)(void* networkModule);
+    using GetAddonByNameFn     = void* (*)(void* unitManager, const char* name, int index);
+    using GetComponentButtonFn = void* (*)(void* addon, unsigned int nodeId);
+    using ReceiveEventFn       = void  (*)(void* addon, int eventType, int eventParam, void* atkEvent, void* eventData);
+
+    uintptr_t g_getAddonByName    = 0;
+    uintptr_t g_getComponentButton = 0;
+
+    struct Pointers
+    {
+        void* framework;
+        void* uiModule;
+        void* agentLobby;
+        void* networkModule;
+    };
+
+    bool GetPointers(Pointers* out)
+    {
+        __try
+        {
+            memset(out, 0, sizeof(Pointers));
+
+            out->framework = *reinterpret_cast<void**>(g_frameworkStatic);
+            if (out->framework == nullptr)
+                return false;
+
+            out->uiModule = ReadAt<void*>(out->framework, offsets::FRAMEWORK_UI_MODULE);
+            if (out->uiModule == nullptr)
+                return false;
+
+            const auto vtable = ReadAt<void**>(out->uiModule, 0);
+            const auto getAgentModule =
+                reinterpret_cast<void* (*)(void*)>(vtable[offsets::UI_MODULE_GET_AGENT_MODULE_VF]);
+
+            const auto agentModule = getAgentModule(out->uiModule);
+            if (agentModule == nullptr)
+                return false;
+
+            out->agentLobby = ReadAt<void*>(agentModule,
+                                            offsets::AGENT_MODULE_AGENTS + offsets::AGENT_ID_LOBBY * sizeof(void*));
+
+            const auto proxy = ReadAt<void*>(out->framework, offsets::FRAMEWORK_NETWORK_MODULE_PROXY);
+            if (proxy != nullptr)
+                out->networkModule = ReadAt<void*>(proxy, offsets::NETWORK_MODULE_PROXY_MODULE);
+
+            return out->agentLobby != nullptr && out->networkModule != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    // GameFunctions.ChangeGameServer: 三个 NetworkModule 字段 + DevConfig 里的三项
+    int OpSetHosts(const Pointers* p, const char* lobbyHost, const char* saveDataHost, const char* gmHost)
+    {
+        __try
+        {
+            const auto setString = reinterpret_cast<SetStringFn>(g_setString);
+            const auto network   = reinterpret_cast<uint8_t*>(p->networkModule);
+
+            setString(network + offsets::NETWORK_MODULE_ACTIVE_LOBBY, lobbyHost);
+            setString(network + offsets::NETWORK_MODULE_LOBBY_HOSTS,  lobbyHost);
+            setString(network + offsets::NETWORK_MODULE_SAVE_DATA,    saveDataHost);
+
+            int written = 3;
+
+            const auto devConfig = reinterpret_cast<uint8_t*>(p->framework) + offsets::FRAMEWORK_DEV_CONFIG;
+            const auto count     = ReadAt<unsigned int>(devConfig, offsets::CONFIG_BASE_COUNT);
+            const auto entries   = ReadAt<uint8_t*>(devConfig, offsets::CONFIG_BASE_ENTRIES);
+
+            if (entries == nullptr)
+                return written;
+
+            for (unsigned int i = 0; i < count; ++i)
+            {
+                auto* entry = entries + static_cast<size_t>(i) * offsets::CONFIG_ENTRY_SIZE;
+
+                const auto name  = ReadAt<const char*>(entry, offsets::CONFIG_ENTRY_NAME);
+                const auto value = ReadAt<void*>(entry, offsets::CONFIG_ENTRY_VALUE);
+
+                if (name == nullptr || value == nullptr)
+                    continue;
+
+                if (strcmp(name, "GMServerHost") == 0)
+                    setString(value, gmHost);
+                else if (strcmp(name, "SaveDataBankHost") == 0)
+                    setString(value, saveDataHost);
+                else if (strcmp(name, "LobbyHost01") == 0)
+                    setString(value, lobbyHost);
+                else
+                    continue;
+
+                ++written;
+            }
+
+            return written;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] SETHOSTS 异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+
+    // GameFunctions.RefreshGameServer: 作废缓存的大厅上下文 —— P3 实测证明这步是必需的,
+    // 光改主机名不做这步, title→login 会复用旧连接, 大区根本不变
+    int OpRelease(const Pointers* p)
+    {
+        __try
+        {
+            reinterpret_cast<ReleaseLobbyFn>(g_releaseLobbyContext)(p->networkModule);
+
+            const auto lobby = reinterpret_cast<uint8_t*>(p->agentLobby);
+            *reinterpret_cast<void**>(lobby + offsets::AGENT_LOBBY_UI_CLIENT_CONTEXT)       = nullptr;
+            *reinterpret_cast<unsigned char*>(lobby + offsets::AGENT_LOBBY_UI_CLIENT_STATE) = 0;
+
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] RELEASE 异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+
+    int OpReturnToTitle(const Pointers* p)
+    {
+        __try
+        {
+            reinterpret_cast<ReturnToTitleFn>(g_returnToTitle)(p->agentLobby);
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] RETURNTITLE 异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+
+    // GameFunctions.ChangeDEVTestSID
+    int OpSetSid(const Pointers* p, const char* sid)
+    {
+        __try
+        {
+            reinterpret_cast<SetStringFn>(g_setString)(
+                reinterpret_cast<uint8_t*>(p->agentLobby) + offsets::AGENT_LOBBY_GAME_SESSION, sid);
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] SETSID 异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+
+    int OpResetIdleTime(const Pointers* p)
+    {
+        __try
+        {
+            *reinterpret_cast<long long*>(reinterpret_cast<uint8_t*>(p->agentLobby) + offsets::AGENT_LOBBY_IDLE_TIME) = 0;
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+    }
+
+    // GameFunctions.LoginInGame: 给 _TitleMenu 的 4 号按钮发一次 ButtonClick
+    int OpLogin(const Pointers* p)
+    {
+        __try
+        {
+            const auto unitManager = reinterpret_cast<uint8_t*>(p->uiModule) +
+                                     offsets::UI_MODULE_RAPTURE_ATK_MODULE +
+                                     offsets::RAPTURE_ATK_MODULE_UNIT_MANAGER;
+
+            const auto addon = reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(unitManager, "_TitleMenu", 1);
+            if (addon == nullptr)
+                return 0; // 不在标题界面
+
+            const auto button = reinterpret_cast<GetComponentButtonFn>(g_getComponentButton)(
+                addon, offsets::TITLE_MENU_LOGIN_BUTTON_ID);
+            if (button == nullptr)
+                return 0;
+
+            const auto resNode = ReadAt<void*>(button, offsets::ATK_COMPONENT_BASE_RES_NODE);
+            if (resNode == nullptr)
+                return 0;
+
+            const auto atkEvent = ReadAt<void*>(resNode, offsets::ATK_RES_NODE_EVENT_MANAGER);
+
+            const auto vtable      = ReadAt<void**>(addon, 0);
+            const auto receiveEvent = reinterpret_cast<ReceiveEventFn>(vtable[offsets::ATK_UNIT_BASE_RECEIVE_EVENT_VF]);
+
+            receiveEvent(addon, offsets::ATK_EVENT_TYPE_BUTTON_CLICK, 1, atkEvent, nullptr);
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] LOGIN 异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+
+    // 轮询期保活: 标题界面挂久了会被踢, DCTraveler 每帧把 IdleTime 归零, 我们按 500ms 一次
+    std::atomic<bool> g_keepAlive {false};
+
+    DWORD WINAPI KeepAliveProc(LPVOID)
+    {
+        LogF("[game] 保活线程启动");
+
+        while (g_keepAlive.load())
+        {
+            Pointers pointers{};
+            MainThreadRun([&]
+            {
+                if (GetPointers(&pointers))
+                    OpResetIdleTime(&pointers);
+            }, 1000);
+
+            Sleep(500);
+        }
+
+        LogF("[game] 保活线程退出");
+        return 0;
+    }
+
+    // 所有换服命令共用的前置: 特征码解析 + 指针取全, 缺一不可
+    bool PrepareCall(Pointers* pointers, std::string& failure)
+    {
+        if (!GameResolve())
+        {
+            failure = "FAIL sigscan-failed";
+            return false;
+        }
+
+        bool ok = false;
+        if (!MainThreadRun([&] { ok = GetPointers(pointers); }, 3000))
+        {
+            failure = "FAIL mainthread-timeout";
+            return false;
+        }
+
+        if (!ok)
+        {
+            failure = "FAIL pointers-unavailable";
+            return false;
+        }
+
+        return true;
+    }
+}
+
+std::string GameSetHosts(const std::string& lobbyHost, const std::string& saveDataHost, const std::string& gmHost)
+{
+    Pointers    pointers{};
+    std::string failure;
+
+    if (!PrepareCall(&pointers, failure))
+        return failure;
+
+    int written = -1;
+    if (!MainThreadRun([&] { written = OpSetHosts(&pointers, lobbyHost.c_str(), saveDataHost.c_str(), gmHost.c_str()); }, 5000))
+        return "FAIL mainthread-timeout";
+
+    if (written < 0)
+        return "FAIL exception";
+
+    LogF("[game] SETHOSTS lobby=%s sdb=%s gm=%s → 写了 %d 处", lobbyHost.c_str(), saveDataHost.c_str(), gmHost.c_str(), written);
+
+    char response[64];
+    _snprintf_s(response, sizeof(response), _TRUNCATE, "OK written=%d", written);
+    return response;
+}
+
+std::string GameReturnToTitle()
+{
+    Pointers    pointers{};
+    std::string failure;
+
+    if (!PrepareCall(&pointers, failure))
+        return failure;
+
+    int result = -1;
+    if (!MainThreadRun([&] { result = OpReturnToTitle(&pointers); }, 5000))
+        return "FAIL mainthread-timeout";
+
+    return result == 1 ? "OK" : "FAIL exception";
+}
+
+std::string GameReleaseLobbyContext()
+{
+    Pointers    pointers{};
+    std::string failure;
+
+    if (!PrepareCall(&pointers, failure))
+        return failure;
+
+    int result = -1;
+    if (!MainThreadRun([&] { result = OpRelease(&pointers); }, 5000))
+        return "FAIL mainthread-timeout";
+
+    return result == 1 ? "OK" : "FAIL exception";
+}
+
+std::string GameSetSid(const std::string& sid)
+{
+    if (sid.empty())
+        return "FAIL empty-sid";
+
+    Pointers    pointers{};
+    std::string failure;
+
+    if (!PrepareCall(&pointers, failure))
+        return failure;
+
+    int result = -1;
+    if (!MainThreadRun([&] { result = OpSetSid(&pointers, sid.c_str()); }, 5000))
+        return "FAIL mainthread-timeout";
+
+    // ⚠ 不打印 sid 本身, 那是登录票据
+    LogF("[game] SETSID 写入 %d 字节", static_cast<int>(sid.size()));
+
+    return result == 1 ? "OK" : "FAIL exception";
+}
+
+std::string GameLogin()
+{
+    Pointers    pointers{};
+    std::string failure;
+
+    if (!PrepareCall(&pointers, failure))
+        return failure;
+
+    int result = -1;
+    if (!MainThreadRun([&] { result = OpLogin(&pointers); }, 5000))
+        return "FAIL mainthread-timeout";
+
+    if (result == 1) return "OK";
+    if (result == 0) return "FAIL no-title-menu"; // 不在标题界面
+    return "FAIL exception";
+}
+
+std::string GameKeepAlive(bool enable)
+{
+    if (enable == g_keepAlive.load())
+        return enable ? "OK already-on" : "OK already-off";
+
+    g_keepAlive.store(enable);
+
+    if (enable)
+    {
+        const HANDLE thread = CreateThread(nullptr, 0, KeepAliveProc, nullptr, 0, nullptr);
+
+        if (thread == nullptr)
+        {
+            g_keepAlive.store(false);
+            return "FAIL cannot-start-thread";
+        }
+
+        CloseHandle(thread);
+    }
+
+    return "OK";
+}
+
 bool GameResolve()
 {
     if (g_resolved)
@@ -256,14 +635,19 @@ bool GameResolve()
     g_returnToTitle       = ScanText(offsets::RETURN_TO_TITLE_SIG);
     g_releaseLobbyContext = ScanText(offsets::RELEASE_LOBBY_CONTEXT_SIG);
     g_setString           = ScanText(offsets::UTF8_SET_STRING_SIG);
+    g_getAddonByName      = ScanText(offsets::GET_ADDON_BY_NAME_SIG);
+    g_getComponentButton  = ScanText(offsets::GET_COMPONENT_BUTTON_SIG);
 
     LogF("[game] 模块基址=0x%p .text 解析结果:", reinterpret_cast<void*>(base));
     LogF("[game]   Framework 静态指针      RVA=0x%llX", static_cast<unsigned long long>(g_frameworkStatic     ? g_frameworkStatic     - base : 0));
     LogF("[game]   returnToTitle           RVA=0x%llX", static_cast<unsigned long long>(g_returnToTitle       ? g_returnToTitle       - base : 0));
     LogF("[game]   releaseLobbyContext     RVA=0x%llX", static_cast<unsigned long long>(g_releaseLobbyContext ? g_releaseLobbyContext - base : 0));
     LogF("[game]   Utf8String::SetString   RVA=0x%llX", static_cast<unsigned long long>(g_setString           ? g_setString           - base : 0));
+    LogF("[game]   GetAddonByName          RVA=0x%llX", static_cast<unsigned long long>(g_getAddonByName      ? g_getAddonByName      - base : 0));
+    LogF("[game]   GetComponentButtonById  RVA=0x%llX", static_cast<unsigned long long>(g_getComponentButton  ? g_getComponentButton  - base : 0));
 
-    g_resolved = g_frameworkStatic != 0 && g_returnToTitle != 0 && g_releaseLobbyContext != 0 && g_setString != 0;
+    g_resolved = g_frameworkStatic != 0 && g_returnToTitle != 0 && g_releaseLobbyContext != 0 && g_setString != 0 &&
+                 g_getAddonByName != 0 && g_getComponentButton != 0;
 
     if (!g_resolved)
         LogF("[game] 有特征码没命中 —— 游戏版本变了或偏移库过期");

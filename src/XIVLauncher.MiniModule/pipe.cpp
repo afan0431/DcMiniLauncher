@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -54,6 +55,30 @@ namespace
         return response;
     }
 
+    // 命令按空格切; SETSID 的参数是登录票据, 所以日志里只打命令名不打参数
+    std::vector<std::string> Split(const std::string& text)
+    {
+        std::vector<std::string> parts;
+        size_t                   cursor = 0;
+
+        while (cursor < text.size())
+        {
+            const auto begin = text.find_first_not_of(' ', cursor);
+            if (begin == std::string::npos)
+                break;
+
+            const auto end = text.find(' ', begin);
+            parts.push_back(text.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
+
+            if (end == std::string::npos)
+                break;
+
+            cursor = end + 1;
+        }
+
+        return parts;
+    }
+
     std::string HandleCommand(const std::string& command)
     {
         if (command == "PING")
@@ -77,6 +102,40 @@ namespace
         if (command == "DUMP")
             return GameDump();
 
+        // ---- 换服原语 ----------------------------------------------------
+        if (command == "RETURNTITLE")
+            return GameReturnToTitle();
+
+        if (command == "RELEASE")
+            return GameReleaseLobbyContext();
+
+        if (command == "LOGIN")
+            return GameLogin();
+
+        if (command == "KEEPALIVE ON")
+            return GameKeepAlive(true);
+
+        if (command == "KEEPALIVE OFF")
+            return GameKeepAlive(false);
+
+        const auto parts = Split(command);
+
+        if (!parts.empty() && parts[0] == "SETHOSTS")
+        {
+            if (parts.size() != 4)
+                return "FAIL usage:SETHOSTS <lobbyHost> <saveDataHost> <gmHost>";
+
+            return GameSetHosts(parts[1], parts[2], parts[3]);
+        }
+
+        if (!parts.empty() && parts[0] == "SETSID")
+        {
+            if (parts.size() != 2)
+                return "FAIL usage:SETSID <sid>";
+
+            return GameSetSid(parts[1]);
+        }
+
         if (command == "UNLOAD")
         {
             g_stop.store(true);
@@ -99,7 +158,9 @@ namespace
             const std::string command  = Trim(buffer);
             const std::string response = HandleCommand(command);
 
-            LogF("[pipe] < %s | > %s", command.c_str(), response.c_str());
+            // SETSID 的参数是登录票据 —— 只记命令名
+            const bool secret = command.rfind("SETSID", 0) == 0;
+            LogF("[pipe] < %s | > %s", secret ? "SETSID <已隐去>" : command.c_str(), response.c_str());
 
             DWORD written = 0;
             if (!WriteFile(pipe, response.c_str(), static_cast<DWORD>(response.size()), &written, nullptr))
