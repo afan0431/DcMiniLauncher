@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Serilog;
 using XIVLauncher.DCTravel;
@@ -47,6 +48,22 @@ public sealed class InGameTravelService(DCTravelClient client)
     /// <summary>状态查询连续失败这么多次就放弃（和启动器外部传送那套一致）</summary>
     private const int MAX_CONSECUTIVE_FAILURES = 3;
 
+    /// <summary>跨大区冷却 60 秒 —— 与 DcTraveler 的 <c>TravelCooldownGate</c> 一致</summary>
+    private static readonly TimeSpan COOLDOWN = TimeSpan.FromSeconds(60);
+
+    /// <summary>重试间隔与次数取 DcTraveler 的默认配置（RetryDelaySeconds=60, MaxRetryCount=20）</summary>
+    private static readonly TimeSpan RETRY_DELAY     = TimeSpan.FromSeconds(60);
+    private const           int      MAX_RETRY_COUNT = 20;
+
+    /// <summary>上次下单时刻（UTC ticks）。冷却是账号侧的, 所以整个启动器共用一个。</summary>
+    private static long lastOrderTicks;
+
+    /// <summary>
+    ///     同一个客户端同一时刻只允许一次换服在跑（DcTraveler 用 <c>TravelRuntime</c> 的信号量做同样的事）。
+    ///     按 PID 分开 —— 多开时各客户端互不影响。
+    /// </summary>
+    private static readonly ConcurrentDictionary<int, SemaphoreSlim> TRAVEL_GATES = new();
+
     public async Task<InGameTravelResult> TravelAsync
     (
         Process           gameProcess,
@@ -63,6 +80,34 @@ public sealed class InGameTravelService(DCTravelClient client)
             string.IsNullOrWhiteSpace(targetArea.AreaGM))
             return InGameTravelResult.Failed($"大区 {targetArea.AreaName} 缺少主机名信息");
 
+        // 同一客户端只允许一次换服在跑; 已经有一次在跑就直接拒绝, 不排队
+        var gate = TRAVEL_GATES.GetOrAdd(gameProcess.Id, _ => new SemaphoreSlim(1, 1));
+
+        if (!await gate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            return InGameTravelResult.Failed("这个客户端已经有一次换大区在进行中");
+
+        try
+        {
+            return await TravelCoreAsync(gameProcess, sourceGroup, targetGroup, character, targetArea, progress, cancellationToken)
+                       .ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<InGameTravelResult> TravelCoreAsync
+    (
+        Process            gameProcess,
+        DCTravelGroup      sourceGroup,
+        DCTravelGroup      targetGroup,
+        DCTravelCharacter  character,
+        LoginArea          targetArea,
+        IProgress<string>? progress,
+        CancellationToken  cancellationToken
+    )
+    {
         var injectError = MiniModuleInjector.Inject(gameProcess);
 
         if (injectError != null)
@@ -124,15 +169,12 @@ public sealed class InGameTravelService(DCTravelClient client)
 
             try
             {
-                // 3. 下单 + 轮询到「完成」
-                Report(progress, "正在提交超域旅行订单…");
-                var orderId = await client.TravelOrder(targetGroup, sourceGroup, character).ConfigureAwait(false);
-                Log.Information("[InGameTravel] 订单号 {OrderId}, 目标 {Area}/{Group}", orderId, targetGroup.AreaName, targetGroup.GroupName);
+                // 3. 下单 + 轮询到「完成」（带冷却与重试, 语义抄自 DcTraveler, 见下面各方法注释）
+                var ordered = await SubmitWithRetryAsync(sourceGroup, targetGroup, character, progress, cancellationToken)
+                                  .ConfigureAwait(false);
 
-                var orderFailure = await WaitForOrderAsync(orderId, progress, cancellationToken).ConfigureAwait(false);
-
-                if (orderFailure != null)
-                    return InGameTravelResult.Failed(orderFailure);
+                if (ordered != null)
+                    return InGameTravelResult.Failed(ordered);
 
                 // 4. 现取一张新票据 —— 旧的和原大区绑定, 换服后必然失效
                 Report(progress, "正在换取新的登录票据…");
@@ -171,6 +213,172 @@ public sealed class InGameTravelService(DCTravelClient client)
             return InGameTravelResult.Failed(ex.Message);
         }
     }
+
+    /// <summary>
+    ///     下单 + 轮询, 带冷却与重试。语义抄自 DcTraveler（<c>TravelCooldownGate</c> /
+    ///     <c>DefaultTravelRetryPolicy</c> / <c>TravelContextResolver.ResolveEffectiveTargetGroup</c>）：
+    ///     <list type="bullet">
+    ///       <item>每次下单前等满 <b>60 秒冷却</b>（基准是上一次下单时刻, 全启动器共享）</item>
+    ///       <item>下单前<b>重新拉一次目标大区的服务器状态</b>, 拿到最新的 QueueTime</item>
+    ///       <item>目标服务器 <c>QueueTime &lt; 0</c>（繁忙）时, 自动换成同大区里 <c>QueueTime == 0</c> 的那个</item>
+    ///       <item>只有「传送失败 / 繁忙 / 稍晚再次尝试 / 用户数量较多」这类错误才重试, 最多 20 次</item>
+    ///     </list>
+    ///     返回 null 表示成功, 否则是失败原因。
+    /// </summary>
+    private async Task<string?> SubmitWithRetryAsync
+    (
+        DCTravelGroup      sourceGroup,
+        DCTravelGroup      requestedTargetGroup,
+        DCTravelCharacter  character,
+        IProgress<string>? progress,
+        CancellationToken  cancellationToken
+    )
+    {
+        string? lastFailure = null;
+
+        for (var attempt = 0; attempt <= MAX_RETRY_COUNT; ++attempt)
+        {
+            await WaitForCooldownAsync(progress, cancellationToken).ConfigureAwait(false);
+
+            var targetGroup = await ResolveEffectiveTargetGroupAsync(sourceGroup, requestedTargetGroup, cancellationToken)
+                                  .ConfigureAwait(false);
+
+            Report(progress, attempt == 0
+                                 ? $"正在提交超域旅行订单（目标 {targetGroup.AreaName}/{targetGroup.GroupName}）…"
+                                 : $"第 {attempt}/{MAX_RETRY_COUNT} 次重试（目标 {targetGroup.AreaName}/{targetGroup.GroupName}）…");
+
+            string orderId;
+
+            try
+            {
+                orderId = await client.TravelOrder(targetGroup, sourceGroup, character).ConfigureAwait(false);
+                MarkOrdered();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                lastFailure = ex.Message;
+
+                if (!IsRetryable(lastFailure) || attempt == MAX_RETRY_COUNT)
+                    return $"下单失败: {lastFailure}";
+
+                await WaitBeforeRetryAsync(lastFailure, attempt + 1, progress, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            Log.Information("[InGameTravel] 订单号 {OrderId}, 目标 {Area}/{Group}", orderId, targetGroup.AreaName, targetGroup.GroupName);
+
+            lastFailure = await WaitForOrderAsync(orderId, progress, cancellationToken).ConfigureAwait(false);
+
+            if (lastFailure == null)
+                return null; // 成功
+
+            if (!IsRetryable(lastFailure) || attempt == MAX_RETRY_COUNT)
+                return lastFailure;
+
+            await WaitBeforeRetryAsync(lastFailure, attempt + 1, progress, cancellationToken).ConfigureAwait(false);
+        }
+
+        return lastFailure ?? "传送失败";
+    }
+
+    /// <summary>
+    ///     下单前重新拉一次目标大区的服务器状态。<c>QueueTime</c>：<c>0</c>=即刻完成，<c>&lt;0</c>=繁忙，
+    ///     <c>&gt;0</c>=预计排队 N 分钟。繁忙时自动换成同大区里通畅的那个（DcTraveler 默认也是这么做的）。
+    /// </summary>
+    private async Task<DCTravelGroup> ResolveEffectiveTargetGroupAsync
+    (
+        DCTravelGroup     sourceGroup,
+        DCTravelGroup     requestedTargetGroup,
+        CancellationToken cancellationToken
+    )
+    {
+        try
+        {
+            var areas = await client.QueryGroupListTravelTarget(sourceGroup.AreaID, sourceGroup.GroupID).ConfigureAwait(false);
+            var area  = areas.FirstOrDefault(x => x.AreaID == requestedTargetGroup.AreaID);
+
+            if (area == null)
+                return requestedTargetGroup;
+
+            var latest = area.GroupList.FirstOrDefault(x => x.GroupID == requestedTargetGroup.GroupID) ?? requestedTargetGroup;
+
+            // 只有「繁忙」(<0) 才换; 排队 N 分钟(>0) 说明能排上, 照常下单
+            if (latest.QueueTime is not < 0)
+                return latest;
+
+            var available = area.GroupList
+                                .Where(x => x.QueueTime == 0 && x.GroupID != latest.GroupID)
+                                .OrderBy(x => x.GroupID)
+                                .FirstOrDefault();
+
+            if (available == null)
+            {
+                Log.Information("[InGameTravel] {Group} 繁忙, 但同大区没有通畅的服务器, 仍按原目标下单", latest.GroupName);
+                return latest;
+            }
+
+            Log.Information("[InGameTravel] {Group} 繁忙, 自动改投同大区的 {Available}", latest.GroupName, available.GroupName);
+            return available;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log.Warning(ex, "[InGameTravel] 刷新目标服务器状态失败, 按原目标下单");
+            return requestedTargetGroup;
+        }
+    }
+
+    /// <summary>DcTraveler 的重试判据: 只有这几类「服务侧忙」的错误才值得再试。</summary>
+    private static bool IsRetryable(string message) =>
+        message.Contains("传送失败", StringComparison.Ordinal)     ||
+        message.Contains("繁忙", StringComparison.Ordinal)         ||
+        message.Contains("请您稍晚再次尝试", StringComparison.Ordinal) ||
+        message.Contains("稍晚再次尝试", StringComparison.Ordinal)   ||
+        message.Contains("用户数量较多", StringComparison.Ordinal);
+
+    private static async Task WaitBeforeRetryAsync(string failure, int attempt, IProgress<string>? progress, CancellationToken cancellationToken)
+    {
+        var until = DateTimeOffset.UtcNow + RETRY_DELAY;
+
+        while (DateTimeOffset.UtcNow < until)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var remaining = (until - DateTimeOffset.UtcNow).TotalSeconds;
+            Report(progress, $"{failure} —— 第 {attempt}/{MAX_RETRY_COUNT} 次重试, {remaining:F0} 秒后继续");
+
+            await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    ///     跨大区有 60 秒冷却（DcTraveler 同样是 60 秒, 基准取「上次下单」与「上次取消」中较晚者）。
+    ///     这里按启动器进程记一个全局时刻 —— 冷却是账号侧的, 与开了几个客户端无关。
+    /// </summary>
+    private static async Task WaitForCooldownAsync(IProgress<string>? progress, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var last = Volatile.Read(ref lastOrderTicks);
+
+            if (last == 0)
+                return;
+
+            var elapsed = DateTimeOffset.UtcNow - new DateTimeOffset(last, TimeSpan.Zero);
+
+            if (elapsed >= COOLDOWN)
+                return;
+
+            var remaining = (COOLDOWN - elapsed).TotalSeconds;
+            Report(progress, $"跨大区冷却中, 还需等待 {remaining:F0} 秒…");
+
+            await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static void MarkOrdered() =>
+        Volatile.Write(ref lastOrderTicks, DateTimeOffset.UtcNow.UtcTicks);
 
     /// <summary>
     ///     轮询订单直到「完成」。语义与启动器外部传送那套一致（需要确认就确认, 连续异常三次放弃）。
