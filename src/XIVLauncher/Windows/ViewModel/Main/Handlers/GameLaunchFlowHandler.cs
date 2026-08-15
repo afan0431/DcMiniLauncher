@@ -14,6 +14,7 @@ using XIVLauncher.Common.Game.Exceptions;
 using XIVLauncher.CompanionApp;
 using XIVLauncher.Dalamud;
 using XIVLauncher.GamePatchV3.Update;
+using XIVLauncher.InGame;
 using XIVLauncher.Login;
 using XIVLauncher.Login.Channels;
 using XIVLauncher.Login.Client;
@@ -155,6 +156,11 @@ internal sealed class GameLaunchFlowHandler
         if (gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion))
             await AttachMinionAsync(launched, gamePath, dalamudOk).ConfigureAwait(false);
 
+        // F4: 只有「只 Minion」这一种模式需要我们自己的游戏内模块 ——
+        // 注了 Dalamud 的模式由现成的 DcTraveler 插件换服, 都不注的模式不提供跨大区
+        if (gameLaunchContext.InGameAgents == InGameAgents.Minion)
+            await RunMiniModuleGateAsync(launched).ConfigureAwait(false);
+
         Log.Debug("等待游戏进程退出");
 
         try
@@ -236,6 +242,29 @@ internal sealed class GameLaunchFlowHandler
                             .WithAppendText("\n\n挂载 Minion 时发生错误, 游戏已经启动, 不受影响")
                             .WithParentWindow(vm.Window)
                             .Show();
+        }
+    }
+
+    /// <summary>
+    ///     注入自家的游戏内模块并跑一次生死闸自检（F4）。
+    ///     模块文件不在（还没跑 build.ps1 / 发布里没带）就安静跳过, 绝不影响已经在跑的游戏。
+    /// </summary>
+    private async Task RunMiniModuleGateAsync(FFXIVProcess launched)
+    {
+        if (!MiniModuleInjector.ModulePath.Exists)
+        {
+            Log.Debug("[MiniModule] 没有 {Module}, 跳过", MiniModuleInjector.MODULE_FILE_NAME);
+            return;
+        }
+
+        try
+        {
+            await MiniModuleGate.RunAsync(launched.UnderlyingProcess, vm.LoginFlow.LoginCancellationToken)
+                                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[MiniModule] 自检时发生未处理异常（游戏不受影响）");
         }
     }
 
