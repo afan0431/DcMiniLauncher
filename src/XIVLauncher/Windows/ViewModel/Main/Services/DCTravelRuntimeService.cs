@@ -1,6 +1,7 @@
 using Serilog;
 using XIVLauncher.Common.Util;
 using XIVLauncher.DCTravel;
+using XIVLauncher.InGame;
 using XIVLauncher.Login;
 using XIVLauncher.Login.Workflow;
 
@@ -72,8 +73,14 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         DcTravelPort = APIHelper.GetAvailablePort();
 
         // 无论初始化是否成功, 始终启动监听器 —— 游戏内插件可通过 RPC 错误区分维护状态
-        Listener = new DCTravelListener(Client, DcTravelPort, false);
-        _        = Listener.StartAsync();
+        Listener = new DCTravelListener(Client, DcTravelPort, false)
+        {
+            // F4: /dctravel/ingame-travel —— bot 用普通 HTTP 就能让已经在跑的客户端原地换大区。
+            // 该客户端注了 Dalamud 的话协调器会拒绝（那种模式由 DcTraveler 插件负责）。
+            InGameTravelHandler = new InGameTravelCoordinator(Client).HandleAsync
+        };
+
+        _ = Listener.StartAsync();
         Log.Information("[DCTravelListener] 打开监听端口: {DcTravelPort}", DcTravelPort);
 
         try

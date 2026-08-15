@@ -15,6 +15,12 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
 {
     public DCTravelClient DCTravelClient { get; }
 
+    /// <summary>
+    ///     处理 <c>/dctravel/ingame-travel</c> 的钩子（F4）。由启动器在「只 Minion」模式下装上 ——
+    ///     本项目不认识注入模块那一套, 所以行为由上层注入, 监听器只负责收发。
+    /// </summary>
+    public Func<InGameTravelRequest, CancellationToken, Task<InGameTravelResponse>>? InGameTravelHandler { get; set; }
+
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -252,6 +258,27 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
         public object?[] Params { get; set; } = [];
     }
 
+    /// <summary>
+    ///     游戏内换大区请求（F4）。给 bot（Afan/Minion 的 Lua 只会发普通 HTTP）用：
+    ///     <c>POST http://127.0.0.1:&lt;XL.DcTraveler&gt;/dctravel/ingame-travel</c>
+    ///     <code>{"area":"陆行鸟","group":"紫水栈桥","character":"某某","pid":1234}</code>
+    ///     除 <see cref="Area" /> 外都可省：<see cref="Group" /> 省了就挑该大区第一个可用服务器，
+    ///     <see cref="Character" /> 省了就要求源大区只有一个角色，<see cref="Pid" /> 省了就要求只开着一个客户端。
+    /// </summary>
+    public sealed class InGameTravelRequest
+    {
+        public string  Area      { get; set; } = string.Empty;
+        public string? Group     { get; set; }
+        public string? Character { get; set; }
+        public int?    Pid       { get; set; }
+    }
+
+    public sealed class InGameTravelResponse
+    {
+        public bool   Ok      { get; set; }
+        public string Message { get; set; } = string.Empty;
+    }
+
     public sealed class RpcResponse
     {
         public object? Result { get; set; }
@@ -292,6 +319,55 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
             {
                 await WriteRpcResponseAsync(new RpcResponse { Error = UnwrapException(ex).ToString() }).ConfigureAwait(false);
             }
+        }
+
+        /// <summary>
+        ///     游戏内换大区（F4）。和上面的 RPC 不同, 这条**不是**代理 SDO 接口, 而是让启动器
+        ///     去驱动注入到游戏里的 native 模块原地换服 —— 所以它不走 <c>rpcMethodCache</c>,
+        ///     也不加密（本监听器整体就是明文绑 127.0.0.1, 见 DCTravelRuntimeService 的构造）。
+        ///     整个流程要跑几分钟（排队), 这里会一直等到有结果为止。
+        /// </summary>
+        [Route(HttpVerbs.Post, "/ingame-travel")]
+        public async Task ProcessInGameTravel()
+        {
+            if (!string.IsNullOrEmpty(Request.Headers["Origin"]))
+            {
+                Response.StatusCode = 403;
+                await Response.OutputStream.WriteAsync("CORS Forbidden"u8.ToArray()).ConfigureAwait(false);
+                return;
+            }
+
+            InGameTravelResponse response;
+
+            try
+            {
+                var handler = listener.InGameTravelHandler
+                              ?? throw new InvalidOperationException("本启动器未启用游戏内换大区（只在「只 Minion」模式下可用）");
+
+                using var reader = new StreamReader(Request.InputStream, Request.ContentEncoding ?? Encoding.UTF8);
+                var       body   = await reader.ReadToEndAsync().ConfigureAwait(false);
+
+                var request = JsonSerializer.Deserialize<InGameTravelRequest>(body, SerializerOptions)
+                              ?? throw new InvalidOperationException("无效的请求负载");
+
+                if (string.IsNullOrWhiteSpace(request.Area))
+                    throw new InvalidOperationException("缺少目标大区 area");
+
+                Log.Information("[DCTravelListener] 收到游戏内换大区请求: area={Area} group={Group} pid={Pid}",
+                                request.Area, request.Group, request.Pid);
+
+                response = await handler(request, listener.listenerCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[DCTravelListener] 游戏内换大区失败");
+                response = new InGameTravelResponse { Ok = false, Message = UnwrapException(ex).Message };
+            }
+
+            var json = JsonSerializer.Serialize(response, SerializerOptions);
+            Response.ContentType = "application/json";
+            Response.StatusCode  = response.Ok ? 200 : 500;
+            await Response.OutputStream.WriteAsync(Encoding.UTF8.GetBytes(json)).ConfigureAwait(false);
         }
 
         private async Task<RpcRequest> ReadRequestAsync()

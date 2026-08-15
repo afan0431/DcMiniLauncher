@@ -3,6 +3,8 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Serilog;
 using XIVLauncher.DCTravel;
+using XIVLauncher.InGame;
+using XIVLauncher.Login.Models;
 
 namespace XIVLauncher.Windows.ViewModel.Main;
 
@@ -328,16 +330,33 @@ public sealed partial class DCTravelViewModel : ObservableObject
             }
 
             var targetGroup = SelectedTargetGroup;
-            var orderId     = await client.TravelOrder(targetGroup, sourceGroup, SelectedCharacter);
 
-            var completed = await PollOrderStatusAsync(orderId, pollCts.Token);
-            if (!completed)
-                return;
+            // F4: 游戏已经开着（且是「只 Minion」模式）就原地换服, 不必退客户端。
+            // 选人选服的界面完全复用上面这套, 只是执行路径不同。
+            var inGameTarget = TryGetInGameTarget();
+
+            if (inGameTarget != null)
+            {
+                var travelled = await TravelInGameAsync(client, inGameTarget, sourceGroup, targetGroup, pollCts.Token);
+
+                if (!travelled)
+                    return;
+            }
+            else
+            {
+                var orderId   = await client.TravelOrder(targetGroup, sourceGroup, SelectedCharacter);
+                var completed = await PollOrderStatusAsync(orderId, pollCts.Token);
+
+                if (!completed)
+                    return;
+            }
 
             if (SelectedTargetArea != null)
                 UpdateCurrentArea(SelectedTargetArea.AreaName);
 
-            if (AutoStartGameOnComplete)
+            // 游戏内换服的客户端已经在目标大区跑着了, 这时候再「传送完成后自动启动游戏」
+            // 就会多开出第二个客户端 —— 所以那条只走外部传送
+            if (AutoStartGameOnComplete && inGameTarget == null)
                 onTravelCompleteAction();
             else
                 activateAction();
@@ -348,6 +367,75 @@ public sealed partial class DCTravelViewModel : ObservableObject
             TravelProgressText = $"传送失败: {ex.Message}";
             IsTravelInProgress = false;
         }
+    }
+
+    /// <summary>
+    ///     本次传送能不能走「游戏内换服」（F4）。条件是本启动器正好起着一个客户端, 且它是
+    ///     「只 Minion」模式 —— 注了 Dalamud 的由 DcTraveler 插件负责, 什么都没注的没有执行者。
+    ///     不满足就返回 null, 走原来的外部传送（传送完再启动游戏）。
+    /// </summary>
+    private static RunningGameRegistry.Entry? TryGetInGameTarget()
+    {
+        var game = RunningGameRegistry.Resolve(null, out _);
+
+        if (game == null)
+            return null;
+
+        if (game.Agents != InGameAgents.Minion)
+            return null;
+
+        return MiniModuleInjector.ModulePath.Exists ? game : null;
+    }
+
+    private async Task<bool> TravelInGameAsync
+    (
+        DCTravelClient              client,
+        RunningGameRegistry.Entry   game,
+        DCTravelGroup               sourceGroup,
+        DCTravelGroup               targetGroup,
+        CancellationToken           ct
+    )
+    {
+        if (SelectedTargetArea == null || SelectedCharacter == null)
+            return false;
+
+        LoginArea? loginArea = null;
+
+        try
+        {
+            var loginAreas = await LoginArea.Get();
+            loginArea = loginAreas.FirstOrDefault(x => string.Equals(x.AreaName, SelectedTargetArea.AreaName, StringComparison.Ordinal));
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[DCTravelVM] 取大区登录主机名失败");
+        }
+
+        if (loginArea == null)
+        {
+            TravelProgressText = $"拿不到大区 {SelectedTargetArea.AreaName} 的登录主机名, 无法游戏内换服";
+            IsTravelInProgress = false;
+            return false;
+        }
+
+        var progress = new Progress<string>(text => TravelProgressText = text);
+        var service  = new InGameTravelService(client);
+
+        var result = await service.TravelAsync(game.Process, sourceGroup, targetGroup, SelectedCharacter, loginArea, progress, ct);
+
+        if (!result.Ok)
+        {
+            TravelProgressText = $"游戏内换服失败: {result.Message}";
+            IsTravelInProgress = false;
+            return false;
+        }
+
+        TravelProgressText = $"已在游戏内换到 {SelectedTargetArea.AreaName}（客户端未重启）";
+        IsTravelInProgress = false;
+        IsTravelSuccessful = true;
+
+        await RefreshOrdersAsync();
+        return true;
     }
 
     private async Task<bool> PollOrderStatusAsync(string orderId, CancellationToken ct)
