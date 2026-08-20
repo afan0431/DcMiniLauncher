@@ -77,43 +77,50 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     }
 
     /// <summary>
-    ///     游戏内 UI 用: 报告<b>这个角色</b>现在的处境, 以及（在家时）它能去哪。
-    ///     <paramref name="character" /> 由游戏内那侧给（Minion Lua 的 <c>Player.name</c>）——
-    ///     谁在玩只有游戏进程自己知道, 问启动器的启动记录问不出来。
+    ///     游戏内 UI 用: 报告<b>这个角色</b>现在的处境, 以及（在原始大区时）它能去哪。
+    ///     三个参数都由游戏内那侧给（<c>Player.name</c> + <c>FFXIVLib.API.World.GetWorldById</c>
+    ///     解出的当前世界名 / 原始世界名）—— 谁在玩、人在哪, 只有游戏进程自己知道。
     ///     <c>queueTime</c>: 0=通畅, &lt;0=繁忙, &gt;0=预计排队分钟数。
     /// </summary>
-    public async Task<object> QueryTargetsAsync(string? character, CancellationToken cancellationToken)
+    public async Task<object> QueryTargetsAsync
+    (
+        string?           character,
+        string?           world,
+        string?           homeWorld,
+        CancellationToken cancellationToken
+    )
     {
-        var (state, error) = await ResolveCharacterStateAsync(character, cancellationToken).ConfigureAwait(false);
+        var (state, error) = await ResolveCharacterStateAsync(character, world, homeWorld, cancellationToken).ConfigureAwait(false);
 
         if (state == null)
             return new { ok = false, message = error ?? "拿不到角色信息" };
 
-        // 做客中: 只能返回原大区, 给目标列表没意义 —— 空着, 游戏内 UI 靠 away 决定画什么
+        // 超域中: 只能超域返回, 给目标列表没意义 —— 空着, 游戏内 UI 靠 away 决定画什么
         if (state.Away)
             return new
             {
                 ok        = true,
                 character = state.Name,
-                area      = state.AreaName,
-                group     = state.GroupName,
+                area      = state.CurrentGroup.AreaName,
+                group     = state.CurrentGroup.GroupName,
                 away      = true,
-                homeArea  = state.Order!.SourceAreaName,
-                homeGroup = state.Order.SourceGroupName,
+                homeArea  = state.HomeGroup.AreaName,
+                homeGroup = state.HomeGroup.GroupName,
                 areas     = Array.Empty<object>()
             };
 
-        var targets = await client.QueryGroupListTravelTarget(state.Group!.AreaID, state.Group.GroupID).ConfigureAwait(false);
+        // SDO 的超域业务以**原始服务器**为源 —— 角色跨界传送到同大区别的世界时也一样
+        var targets = await client.QueryGroupListTravelTarget(state.HomeGroup.AreaID, state.HomeGroup.GroupID).ConfigureAwait(false);
 
         return new
         {
             ok        = true,
             character = state.Name,
-            area      = state.AreaName,
-            group     = state.GroupName,
+            area      = state.CurrentGroup.AreaName,
+            group     = state.CurrentGroup.GroupName,
             away      = false,
-            homeArea  = "",
-            homeGroup = "",
+            homeArea  = state.HomeGroup.AreaName,
+            homeGroup = state.HomeGroup.GroupName,
             areas = targets.Select(area => new
             {
                 area = area.AreaName,
@@ -303,26 +310,28 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     /// </summary>
     private async Task<TravelContext> ResolveReturnContextAsync(DCTravelListener.InGameTravelRequest request, CancellationToken cancellationToken)
     {
-        var (state, error) = await ResolveCharacterStateAsync(request.Character, cancellationToken).ConfigureAwait(false);
+        var (state, error) = await ResolveCharacterStateAsync(request.Character, request.World, request.HomeWorld, cancellationToken)
+                                 .ConfigureAwait(false);
 
         if (state == null)
             return TravelContext.Failed(error!);
 
         if (!state.Away)
-            return TravelContext.Failed($"角色 {state.Name} 没在做客 —— 它本来就在原大区");
+            return TravelContext.Failed($"角色 {state.Name} 没在超域 —— 它本来就在原始大区");
 
-        if (state.Group == null)
-            return TravelContext.Failed($"拿不到 {state.AreaName}/{state.GroupName} 的服务器信息, 提交不了返回请求");
+        var order = await FindReturnTicketAsync(state.Name, state.CurrentGroup, cancellationToken).ConfigureAwait(false);
 
-        var order      = state.Order!;
+        if (order == null)
+            return TravelContext.Failed($"没找到角色 {state.Name} 在 {state.CurrentGroup.AreaName}/{state.CurrentGroup.GroupName} 的超域订单");
+
         var loginAreas = await LoginArea.Get().ConfigureAwait(false);
         var homeArea   = loginAreas.FirstOrDefault(x => string.Equals(x.AreaName, order.SourceAreaName, StringComparison.Ordinal));
 
         if (homeArea == null)
-            return TravelContext.Failed($"拿不到原大区 {order.SourceAreaName} 的登录主机名");
+            return TravelContext.Failed($"拿不到原始大区 {order.SourceAreaName} 的登录主机名");
 
-        Log.Information("[InGameTravel] 返回原大区: {Character}@{Current} → {Home}/{HomeGroup} (订单 {OrderId})",
-                        state.Name, state.GroupName, order.SourceAreaName, order.SourceGroupName, order.OrderID);
+        Log.Information("[InGameTravel] 超域返回: {Character}@{Current} → {Home}/{HomeGroup} (订单 {OrderId})",
+                        state.Name, state.CurrentGroup.GroupName, order.SourceAreaName, order.SourceGroupName, order.OrderID);
 
         // TargetGroup 这里只用于显示; 真正提交返回单只需要当前服务器 + 订单号
         var homeGroup = new DCTravelGroup
@@ -333,7 +342,7 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             GroupCode = string.Empty
         };
 
-        return new TravelContext(state.Group, homeGroup, state.Character, homeArea, null) { ReturnOrderId = order.OrderID };
+        return new TravelContext(state.CurrentGroup, homeGroup, null, homeArea, null) { ReturnOrderId = order.OrderID };
     }
 
     private sealed record TravelContext
@@ -350,116 +359,83 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
 
         public static TravelContext Failed(string error) => new(null, null, null, null, error);
     }
-
     /// <summary>
-    ///     角色现在的处境。<b>位置以 <c>queryRoleList4Migration</c> 为准</b> —— 它按服务器列角色,
-    ///     人在哪就出现在哪。订单只用来回答「它是不是正做客、返回票是哪张」, 而且必须拿
-    ///     当前位置去对订单的目的地才算数（见 <see cref="TRAVEL_STATUS_ARRIVED" /> 上的警告）。
+    ///     角色现在的处境。<b>位置只能来自游戏内存</b> ——
+    ///     游戏内是 <c>Player.currentworld</c> / <c>homeworld</c>，选角界面是
+    ///     <c>CharaSelectCharacterEntry</c>。SDO 那边给不了：
+    ///     <c>queryRoleList4Migration</c> 是按**原始服务器**列角色的，
+    ///     角色超域出去之后它照样把角色列在原始服务器下（2026-08-20 实测）。
     /// </summary>
     private sealed record CharacterState
     {
         public required string Name { get; init; }
 
-        /// <summary>现在人在哪个大区/服务器 —— 做客中就是做客地, 不是原大区</summary>
-        public required string AreaName { get; init; }
+        /// <summary>角色**现在**所在的服务器（超域中就是做客地）</summary>
+        public required DCTravelGroup CurrentGroup { get; init; }
 
-        public required string GroupName { get; init; }
+        /// <summary>角色的原始服务器。SDO 的超域业务全部以它为源。</summary>
+        public required DCTravelGroup HomeGroup { get; init; }
 
-        /// <summary>现在所在服务器的完整对象; 提交请求要 GroupID/GroupCode, 光有名字不够</summary>
-        public DCTravelGroup? Group { get; init; }
-
-        /// <summary>在家时才有 —— 下新单要 ContentID</summary>
-        public DCTravelCharacter? Character { get; init; }
-
-        /// <summary>做客中才有 —— 返回原大区要 OrderID 和订单里记的原大区</summary>
-        public DCTravelMigrationOrder? Order { get; init; }
-
-        /// <summary>做客中: 只能返回原大区, 不能直接再跨去别处</summary>
-        public bool Away => Order != null;
+        /// <summary>超域中 = 现在所在的大区不是原始大区</summary>
+        public bool Away => !string.Equals(CurrentGroup.AreaName, HomeGroup.AreaName, StringComparison.Ordinal);
     }
 
     /// <summary>
-    ///     查清楚角色现在什么处境。<paramref name="wantedName" /> 由游戏内那侧给（Minion Lua 的
-    ///     <c>Player.name</c>）—— 它比启动器的任何记录都准: 启动器只知道「这个客户端是我起的、
-    ///     登录的哪个大区」, 而角色一旦做客, 登录大区和它实际所在的大区就是两回事了。
+    ///     按游戏内报上来的世界名定位角色。<paramref name="world" /> / <paramref name="homeWorld" />
+    ///     由游戏内那侧算好（<c>FFXIVLib.API.World.GetWorldById</c>），
+    ///     这里只把名字映射成 SDO 的服务器对象（要 GroupID / GroupCode 才能提交请求）。
+    ///     <para>
+    ///         只发一次 <c>queryGroupListTravelSource</c>。原先那套「挨个服务器问可迁移角色」
+    ///         的扫描（4 大区 28 个服务器、串行十几秒）已删除 —— 它不但慢，查的还是另一回事。
+    ///     </para>
     /// </summary>
     private async Task<(CharacterState? State, string? Error)> ResolveCharacterStateAsync
     (
-        string?           wantedName,
+        string?           name,
+        string?           world,
+        string?           homeWorld,
         CancellationToken cancellationToken
     )
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (string.IsNullOrWhiteSpace(name))
+            return (null, "拿不到角色名（游戏内那侧没报上来）");
+
+        if (string.IsNullOrWhiteSpace(world) || string.IsNullOrWhiteSpace(homeWorld))
+            return (null, "拿不到角色所在的世界（进游戏后再试）");
+
         var sourceAreas = await client.QueryGroupListTravelSource().ConfigureAwait(false);
 
-        // 挨个服务器问「可迁移角色」—— 必须扫完。
-        // WHY 强调扫完: 早先这里撞见第二个角色就 return, 结果 areaId=7/8 根本没扫到,
-        // 家在豆豆柴的角色凭空消失, 还害我推出一套「做客角色查不到」的错理论。
-        var found = new List<(DCTravelCharacter Role, DCTravelGroup Group)>();
+        var homeGroup = FindGroupByName(sourceAreas, homeWorld);
 
-        foreach (var area in sourceAreas)
-        {
-            foreach (var group in area.GroupList)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
+        if (homeGroup == null)
+            return (null, $"SDO 的服务器列表里没有 {homeWorld}");
 
-                List<DCTravelCharacter> roles;
-
-                try
-                {
-                    roles = await client.QueryRoleList(area.AreaID, group.GroupID).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    Log.Debug(ex, "[InGameTravel] 查角色失败 A={AreaID} G={GroupID}, 跳过", area.AreaID, group.GroupID);
-                    continue;
-                }
-
-                foreach (var role in roles)
-                    found.Add((role, group));
-            }
-        }
-
-        var matched = string.IsNullOrWhiteSpace(wantedName)
-                          ? found
-                          : found.Where(x => string.Equals(x.Role.Name, wantedName, StringComparison.Ordinal)).ToList();
-
-        if (matched.Count == 0)
-            return (null, string.IsNullOrWhiteSpace(wantedName)
-                              ? "没查到任何可传送的角色"
-                              : $"没找到角色 {wantedName}（它可能不在可超域的服务器上）");
-
-        // 名字是游戏内给的, 只有标题/选人界面才会没有 —— 那时候确实没有「当前角色」这回事
-        if (matched.Count > 1)
-            return (null, $"这个账号下有 {matched.Count} 个角色, 进游戏后再开这个窗口");
-
-        var (hit, hitGroup) = matched[0];
-
-        var order = await FindReturnTicketAsync(hit.ContentID, hitGroup, cancellationToken).ConfigureAwait(false);
+        // 做客世界一定也在源列表里（那份列表含全部四个大区的全部服务器）；
+        // 万一没有就退回原始服务器，至少不会把状态判反。
+        var currentGroup = FindGroupByName(sourceAreas, world) ?? homeGroup;
 
         return (new CharacterState
         {
-            Name      = hit.Name,
-            AreaName  = hitGroup.AreaName,
-            GroupName = hitGroup.GroupName,
-            Group     = hitGroup,
-            Character = hit,
-            Order     = order
+            Name         = name,
+            CurrentGroup = currentGroup,
+            HomeGroup    = homeGroup
         }, null);
     }
 
     /// <summary>
-    ///     找「角色此刻正做客所凭的那张单」。判据不是订单状态, 是<b>位置对得上</b>:
-    ///     角色现在所在的服务器 == 这一单的目的地, 且目的地 != 出发地。
+    ///     找「角色此刻正超域所凭的那张单」—— 提交超域返回要它的 OrderID。
+    ///     判据是<b>位置对得上</b>：这一单的目的地就是角色现在所在的服务器。
     ///     <para>
-    ///         为什么不能只看 <c>travelStatus == 1</c>: 那个值送达后永不改变, 而官方对超过一天
-    ///         没登录的角色会自动遣返 —— 角色早回家了, 订单还写着「已抵达」。只看状态就会把
-    ///         一个在家的角色报成做客中, 顺带把历史上每一次旅行都算成一次做客。
+    ///         为什么不能只看 <c>travelStatus == 1</c>: 那个值送达后永不改变，而官方对超过一天
+    ///         没登录的角色会自动遣返 —— 角色早回去了，订单还写着「已抵达」。
     ///     </para>
-    ///     订单列表是新单在前, 所以取第一条对得上的。
+    ///     订单列表新单在前，取第一条对得上的。
     /// </summary>
     private async Task<DCTravelMigrationOrder?> FindReturnTicketAsync
     (
-        string            contentId,
+        string            roleName,
         DCTravelGroup     current,
         CancellationToken cancellationToken
     )
@@ -475,15 +451,11 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
                 if (order.TravelStatus != TRAVEL_STATUS_ARRIVED)
                     continue;
 
-                if (!string.Equals(order.ContentID, contentId, StringComparison.Ordinal))
+                if (!string.Equals(order.RoleName, roleName, StringComparison.Ordinal))
                     continue;
 
                 if (!string.Equals(order.TargetAreaName,  current.AreaName,  StringComparison.Ordinal) ||
                     !string.Equals(order.TargetGroupName, current.GroupName, StringComparison.Ordinal))
-                    continue;
-
-                // 目的地就是出发地的单（理论上不存在）不算做客
-                if (string.Equals(order.SourceGroupName, current.GroupName, StringComparison.Ordinal))
                     continue;
 
                 return order;
@@ -496,25 +468,48 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         return null;
     }
 
-    private static DCTravelGroup? FindGroup(List<DCTravelArea> areas, string areaName, string groupName) =>
-        areas.FirstOrDefault(x => string.Equals(x.AreaName, areaName, StringComparison.Ordinal))
-            ?.GroupList.FirstOrDefault(x => string.Equals(x.GroupName, groupName, StringComparison.Ordinal));
+    /// <summary>在原始服务器上把角色查出来 —— 下新单要 <c>roleId</c>。只问这一个服务器。</summary>
+    private async Task<DCTravelCharacter?> FindCharacterAsync(string roleName, DCTravelGroup homeGroup)
+    {
+        List<DCTravelCharacter> roles;
+
+        try
+        {
+            roles = await client.QueryRoleList(homeGroup.AreaID, homeGroup.GroupID).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[InGameTravel] 查角色失败 A={AreaID} G={GroupID}", homeGroup.AreaID, homeGroup.GroupID);
+            return null;
+        }
+
+        return roles.FirstOrDefault(x => string.Equals(x.Name, roleName, StringComparison.Ordinal));
+    }
+
+    private static DCTravelGroup? FindGroupByName(List<DCTravelArea> areas, string groupName) =>
+        areas.SelectMany(x => x.GroupList)
+             .FirstOrDefault(x => string.Equals(x.GroupName, groupName, StringComparison.Ordinal));
 
     private async Task<TravelContext> ResolveContextAsync(DCTravelListener.InGameTravelRequest request, CancellationToken cancellationToken)
     {
-        // 1. 找角色 —— 顺带就确定了它现在在哪个大区哪个服务器（= 源服务器）
-        var (state, error) = await ResolveCharacterStateAsync(request.Character, cancellationToken).ConfigureAwait(false);
+        // 1. 定位角色 —— 世界名由游戏内那侧给, 这里只映射成 SDO 的服务器对象
+        var (state, error) = await ResolveCharacterStateAsync(request.Character, request.World, request.HomeWorld, cancellationToken)
+                                 .ConfigureAwait(false);
 
         if (state == null)
             return TravelContext.Failed(error!);
 
-        // 做客中不能再直接跨去别处, 得先回家 —— 这是 SDO 的规则, 不是我们加的限制
+        // 超域中不能再直接跨去别处, 得先超域返回 —— 这是 SDO 的规则, 不是我们加的限制
         if (state.Away)
-            return TravelContext.Failed($"角色 {state.Name} 正在 {state.AreaName}/{state.GroupName} 做客, "
-                                        + $"要去别的大区得先返回原大区 {state.Order!.SourceAreaName}/{state.Order.SourceGroupName}");
+            return TravelContext.Failed($"角色 {state.Name} 正在 {state.CurrentGroup.AreaName}/{state.CurrentGroup.GroupName} 超域中, "
+                                        + $"要去别的大区得先超域返回 {state.HomeGroup.AreaName}/{state.HomeGroup.GroupName}");
 
-        var character   = state.Character!;
-        var sourceGroup = state.Group!;
+        // SDO 的超域业务以原始服务器为源
+        var sourceGroup = state.HomeGroup;
+        var character   = await FindCharacterAsync(state.Name, sourceGroup).ConfigureAwait(false);
+
+        if (character == null)
+            return TravelContext.Failed($"在 {sourceGroup.AreaName}/{sourceGroup.GroupName} 上没查到角色 {state.Name}");
         // 2. 目标大区/服务器
         var targetAreas = await client.QueryGroupListTravelTarget(sourceGroup.AreaID, sourceGroup.GroupID).ConfigureAwait(false);
 

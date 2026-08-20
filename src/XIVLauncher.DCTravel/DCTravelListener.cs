@@ -29,10 +29,12 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
 
     /// <summary>
     ///     <c>GET /dctravel/ingame-travel/areas</c> 的钩子 —— 游戏内 UI 用它问「我这个角色现在什么处境」:
-    ///     在家就附上能去的大区/服务器和拥挤度（queueTime: 0=通畅, &lt;0=繁忙, &gt;0=排队分钟数）,
-    ///     做客中就只报所在地和原大区。第一个参数是角色名, 由游戏内那侧给（拿不到就传 null）。
+    ///     在原始大区就附上能去的大区/服务器和拥挤度（queueTime: 0=通畅, &lt;0=繁忙, &gt;0=排队分钟数）,
+    ///     超域中就只报所在地和原始大区。
+    ///     三个字符串参数依次是: 角色名 / 当前世界名 / 原始世界名, 全部由游戏内那侧给
+    ///     （<c>Player.name</c> + <c>FFXIVLib.API.World.GetWorldById</c>）—— 人在哪只有游戏进程知道。
     /// </summary>
-    public Func<string?, CancellationToken, Task<object>>? InGameTravelAreasProvider { get; set; }
+    public Func<string?, string?, string?, CancellationToken, Task<object>>? InGameTravelAreasProvider { get; set; }
 
     /// <summary>
     ///     <c>POST /dctravel/ingame-travel/switch-area</c> 的钩子 —— 换登录大区（标题界面用）。
@@ -303,6 +305,12 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
         public string? Character { get; set; }
         public int?    Pid       { get; set; }
 
+        /// <summary>角色当前所在世界名（超域中就是做客地）。游戏内那侧给。</summary>
+        public string? World { get; set; }
+
+        /// <summary>角色原始世界名。SDO 的超域业务以它所在的服务器为源。</summary>
+        public string? HomeWorld { get; set; }
+
         /// <summary>true = 返回原大区（不需要 area/group，目标记在当初那张跨区订单里）</summary>
         public bool Back { get; set; }
 
@@ -444,8 +452,10 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
         }
 
         /// <summary>
-        ///     游戏内 UI 问「我现在什么处境」用。<c>?character=名字</c> 指明是谁 ——
-        ///     角色做客之后, 登录大区和它实际所在的大区是两回事, 只有游戏进程自己知道在玩谁。
+        ///     游戏内 UI 问「我现在什么处境」用:
+        ///     <c>?character=名字&amp;world=晨曦王座&amp;homeWorld=红茶川</c>。
+        ///     角色一旦超域, 登录大区、原始大区、实际所在大区三者互不相同,
+        ///     只有游戏进程自己知道在玩谁、人在哪。
         /// </summary>
         [Route(HttpVerbs.Get, "/ingame-travel/areas")]
         public async Task GetInGameTravelAreas()
@@ -457,9 +467,11 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
                 var provider = listener.InGameTravelAreasProvider
                                ?? throw new InvalidOperationException("本启动器未启用游戏内换大区");
 
-                var character = Request.QueryString["character"];
+                static string? Trim(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
 
-                payload = await provider(string.IsNullOrWhiteSpace(character) ? null : character,
+                payload = await provider(Trim(Request.QueryString["character"]),
+                                         Trim(Request.QueryString["world"]),
+                                         Trim(Request.QueryString["homeWorld"]),
                                          listener.listenerCts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
