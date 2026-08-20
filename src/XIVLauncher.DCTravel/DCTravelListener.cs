@@ -35,6 +35,17 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
     public Func<string?, CancellationToken, Task<object>>? InGameTravelAreasProvider { get; set; }
 
     /// <summary>
+    ///     <c>POST /dctravel/ingame-travel/switch-area</c> 的钩子 —— 换登录大区（标题界面用）。
+    ///     和超域旅行是两回事: 不动角色、不下单、无冷却。
+    /// </summary>
+    public Func<SwitchAreaRequest, CancellationToken, Task<InGameTravelResponse>>? InGameSwitchAreaHandler { get; set; }
+
+    /// <summary>
+    ///     <c>GET /dctravel/ingame-travel/login-areas</c> 的钩子 —— 可切换的登录大区列表。
+    /// </summary>
+    public Func<CancellationToken, Task<object>>? InGameLoginAreasProvider { get; set; }
+
+    /// <summary>
     ///     <c>GET/POST /dctravel/ingame-travel/settings</c> 的钩子 —— 游戏内 UI 抄的是 DcTraveler
     ///     的设置页（自动重试 / 繁忙时自动换服务器 / 最大重试次数 / 重试间隔）。
     ///     入参为 null 表示只读取, 非 null 表示写入后返回最新值。
@@ -299,6 +310,20 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
         public bool Wait { get; set; }
     }
 
+    /// <summary>
+    ///     换登录大区请求。
+    ///     <c>POST http://127.0.0.1:&lt;XL.DcTraveler&gt;/dctravel/ingame-travel/switch-area</c>
+    ///     <code>{"area":"陆行鸟","pid":1234}</code>
+    /// </summary>
+    public sealed class SwitchAreaRequest
+    {
+        public string Area { get; set; } = string.Empty;
+        public int?   Pid  { get; set; }
+
+        /// <summary>true = 一直等到换完才回应；默认立刻返回, 进度用 /ingame-travel/status 查</summary>
+        public bool Wait { get; set; }
+    }
+
     public sealed class InGameTravelResponse
     {
         public bool   Ok      { get; set; }
@@ -436,6 +461,54 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
 
                 payload = await provider(string.IsNullOrWhiteSpace(character) ? null : character,
                                          listener.listenerCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                payload = new InGameTravelResponse { Ok = false, Message = UnwrapException(ex).Message };
+            }
+
+            await WriteJsonAsync(payload).ConfigureAwait(false);
+        }
+
+        /// <summary>换登录大区 —— 不动角色、不下单、无冷却。</summary>
+        [Route(HttpVerbs.Post, "/ingame-travel/switch-area")]
+        public async Task PostInGameSwitchArea()
+        {
+            object payload;
+
+            try
+            {
+                var handler = listener.InGameSwitchAreaHandler
+                              ?? throw new InvalidOperationException("本启动器未启用游戏内换大区");
+
+                using var reader = new StreamReader(Request.InputStream, Request.ContentEncoding ?? Encoding.UTF8);
+                var       body   = await reader.ReadToEndAsync().ConfigureAwait(false);
+
+                var request = JsonSerializer.Deserialize<SwitchAreaRequest>(body, SerializerOptions)
+                              ?? throw new InvalidOperationException("请求体解析失败");
+
+                payload = await handler(request, listener.listenerCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                payload = new InGameTravelResponse { Ok = false, Message = UnwrapException(ex).Message };
+            }
+
+            await WriteJsonAsync(payload).ConfigureAwait(false);
+        }
+
+        /// <summary>可切换的登录大区列表。</summary>
+        [Route(HttpVerbs.Get, "/ingame-travel/login-areas")]
+        public async Task GetInGameLoginAreas()
+        {
+            object payload;
+
+            try
+            {
+                var provider = listener.InGameLoginAreasProvider
+                               ?? throw new InvalidOperationException("本启动器未启用游戏内换大区");
+
+                payload = await provider(listener.listenerCts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

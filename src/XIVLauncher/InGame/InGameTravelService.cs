@@ -146,6 +146,52 @@ public sealed class InGameTravelService(DCTravelClient client)
         }
     }
 
+    /// <summary>
+    ///     换登录大区 —— 只换用哪个大厅登录, 不动任何角色, 不产生 SDO 订单, 没有 60 秒冷却。
+    ///     和超域旅行的区别只有一处: 「在线那半」什么都不干; 进程内那半
+    ///     （现取票据 → 改主机名 → 作废大厅上下文 → 写票据 → 重新登录）一模一样。
+    ///     <para>
+    ///         卫月版 <c>GameFunctions.SelectDCAndLogin</c> 做的就是这件事, 步骤一一对应:
+    ///         <c>RefreshGameSessionId</c> → <c>ChangeToSdoArea</c>（内含改主机名 +
+    ///         <c>releaseLobbyContext</c> + 清 Context/State）→ <c>ChangeDEVTestSID</c> → <c>LoginInGame</c>。
+    ///     </para>
+    /// </summary>
+    public async Task<InGameTravelResult> SwitchLoginAreaAsync
+    (
+        Process            gameProcess,
+        LoginArea          targetArea,
+        IProgress<string>? progress,
+        CancellationToken  cancellationToken
+    )
+    {
+        if (string.IsNullOrWhiteSpace(targetArea.AreaLobby) ||
+            string.IsNullOrWhiteSpace(targetArea.AreaConfigUpload) ||
+            string.IsNullOrWhiteSpace(targetArea.AreaGM))
+            return InGameTravelResult.Failed($"大区 {targetArea.AreaName} 缺少主机名信息");
+
+        var gate = TRAVEL_GATES.GetOrAdd(gameProcess.Id, _ => new SemaphoreSlim(1, 1));
+
+        if (!await gate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            return InGameTravelResult.Failed("这个客户端已经有一次换大区在进行中");
+
+        try
+        {
+            return await TravelCoreAsync
+                       (
+                           gameProcess,
+                           targetArea,
+                           // 在线那半空跑 —— 换登录大区不下单
+                           _ => Task.FromResult<string?>(null),
+                           progress,
+                           cancellationToken
+                       ).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
     /// <summary>提交返回单并轮询到完成。返回 null 表示成功, 否则是失败原因。</summary>
     private async Task<string?> SubmitReturnAsync
     (

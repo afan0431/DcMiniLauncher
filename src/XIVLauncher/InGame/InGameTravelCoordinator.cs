@@ -145,6 +145,98 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     }
 
     /// <summary>
+    ///     换登录大区（标题界面用）。<b>和超域旅行是两回事</b>: 只换用哪个大厅登录,
+    ///     不动任何角色、不产生 SDO 订单、没有 60 秒冷却。所以这里不需要知道角色是谁,
+    ///     也不需要查任何服务器 —— 只要目标大区的名字。
+    /// </summary>
+    public async Task<DCTravelListener.InGameTravelResponse> HandleSwitchAreaAsync
+    (
+        DCTravelListener.SwitchAreaRequest request,
+        CancellationToken                  cancellationToken
+    )
+    {
+        try
+        {
+            var game = RunningGameRegistry.Resolve(request.Pid, out var resolveError);
+
+            if (game == null)
+                return Failed(resolveError ?? "找不到目标客户端");
+
+            if (!game.Agents.HasFlag(InGameAgents.Minion))
+                return Failed("该客户端没有挂 Minion, 游戏内模块不会被注入");
+
+            if (InGameTravelJobs.IsRunning(game.Process.Id))
+                return Failed("这个客户端已经有一次换大区在进行中");
+
+            if (string.IsNullOrWhiteSpace(request.Area))
+                return Failed("没给目标大区");
+
+            var loginAreas = await LoginArea.Get().ConfigureAwait(false);
+            var targetArea = loginAreas.FirstOrDefault(x => string.Equals(x.AreaName, request.Area, StringComparison.Ordinal));
+
+            if (targetArea == null)
+                return Failed($"没有大区 {request.Area}, 可选: {string.Join(", ", loginAreas.Select(x => x.AreaName))}");
+
+            var pid = game.Process.Id;
+            InGameTravelJobs.Begin(pid, targetArea.AreaName);
+
+            var run = RunSwitchAsync(game.Process, targetArea);
+
+            // 默认不等: 整个流程十几秒, 游戏内 UI 靠 /ingame-travel/status 轮询进度
+            if (!request.Wait)
+                return new DCTravelListener.InGameTravelResponse { Ok = true, Message = $"已开始: 切换到 {targetArea.AreaName}" };
+
+            var result = await run.ConfigureAwait(false);
+            return new DCTravelListener.InGameTravelResponse { Ok = result.Ok, Message = result.Message };
+        }
+        catch (OperationCanceledException)
+        {
+            return Failed("已取消");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[InGameTravel] 换登录大区失败");
+            return Failed(ex.Message);
+        }
+    }
+
+    /// <summary>可切换的登录大区列表。纯本地数据, 不联网、不涉及角色。</summary>
+    public static async Task<object> QueryLoginAreasAsync(CancellationToken cancellationToken)
+    {
+        _ = cancellationToken;
+
+        var areas = await LoginArea.Get().ConfigureAwait(false);
+
+        return new
+        {
+            ok    = true,
+            areas = areas.Select(x => new { area = x.AreaName })
+        };
+    }
+
+    /// <summary>跑一次换登录大区, 进度同样写进 <see cref="InGameTravelJobs" /> 供 UI 轮询。</summary>
+    private async Task<InGameTravelResult> RunSwitchAsync(Process gameProcess, LoginArea targetArea)
+    {
+        var pid      = gameProcess.Id;
+        var progress = new Progress<string>(text => InGameTravelJobs.Report(pid, text));
+
+        try
+        {
+            var service = new InGameTravelService(client);
+            var result  = await service.SwitchLoginAreaAsync(gameProcess, targetArea, progress, CancellationToken.None).ConfigureAwait(false);
+
+            InGameTravelJobs.End(pid, result.Ok, result.Message);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[InGameTravel] 换登录大区任务异常");
+            InGameTravelJobs.End(pid, false, ex.Message);
+            return InGameTravelResult.Failed(ex.Message);
+        }
+    }
+
+    /// <summary>
     ///     读/写换大区的行为设置（四项与 DcTraveler 设置页一一对应）。
     ///     <paramref name="body" /> 为 null 表示只读, 否则整份写入后返回最新值。
     /// </summary>
