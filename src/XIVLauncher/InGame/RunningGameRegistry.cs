@@ -21,9 +21,16 @@ public static class RunningGameRegistry
     ///     游戏内 UI（Afan/Minion 的 Lua）要知道往哪个端口发请求。插件是从游戏参数
     ///     <c>XL.DcTraveler</c> 读的, 但 Minion 的 Lua 读不到游戏参数 —— 所以按 PID 落一个小文件,
     ///     Lua 用 <c>io.open</c> 就能读到。多开时各是各的。
+    ///     <para>
+    ///         为什么放 ProgramData 而不是 <c>%TEMP%</c>: Minion 的 Lua 沙箱没有 <c>os.getenv</c>,
+    ///         读不到任何环境变量, 所以两边只能约定一个不依赖环境变量的固定路径。
+    ///     </para>
     /// </summary>
     public static string PortFilePath(int processId) =>
-        Path.Combine(Path.GetTempPath(), $"minilauncher-dctravel-{processId}.port");
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "DcMiniLauncher",
+            $"dctravel-{processId}.port");
 
     public static void Register(Process process, InGameAgents agents, int dcTravelPort = 0)
     {
@@ -35,8 +42,10 @@ public static class RunningGameRegistry
 
         try
         {
-            File.WriteAllText(PortFilePath(process.Id), dcTravelPort.ToString());
-            Log.Debug("[RunningGame] 端口文件已写: {Path} = {Port}", PortFilePath(process.Id), dcTravelPort);
+            var portFile = PortFilePath(process.Id);
+            Directory.CreateDirectory(Path.GetDirectoryName(portFile)!);
+            File.WriteAllText(portFile, dcTravelPort.ToString());
+            Log.Debug("[RunningGame] 端口文件已写: {Path} = {Port}", portFile, dcTravelPort);
         }
         catch (Exception ex)
         {
