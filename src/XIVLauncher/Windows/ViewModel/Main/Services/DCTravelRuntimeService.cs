@@ -70,7 +70,8 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
 
         Client.BeginSession();
         var version = Volatile.Read(ref sessionVersion);
-        DcTravelPort = APIHelper.GetAvailablePort();
+        DcTravelPort                            = APIHelper.GetAvailablePort();
+        RunningGameRegistry.CurrentDcTravelPort = DcTravelPort;
 
         // 无论初始化是否成功, 始终启动监听器 —— 游戏内插件可通过 RPC 错误区分维护状态
         var inGameTravel = new InGameTravelCoordinator(Client);
@@ -133,6 +134,8 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         var listener = Listener;
         Listener     = null;
         DcTravelPort = 0;
+
+        RunningGameRegistry.CurrentDcTravelPort = 0;
 
         try
         {

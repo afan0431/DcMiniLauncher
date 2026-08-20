@@ -18,6 +18,13 @@ public static class RunningGameRegistry
     private static readonly ConcurrentDictionary<int, Entry> ENTRIES = new();
 
     /// <summary>
+    ///     当前这轮监听用的 DcTravel 端口。启动器一重启端口就换一个（<c>GetAvailablePort()</c>），
+    ///     而认领来的客户端（见 <see cref="AdoptOrphans" />）当初那份端口文件写的是上一轮的端口 ——
+    ///     不重写就是把游戏内 UI 指向一个已经没人听的端口, 它还会把结果缓存下来。
+    /// </summary>
+    public static int CurrentDcTravelPort { get; set; }
+
+    /// <summary>
     ///     游戏内 UI（Afan/Minion 的 Lua）要知道往哪个端口发请求。插件是从游戏参数
     ///     <c>XL.DcTraveler</c> 读的, 但 Minion 的 Lua 读不到游戏参数 —— 所以按 PID 落一个小文件,
     ///     Lua 用 <c>io.open</c> 就能读到。多开时各是各的。
@@ -37,12 +44,17 @@ public static class RunningGameRegistry
         ENTRIES[process.Id] = new Entry(process, agents);
         Log.Debug("[RunningGame] 登记 PID={Pid} agents={Agents}", process.Id, agents);
 
+        WritePortFile(process.Id, dcTravelPort > 0 ? dcTravelPort : CurrentDcTravelPort);
+    }
+
+    private static void WritePortFile(int processId, int dcTravelPort)
+    {
         if (dcTravelPort <= 0)
             return;
 
         try
         {
-            var portFile = PortFilePath(process.Id);
+            var portFile = PortFilePath(processId);
             Directory.CreateDirectory(Path.GetDirectoryName(portFile)!);
             File.WriteAllText(portFile, dcTravelPort.ToString());
             Log.Debug("[RunningGame] 端口文件已写: {Path} = {Port}", portFile, dcTravelPort);
@@ -145,6 +157,9 @@ public static class RunningGameRegistry
             // 认领来的客户端不知道当初以什么模式起的; 但管道在就说明模块在, 换服要的能力齐了
             ENTRIES[process.Id] = new Entry(process, InGameAgents.Minion);
             Log.Information("[RunningGame] 认领了上次留下的客户端 PID={Pid}（模块管道仍在）", process.Id);
+
+            // 端口文件还是上一轮那个端口, 得改写成这一轮的, 否则游戏内 UI 打的是空号
+            WritePortFile(process.Id, CurrentDcTravelPort);
         }
     }
 
