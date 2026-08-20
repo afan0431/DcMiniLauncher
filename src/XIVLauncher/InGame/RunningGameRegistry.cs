@@ -163,6 +163,70 @@ public static class RunningGameRegistry
         }
     }
 
+    /// <summary>
+    ///     清掉「进程已经不在了」的端口文件。
+    ///     <para>
+    ///         启动器被强杀时 <see cref="Unregister" /> 跑不到, 文件就留在盘上。
+    ///         游戏内那侧照样能读到它, 于是一直往一个没人听的端口打 —— 日志刷屏、
+    ///         界面还显示可用。所以每轮启动先扫一遍。
+    ///     </para>
+    ///     ⚠ 只按「PID 对应的进程还在不在」判断, 不判断它是不是游戏 ——
+    ///     PID 会被系统回收复用, 但复用者不会去读这个文件, 留着最多是个无害的垃圾;
+    ///     而误删一个活着的客户端的端口文件, 会让那个客户端的游戏内 UI 直接失联。
+    /// </summary>
+    public static void PruneStalePortFiles()
+    {
+        string[] files;
+
+        try
+        {
+            var directory = Path.GetDirectoryName(PortFilePath(0))!;
+
+            if (!Directory.Exists(directory))
+                return;
+
+            files = Directory.GetFiles(directory, "dctravel-*.port");
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[RunningGame] 枚举端口文件失败");
+            return;
+        }
+
+        foreach (var file in files)
+        {
+            var name = Path.GetFileNameWithoutExtension(file);
+
+            if (!int.TryParse(name.AsSpan("dctravel-".Length), out var pid))
+                continue;
+
+            try
+            {
+                using (Process.GetProcessById(pid))
+                    continue;   // 进程还在, 留着
+            }
+            catch (ArgumentException)
+            {
+                // 进程没了 —— 往下删
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "[RunningGame] 检查 PID={Pid} 失败, 保留端口文件", pid);
+                continue;
+            }
+
+            try
+            {
+                File.Delete(file);
+                Log.Debug("[RunningGame] 清掉残留端口文件: {Path}（PID={Pid} 已退出）", file, pid);
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "[RunningGame] 删残留端口文件失败: {Path}", file);
+            }
+        }
+    }
+
     private static void Prune()
     {
         foreach (var (pid, entry) in ENTRIES)

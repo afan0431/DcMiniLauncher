@@ -73,6 +73,9 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         DcTravelPort                            = APIHelper.GetAvailablePort();
         RunningGameRegistry.CurrentDcTravelPort = DcTravelPort;
 
+        // 上一轮被强杀时留下的端口文件会让游戏内那侧一直往死端口上撞, 先扫掉
+        RunningGameRegistry.PruneStalePortFiles();
+
         // 无论初始化是否成功, 始终启动监听器 —— 游戏内插件可通过 RPC 错误区分维护状态
         var inGameTravel = new InGameTravelCoordinator(Client);
 
