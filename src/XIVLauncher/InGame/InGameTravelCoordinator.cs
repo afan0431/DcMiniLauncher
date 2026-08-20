@@ -14,8 +14,12 @@ namespace XIVLauncher.InGame;
 /// </summary>
 public sealed class InGameTravelCoordinator(DCTravelClient client)
 {
-    /// <summary>跨区订单的 <c>travelStatus</c>: 1 = 已抵达（人还在做客地）, 其余 = 已返回。
-    ///     判据同启动器自己的订单列表 <c>DCTravelHistorySlide.xaml</c>。</summary>
+    /// <summary>
+    ///     跨区订单的 <c>travelStatus</c>: 1 = 这一单送到过。
+    ///     ⚠ <b>它不等于「角色现在还在做客地」</b> —— 送到之后这个值再也不会变, 而官方对超过一天
+    ///     没登录的角色会自动遣返, 订单状态不跟着改。所以判断角色此刻在哪只能看
+    ///     <c>queryRoleList4Migration</c>（人在哪个服务器就出现在哪个服务器下）, 订单只用来取返回票。
+    /// </summary>
     private const int TRAVEL_STATUS_ARRIVED = 1;
 
     public async Task<DCTravelListener.InGameTravelResponse> HandleAsync
@@ -256,9 +260,9 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     }
 
     /// <summary>
-    ///     角色现在的处境。<b>做客中的角色不在 <c>queryRoleList4Migration</c> 里</b> ——
-    ///     SDO 不让做客的角色再发起新的超域旅行, 那份「可迁移角色」列表里根本没有它,
-    ///     只能从跨区订单（<c>travelStatus == 1</c> = 已抵达）看出来。所以两个来源都查, 先查订单。
+    ///     角色现在的处境。<b>位置以 <c>queryRoleList4Migration</c> 为准</b> —— 它按服务器列角色,
+    ///     人在哪就出现在哪。订单只用来回答「它是不是正做客、返回票是哪张」, 而且必须拿
+    ///     当前位置去对订单的目的地才算数（见 <see cref="TRAVEL_STATUS_ARRIVED" /> 上的警告）。
     /// </summary>
     private sealed record CharacterState
     {
@@ -295,27 +299,9 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     {
         var sourceAreas = await client.QueryGroupListTravelSource().ConfigureAwait(false);
 
-        var (order, orderError) = await FindAwayOrderAsync(wantedName, cancellationToken).ConfigureAwait(false);
-
-        if (orderError != null)
-            return (null, orderError);
-
-        if (order != null)
-        {
-            // 订单里的 target 才是它现在待的地方, source 是家
-            var current = FindGroup(sourceAreas, order.TargetAreaName, order.TargetGroupName);
-
-            return (new CharacterState
-            {
-                Name      = order.RoleName,
-                AreaName  = order.TargetAreaName,
-                GroupName = order.TargetGroupName,
-                Group     = current,
-                Order     = order
-            }, null);
-        }
-
-        // 不在做客 —— 挨个源服务器问「可迁移角色」
+        // 挨个服务器问「可迁移角色」—— 必须扫完。
+        // WHY 强调扫完: 早先这里撞见第二个角色就 return, 结果 areaId=7/8 根本没扫到,
+        // 家在豆豆柴的角色凭空消失, 还害我推出一套「做客角色查不到」的错理论。
         var found = new List<(DCTravelCharacter Role, DCTravelGroup Group)>();
 
         foreach (var area in sourceAreas)
@@ -341,8 +327,6 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             }
         }
 
-        var listed = string.Join(", ", found.Select(x => $"{x.Role.Name}@{x.Group.GroupName}"));
-
         var matched = string.IsNullOrWhiteSpace(wantedName)
                           ? found
                           : found.Where(x => string.Equals(x.Role.Name, wantedName, StringComparison.Ordinal)).ToList();
@@ -350,12 +334,15 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         if (matched.Count == 0)
             return (null, string.IsNullOrWhiteSpace(wantedName)
                               ? "没查到任何可传送的角色"
-                              : $"没找到角色 {wantedName}（它可能正在做客, 也可能不在可超域的服务器上）, 可选: {listed}");
+                              : $"没找到角色 {wantedName}（它可能不在可超域的服务器上）");
 
+        // 名字是游戏内给的, 只有标题/选人界面才会没有 —— 那时候确实没有「当前角色」这回事
         if (matched.Count > 1)
-            return (null, $"匹配到多个角色, 请指定 character: {listed}");
+            return (null, $"这个账号下有 {matched.Count} 个角色, 进游戏后再开这个窗口");
 
         var (hit, hitGroup) = matched[0];
+
+        var order = await FindReturnTicketAsync(hit.ContentID, hitGroup, cancellationToken).ConfigureAwait(false);
 
         return (new CharacterState
         {
@@ -363,43 +350,58 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             AreaName  = hitGroup.AreaName,
             GroupName = hitGroup.GroupName,
             Group     = hitGroup,
-            Character = hit
+            Character = hit,
+            Order     = order
         }, null);
     }
 
     /// <summary>
-    ///     翻跨区订单, 找「还在做客」的那一张。<c>travelStatus == 1</c> = 已抵达（人在做客地）,
-    ///     其余是已返回的历史单 —— 不筛这个就会抓到早就返回过的旧单去提交返回请求。
+    ///     找「角色此刻正做客所凭的那张单」。判据不是订单状态, 是<b>位置对得上</b>:
+    ///     角色现在所在的服务器 == 这一单的目的地, 且目的地 != 出发地。
+    ///     <para>
+    ///         为什么不能只看 <c>travelStatus == 1</c>: 那个值送达后永不改变, 而官方对超过一天
+    ///         没登录的角色会自动遣返 —— 角色早回家了, 订单还写着「已抵达」。只看状态就会把
+    ///         一个在家的角色报成做客中, 顺带把历史上每一次旅行都算成一次做客。
+    ///     </para>
+    ///     订单列表是新单在前, 所以取第一条对得上的。
     /// </summary>
-    private async Task<(DCTravelMigrationOrder? Order, string? Error)> FindAwayOrderAsync
+    private async Task<DCTravelMigrationOrder?> FindReturnTicketAsync
     (
-        string?           wantedName,
+        string            contentId,
+        DCTravelGroup     current,
         CancellationToken cancellationToken
     )
     {
-        var away = new List<DCTravelMigrationOrder>();
-
         for (var page = 1; page <= 20; ++page)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             var orders = await client.QueryMigrationOrders(page).ConfigureAwait(false);
 
-            away.AddRange(orders.Orders.Where(x => x.TravelStatus == TRAVEL_STATUS_ARRIVED));
+            foreach (var order in orders.Orders)
+            {
+                if (order.TravelStatus != TRAVEL_STATUS_ARRIVED)
+                    continue;
+
+                if (!string.Equals(order.ContentID, contentId, StringComparison.Ordinal))
+                    continue;
+
+                if (!string.Equals(order.TargetAreaName,  current.AreaName,  StringComparison.Ordinal) ||
+                    !string.Equals(order.TargetGroupName, current.GroupName, StringComparison.Ordinal))
+                    continue;
+
+                // 目的地就是出发地的单（理论上不存在）不算做客
+                if (string.Equals(order.SourceGroupName, current.GroupName, StringComparison.Ordinal))
+                    continue;
+
+                return order;
+            }
 
             if (page >= orders.TotalPageNum)
                 break;
         }
 
-        if (!string.IsNullOrWhiteSpace(wantedName))
-            return (away.FirstOrDefault(x => string.Equals(x.RoleName, wantedName, StringComparison.Ordinal)), null);
-
-        return away.Count switch
-        {
-            0 => (null, null),
-            1 => (away[0], null),
-            _ => (null, $"有多个做客中的角色, 请指定 character: {string.Join(", ", away.Select(x => x.RoleName))}")
-        };
+        return null;
     }
 
     private static DCTravelGroup? FindGroup(List<DCTravelArea> areas, string areaName, string groupName) =>

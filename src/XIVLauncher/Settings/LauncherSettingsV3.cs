@@ -311,6 +311,34 @@ public sealed class LauncherSettingsV3 : IAccountSettingsStore
         set => Set(ref field, value);
     } = true;
 
+    /// <summary>游戏内换大区: 失败时自动重试。默认值与 <see cref="InGame.InGameTravelSettings" /> 保持一致</summary>
+    public bool InGameTravelAutoRetry
+    {
+        get;
+        set => Set(ref field, value);
+    } = true;
+
+    /// <summary>游戏内换大区: 目标繁忙时自动切换到同大区其他畅通服务器</summary>
+    public bool InGameTravelAutoSwitchWorld
+    {
+        get;
+        set => Set(ref field, value);
+    } = true;
+
+    /// <summary>游戏内换大区: 最大重试次数</summary>
+    public int InGameTravelMaxRetryCount
+    {
+        get;
+        set => Set(ref field, value);
+    } = 20;
+
+    /// <summary>游戏内换大区: 重试间隔（秒）</summary>
+    public int InGameTravelRetryDelaySeconds
+    {
+        get;
+        set => Set(ref field, value);
+    } = 60;
+
     #endregion
 
     #region 补丁更新配置

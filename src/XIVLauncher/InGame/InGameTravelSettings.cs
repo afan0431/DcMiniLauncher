@@ -1,3 +1,6 @@
+using Serilog;
+using XIVLauncher.Settings;
+
 namespace XIVLauncher.InGame;
 
 /// <summary>
@@ -18,8 +21,36 @@ public sealed class InGameTravelSettings
     public int  MaxRetryCount               { get; set; } = 20;
     public int  RetryDelaySeconds           { get; set; } = 60;
 
-    /// <summary>全启动器共用一份 —— 冷却与重试都是账号侧的行为, 不按客户端分。</summary>
-    public static InGameTravelSettings Current { get; } = new();
+    private static InGameTravelSettings? current;
+
+    /// <summary>
+    ///     全启动器共用一份 —— 冷却与重试都是账号侧的行为, 不按客户端分。
+    ///     值落在启动器配置里: 只放内存的话启动器一重启就回默认值, 等于用户没设过。
+    /// </summary>
+    public static InGameTravelSettings Current
+    {
+        get
+        {
+            if (current != null)
+                return current;
+
+            var settings = TryGetLauncherSettings();
+
+            // 配置还没就绪就先给一份默认值, 但**不缓存** —— 否则真配置读上来之前的这一下会被记死
+            if (settings == null)
+                return new InGameTravelSettings();
+
+            current = new InGameTravelSettings
+            {
+                EnableAutoRetry             = settings.InGameTravelAutoRetry,
+                AllowSwitchToAvailableWorld = settings.InGameTravelAutoSwitchWorld,
+                MaxRetryCount               = settings.InGameTravelMaxRetryCount,
+                RetryDelaySeconds           = settings.InGameTravelRetryDelaySeconds
+            };
+
+            return current;
+        }
+    }
 
     public void Apply(InGameTravelSettings other)
     {
@@ -27,5 +58,45 @@ public sealed class InGameTravelSettings
         AllowSwitchToAvailableWorld = other.AllowSwitchToAvailableWorld;
         MaxRetryCount               = Math.Clamp(other.MaxRetryCount, 0, 100);
         RetryDelaySeconds           = Math.Clamp(other.RetryDelaySeconds, 5, 3600);
+
+        Persist();
+    }
+
+    private void Persist()
+    {
+        var settings = TryGetLauncherSettings();
+
+        if (settings == null)
+            return;
+
+        try
+        {
+            settings.Update
+            (x =>
+                {
+                    x.InGameTravelAutoRetry         = EnableAutoRetry;
+                    x.InGameTravelAutoSwitchWorld   = AllowSwitchToAvailableWorld;
+                    x.InGameTravelMaxRetryCount     = MaxRetryCount;
+                    x.InGameTravelRetryDelaySeconds = RetryDelaySeconds;
+                }
+            );
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[InGameTravel] 设置落盘失败, 本次改动只在内存里");
+        }
+    }
+
+    /// <summary>App.Settings 在配置加载前会抛, 这里当成「还没就绪」处理, 不让它把调用方带崩。</summary>
+    private static LauncherSettingsV3? TryGetLauncherSettings()
+    {
+        try
+        {
+            return App.Settings;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
     }
 }
