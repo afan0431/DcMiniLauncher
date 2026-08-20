@@ -82,7 +82,11 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
             //   GET  /dctravel/ingame-travel/status   查进度（游戏内 UI 显示「正在排队…」靠它）
             //   GET  /dctravel/ingame-travel/areas    可选目标 + 拥挤度, 填下拉框用
             InGameTravelHandler        = inGameTravel.HandleAsync,
-            InGameTravelStatusProvider = pid => pid is { } id ? InGameTravelJobs.Get(id) : (object)InGameTravelJobs.All(),
+            // 没跑过的 pid 也要给个成形的对象 —— 直接把 null 序列化出去就是字面量 "null",
+            // 游戏内那侧 json.decode 得到 nil, 会当成「回应解析失败」而不是「还没跑过」
+            InGameTravelStatusProvider = pid => pid is { } id
+                                                    ? InGameTravelJobs.Get(id) ?? new InGameTravelStatus { Pid = id }
+                                                    : (object)InGameTravelJobs.All(),
             InGameTravelAreasProvider  = inGameTravel.QueryTargetsAsync,
             //   GET/POST /dctravel/ingame-travel/settings  抄 DcTraveler 那四项设置
             InGameTravelSettingsHandler = InGameTravelCoordinator.HandleSettings

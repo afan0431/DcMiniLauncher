@@ -28,10 +28,11 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
     public Func<int?, object>? InGameTravelStatusProvider { get; set; }
 
     /// <summary>
-    ///     <c>GET /dctravel/ingame-travel/areas</c> 的钩子 —— 游戏内 UI 用它填大区/服务器下拉,
-    ///     顺带拿到每个服务器的拥挤度（queueTime: 0=通畅, &lt;0=繁忙, &gt;0=排队分钟数）。
+    ///     <c>GET /dctravel/ingame-travel/areas</c> 的钩子 —— 游戏内 UI 用它问「我这个角色现在什么处境」:
+    ///     在家就附上能去的大区/服务器和拥挤度（queueTime: 0=通畅, &lt;0=繁忙, &gt;0=排队分钟数）,
+    ///     做客中就只报所在地和原大区。第一个参数是角色名, 由游戏内那侧给（拿不到就传 null）。
     /// </summary>
-    public Func<CancellationToken, Task<object>>? InGameTravelAreasProvider { get; set; }
+    public Func<string?, CancellationToken, Task<object>>? InGameTravelAreasProvider { get; set; }
 
     /// <summary>
     ///     <c>GET/POST /dctravel/ingame-travel/settings</c> 的钩子 —— 游戏内 UI 抄的是 DcTraveler
@@ -417,7 +418,10 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
             await WriteJsonAsync(payload).ConfigureAwait(false);
         }
 
-        /// <summary>游戏内 UI 填下拉框用: 可选的目标大区/服务器 + 每个服务器的拥挤度。</summary>
+        /// <summary>
+        ///     游戏内 UI 问「我现在什么处境」用。<c>?character=名字</c> 指明是谁 ——
+        ///     角色做客之后, 登录大区和它实际所在的大区是两回事, 只有游戏进程自己知道在玩谁。
+        /// </summary>
         [Route(HttpVerbs.Get, "/ingame-travel/areas")]
         public async Task GetInGameTravelAreas()
         {
@@ -428,7 +432,10 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
                 var provider = listener.InGameTravelAreasProvider
                                ?? throw new InvalidOperationException("本启动器未启用游戏内换大区");
 
-                payload = await provider(listener.listenerCts.Token).ConfigureAwait(false);
+                var character = Request.QueryString["character"];
+
+                payload = await provider(string.IsNullOrWhiteSpace(character) ? null : character,
+                                         listener.listenerCts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
