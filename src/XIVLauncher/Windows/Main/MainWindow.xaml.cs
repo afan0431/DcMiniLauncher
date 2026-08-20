@@ -186,13 +186,15 @@ public partial class MainWindow
 
     protected override void OnSourceInitialized(EventArgs e)
     {
+        base.OnSourceInitialized(e);
+
         try
         {
             PreserveWindowPosition.RestorePosition(this);
 
-            // 与 MainWindow.xaml 的 Width/Height 保持一致
+            // 与 MainWindow.xaml 的 Width/Height 保持一致（上游 2.4.2 把高度从 540 改成了 580）
             Width  = BASE_WIDTH;
-            Height = 540;
+            Height = 580;
 
             ApplyInjectionOptionsWidth();
         }
