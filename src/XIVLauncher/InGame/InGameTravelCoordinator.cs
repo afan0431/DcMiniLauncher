@@ -43,22 +43,21 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             if (InGameTravelJobs.IsRunning(game.Process.Id))
                 return Failed("这个客户端已经有一次换大区在进行中");
 
-            var context = request.Back
-                              ? await ResolveReturnContextAsync(request, cancellationToken).ConfigureAwait(false)
-                              : await ResolveContextAsync(request, cancellationToken).ConfigureAwait(false);
+            var (legs, planError) = await PlanAsync(request, cancellationToken).ConfigureAwait(false);
 
-            if (context.Error != null)
-                return Failed(context.Error);
+            if (planError != null)
+                return Failed(planError);
 
             var pid    = game.Process.Id;
-            var target = $"{context.TargetArea!.AreaName}/{context.TargetGroup!.GroupName}";
+            var last   = legs[^1].Context;
+            var target = $"{last.TargetArea!.AreaName}/{last.TargetGroup!.GroupName}";
 
             InGameTravelJobs.Begin(pid, target);
 
-            var run = RunAsync(game.Process, context, request.Back);
+            var run = RunLegsAsync(game.Process, legs);
 
-            // 默认不等: 整个流程要几十秒到几分钟, 游戏内 UI 靠 /ingame-travel/status 轮询进度。
-            // 想同步等结果（比如手工测试）就传 "wait": true
+            // 默认不等: 一段就要几十秒到几分钟(含排队与 60 秒冷却), 两段更久,
+            // 游戏内 UI 靠 /ingame-travel/status 轮询进度。想同步等结果就传 "wait": true
             if (!request.Wait)
                 return new DCTravelListener.InGameTravelResponse { Ok = true, Message = $"已开始: {target}（用 /dctravel/ingame-travel/status 查进度）" };
 
@@ -104,6 +103,22 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
                 area      = state.CurrentGroup.AreaName,
                 group     = state.CurrentGroup.GroupName,
                 away      = true,
+                visiting  = false,
+                homeArea  = state.HomeGroup.AreaName,
+                homeGroup = state.HomeGroup.GroupName,
+                areas     = Array.Empty<object>()
+            };
+
+        // 跨界传送中: 也去不了 —— 得先在游戏内返回原始世界。同样不给目标列表。
+        if (state.Visiting)
+            return new
+            {
+                ok        = true,
+                character = state.Name,
+                area      = state.CurrentGroup.AreaName,
+                group     = state.CurrentGroup.GroupName,
+                away      = false,
+                visiting  = true,
                 homeArea  = state.HomeGroup.AreaName,
                 homeGroup = state.HomeGroup.GroupName,
                 areas     = Array.Empty<object>()
@@ -119,6 +134,7 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             area      = state.CurrentGroup.AreaName,
             group     = state.CurrentGroup.GroupName,
             away      = false,
+            visiting  = false,
             homeArea  = state.HomeGroup.AreaName,
             homeGroup = state.HomeGroup.GroupName,
             areas = targets.Select(area => new
@@ -276,23 +292,46 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         };
     }
 
-    /// <summary>跑一次换服, 把每一步的进度写进 <see cref="InGameTravelJobs" /> 供 UI 轮询。</summary>
-    private async Task<InGameTravelResult> RunAsync(Process gameProcess, TravelContext context, bool isBack)
+    /// <summary>一段行程。超域中要去别的大区时是两段: 先超域返回, 再超域旅行。</summary>
+    private sealed record TravelLeg(bool IsBack, TravelContext Context, string Describe);
+
+    /// <summary>
+    ///     按顺序跑完所有段, 每一步的进度写进 <see cref="InGameTravelJobs" /> 供 UI 轮询。
+    ///     任何一段失败就整体停在那里 —— 不假装成功, 也不继续往下跑。
+    /// </summary>
+    private async Task<InGameTravelResult> RunLegsAsync(Process gameProcess, IReadOnlyList<TravelLeg> legs)
     {
-        var pid      = gameProcess.Id;
-        var progress = new Progress<string>(text => InGameTravelJobs.Report(pid, text));
+        var pid = gameProcess.Id;
 
         try
         {
             var service = new InGameTravelService(client);
+            var result  = InGameTravelResult.Failed("没有任何行程");
 
-            var result = isBack
+            for (var i = 0; i < legs.Count; ++i)
+            {
+                var leg = legs[i];
+
+                // 多段时把「第几段」缀在每条进度前面, 单段就不啰嗦
+                var prefix   = legs.Count > 1 ? $"[{i + 1}/{legs.Count} {leg.Describe}] " : string.Empty;
+                var progress = new Progress<string>(text => InGameTravelJobs.Report(pid, prefix + text));
+                var context  = leg.Context;
+
+                result = leg.IsBack
                              ? await service.TravelBackAsync(gameProcess, context.SourceGroup!, context.ReturnOrderId!,
                                                              context.TargetArea!, progress, CancellationToken.None).ConfigureAwait(false)
                              : await service.TravelAsync(gameProcess, context.SourceGroup!, context.TargetGroup!,
                                                          context.Character!, context.TargetArea!, progress, CancellationToken.None).ConfigureAwait(false);
 
-            InGameTravelJobs.End(pid, result.Ok, result.Message);
+                if (!result.Ok)
+                {
+                    var message = legs.Count > 1 ? $"{prefix}{result.Message}" : result.Message;
+                    InGameTravelJobs.End(pid, false, message);
+                    return InGameTravelResult.Failed(message);
+                }
+            }
+
+            InGameTravelJobs.End(pid, true, result.Message);
             return result;
         }
         catch (Exception ex)
@@ -304,21 +343,71 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     }
 
     /// <summary>
+    ///     把一次请求拆成要跑的几段。
+    ///     <list type="bullet">
+    ///       <item>在原始大区 → 1 段: 超域旅行</item>
+    ///       <item>超域中 + 请求返回 → 1 段: 超域返回</item>
+    ///       <item>超域中 + 要去别的大区 → 2 段: 超域返回 → （冷却 60 秒）→ 超域旅行</item>
+    ///       <item>跨界传送中 → 拒绝: SDO 不接受从做客世界发起超域, 得先在游戏内返回原始世界</item>
+    ///     </list>
+    ///     两段的目标都能**提前**定下来: SDO 的超域业务一律以原始服务器为源, 而
+    ///     <c>queryRoleList4Migration</c> 按原始服务器列角色 —— 角色人还在做客地时,
+    ///     它的 roleId 照样查得到。所以不必等第一段跑完再解析第二段。
+    /// </summary>
+    private async Task<(IReadOnlyList<TravelLeg> Legs, string? Error)> PlanAsync
+    (
+        DCTravelListener.InGameTravelRequest request,
+        CancellationToken                    cancellationToken
+    )
+    {
+        var (state, stateError) = await ResolveCharacterStateAsync(request.Character, request.World, request.HomeWorld, cancellationToken)
+                                      .ConfigureAwait(false);
+
+        if (state == null)
+            return ([], stateError);
+
+        // 跨界传送中: 人在同大区的别的世界。SDO 不接受从做客世界发起超域,
+        // 必须先在游戏内(主城大水晶)返回原始世界 —— 那一步这里做不了。
+        if (state.Visiting)
+            return ([], $"角色 {state.Name} 正跨界传送在 {state.CurrentGroup.GroupName}, "
+                        + $"要超域得先在游戏内返回原始世界 {state.HomeGroup.GroupName}（主城大水晶）");
+
+        var legs = new List<TravelLeg>();
+
+        if (state.Away)
+        {
+            var back = await ResolveReturnContextAsync(state, cancellationToken).ConfigureAwait(false);
+
+            if (back.Error != null)
+                return ([], back.Error);
+
+            legs.Add(new TravelLeg(true, back, "超域返回"));
+
+            // 只想返回就到此为止
+            if (request.Back)
+                return (legs, null);
+        }
+        else if (request.Back)
+        {
+            return ([], $"角色 {state.Name} 没在超域 —— 它本来就在原始大区");
+        }
+
+        var forward = await ResolveForwardContextAsync(request, state, cancellationToken).ConfigureAwait(false);
+
+        if (forward.Error != null)
+            return ([], forward.Error);
+
+        legs.Add(new TravelLeg(false, forward, "超域旅行"));
+        return (legs, null);
+    }
+
+    /// <summary>
     ///     「返回原大区」的解析。和正向不同, 它不需要选目标 —— 目标就是当初出发的那个大区,
     ///     记在跨区订单里（<c>QueryMigrationOrders</c> 的 <c>sourceAreaName</c>）。
     ///     提交时要带上角色**现在所在**的服务器（<c>TravelBack</c> 的 groupId/Code/Name）。
     /// </summary>
-    private async Task<TravelContext> ResolveReturnContextAsync(DCTravelListener.InGameTravelRequest request, CancellationToken cancellationToken)
+    private async Task<TravelContext> ResolveReturnContextAsync(CharacterState state, CancellationToken cancellationToken)
     {
-        var (state, error) = await ResolveCharacterStateAsync(request.Character, request.World, request.HomeWorld, cancellationToken)
-                                 .ConfigureAwait(false);
-
-        if (state == null)
-            return TravelContext.Failed(error!);
-
-        if (!state.Away)
-            return TravelContext.Failed($"角色 {state.Name} 没在超域 —— 它本来就在原始大区");
-
         var order = await FindReturnTicketAsync(state.Name, state.CurrentGroup, cancellationToken).ConfigureAwait(false);
 
         if (order == null)
@@ -376,8 +465,15 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         /// <summary>角色的原始服务器。SDO 的超域业务全部以它为源。</summary>
         public required DCTravelGroup HomeGroup { get; init; }
 
-        /// <summary>超域中 = 现在所在的大区不是原始大区</summary>
+        /// <summary>超域中 = 现在所在的**大区**不是原始大区。只能超域返回。</summary>
         public bool Away => !string.Equals(CurrentGroup.AreaName, HomeGroup.AreaName, StringComparison.Ordinal);
+
+        /// <summary>
+        ///     跨界传送中 = 同一个大区内做客别的服务器。这不是超域,
+        ///     但 SDO 同样不接受从做客世界发起超域 —— 必须先在游戏内(主城大水晶)返回原始世界。
+        ///     卫月版的处理是把「超域旅行」菜单项置灰（<c>IsEnabled = currentWorldId == homeWorldId</c>）。
+        /// </summary>
+        public bool Visiting => !Away && !string.Equals(CurrentGroup.GroupName, HomeGroup.GroupName, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -490,21 +586,15 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         areas.SelectMany(x => x.GroupList)
              .FirstOrDefault(x => string.Equals(x.GroupName, groupName, StringComparison.Ordinal));
 
-    private async Task<TravelContext> ResolveContextAsync(DCTravelListener.InGameTravelRequest request, CancellationToken cancellationToken)
+    private async Task<TravelContext> ResolveForwardContextAsync
+    (
+        DCTravelListener.InGameTravelRequest request,
+        CharacterState                       state,
+        CancellationToken                    cancellationToken
+    )
     {
-        // 1. 定位角色 —— 世界名由游戏内那侧给, 这里只映射成 SDO 的服务器对象
-        var (state, error) = await ResolveCharacterStateAsync(request.Character, request.World, request.HomeWorld, cancellationToken)
-                                 .ConfigureAwait(false);
-
-        if (state == null)
-            return TravelContext.Failed(error!);
-
-        // 超域中不能再直接跨去别处, 得先超域返回 —— 这是 SDO 的规则, 不是我们加的限制
-        if (state.Away)
-            return TravelContext.Failed($"角色 {state.Name} 正在 {state.CurrentGroup.AreaName}/{state.CurrentGroup.GroupName} 超域中, "
-                                        + $"要去别的大区得先超域返回 {state.HomeGroup.AreaName}/{state.HomeGroup.GroupName}");
-
-        // SDO 的超域业务以原始服务器为源
+        // SDO 的超域业务一律以原始服务器为源 —— 角色此刻在不在原始大区都一样。
+        // 超域中时这一段是「第二段」, 跑之前第一段已经把角色送回原始大区了。
         var sourceGroup = state.HomeGroup;
         var character   = await FindCharacterAsync(state.Name, sourceGroup).ConfigureAwait(false);
 
