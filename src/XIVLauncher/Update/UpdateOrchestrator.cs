@@ -26,6 +26,7 @@ internal class UpdateOrchestrator
     )
     {
         _ = downloadPrerelease;
+        _ = settings; // 只在上游「检查失败是否继续」那段用到, 本 fork 检查失败一律继续
 
         try
         {
@@ -109,38 +110,10 @@ internal class UpdateOrchestrator
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "启动器更新失败");
-
-            const string UPDATE_FAIL_HINT = "请检查网络、代理链路与安全软件设置。若问题持续，请稍后重试，并将 XIVLauncherCN 加入安全软件白名单。";
-
-            var detailMessage = GetUpdateFailureMessage(ex);
-
-            CustomMessageBox.Show
-            (
-                $"错误：{detailMessage}{Environment.NewLine}{Environment.NewLine}{UPDATE_FAIL_HINT}",
-                "XIVLauncherCN (Soil)",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error,
-                showOfficialLauncher: true
-            );
-
-            if (settings.EnableSkipUpdate)
-            {
-                var result = CustomMessageBox.Show
-                (
-                    "无法完成更新检查。根据你的设置，是否继续使用当前版本？\n请注意：这通常意味着当前无法稳定连接更新源，即使进入 XIVLauncher，也可能无法完成 Dalamud 的更新检查与下载。",
-                    "XIVLauncherCN (Soil)",
-                    MessageBoxButton.YesNo,
-                    MessageBoxImage.Question,
-                    showDiscordLink: false,
-                    showHelpLinks: false
-                );
-
-                return result == MessageBoxResult.Yes;
-            }
-
-            Environment.Exit(1);
-            return false;
+            // DcMiniLauncher: 更新源是 GitHub, 偶尔连不上; 不是 Velopack 安装的目录（直接解压 / 本地编译）也会走到这里。
+            // 上游在这里弹错并退出, 对我们来说「检查不了更新」不该挡住进游戏 —— 记日志, 照常启动。
+            Log.Warning(ex, "启动器更新检查失败, 继续使用当前版本: {Error}", GetUpdateFailureMessage(ex));
+            return true;
         }
     }
 

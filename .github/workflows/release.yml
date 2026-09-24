@@ -1,19 +1,45 @@
-# 推 v* tag 就编译并发布到 GitHub Releases。
+# 编译并发布到 GitHub Releases（Velopack 包, 客户端据此自动更新）。
 #
-# - 用 ReleaseNoUpdate 配置（XL_NOAUTOUPDATE）：原版的自动更新指向上游的发布源，
-#   开着会把本 fork 的启动器「更新」回上游版本，改动全丢。
-# - 额外编译 native 模块 MiniLauncherModule.dll（上游 CI 不认识它）；缺了它游戏内超域旅行不可用，
-#   所以编不出来就直接失败，不发残缺的包。
+# 三种触发：
+#   - 手动推 tag：            git tag v2.5.0-mini.2 && git push origin v2.5.0-mini.2
+#   - sync-upstream.yml 调用： 同步上游成功后自动发版（workflow_call）
+#   - 网页上 Run workflow：   填一个已存在的 tag 重发
 #
-#   git tag v2.5.0-mini.1 && git push origin v2.5.0-mini.1
+# 要点：
+# - Release 配置编译：定义 RELEASE → 启动时检查更新（StartupOrchestrator 的 #if RELEASE）, 且开优化。
+#   更新源在 Links.LAUNCHER_DISTRIBUTE_BASE_URL, 已指向本仓库的 Releases。
+# - 额外编译 native 模块 MiniLauncherModule.dll（上游 CI 不认识它）；编不出来就失败, 不发残缺包。
+# - Velopack 包名 DcMiniLauncher, 与官方 XIVLauncherCN 分开, 两边安装互不相认。
+# - 每个 Release 附带只含本版本的 releases.win.json + 完整 nupkg：
+#   客户端访问 releases/latest/download/<文件名>, 总能拿到最新版。
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（须已存在）"
+        type: string
+        required: true
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  PACK_ID: DcMiniLauncher
+  CHANNEL: win
 
 jobs:
   release:
@@ -21,6 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: refs/tags/${{ env.TAG }}
           fetch-depth: 0
           submodules: recursive
 
@@ -32,32 +59,64 @@ jobs:
         run: |
           cd src
           dotnet restore
-          dotnet build XIVLauncher.slnx -c ReleaseNoUpdate
+          dotnet build XIVLauncher.slnx -c Release
 
       - name: Build native module
         run: .\src\XIVLauncher.MiniModule\build.ps1 -Configuration Release
 
-      - name: Package
-        id: pkg
+      - name: Check output
         run: |
           $out = "src\bin\win-x64"
           foreach ($f in "XIVLauncherCN.exe", "MiniLauncherModule.dll") {
             if (-not (Test-Path "$out\$f")) { throw "产物里缺 $f" }
           }
-          $tag = "${{ github.ref_name }}"
-          $zip = "DcMiniLauncher-$tag-win-x64.zip"
-          $stage = "stage\DcMiniLauncher"
-          New-Item -ItemType Directory -Force $stage | Out-Null
-          Copy-Item "$out\*" $stage -Recurse -Exclude *.pdb
-          Compress-Archive -Path $stage -DestinationPath $zip
-          "zip=$zip" >> $env:GITHUB_OUTPUT
+          # 调试符号 / 增量链接文件不进包
+          Get-ChildItem $out -Recurse -Include *.pdb, *.ilk | Remove-Item -Force
+
+      - name: Release notes
+        shell: bash
+        run: |
+          prev=$(git tag -l 'v*-mini.*' --sort=-v:refname | grep -vx "$TAG" | head -1)
+          {
+            echo "## $TAG"
+            echo
+            if [ -n "$prev" ]; then
+              git log --no-merges --format='- %s' "$prev..$TAG" | head -40
+            else
+              git log --no-merges --format='- %s' -20 "$TAG"
+            fi
+          } > notes.md
+          cat notes.md
+
+      - name: Velopack pack
+        run: |
+          $pkg = (Select-String -Path src\Directory.Packages.props -Pattern 'Include="Velopack" Version="([^"]+)"').Matches[0].Groups[1].Value
+          # vpk 与程序里引用的 Velopack 库同版本, 装不上再退回最新版
+          dotnet tool install -g vpk --version $pkg
+          if ($LASTEXITCODE -ne 0) { dotnet tool install -g vpk }
+          $version = $env:TAG -replace '^v', ''
+          vpk pack `
+            -u $env:PACK_ID -v $version `
+            -p src\bin\win-x64 -o Releases -e XIVLauncherCN.exe `
+            --channel $env:CHANNEL --packAuthors afan0431 --packTitle DcMiniLauncher `
+            --releaseNotes notes.md `
+            --icon src\XIVLauncher\Resources\dalamud_icon.ico `
+            --splashImage src\XIVLauncher\Resources\logo.png `
+            --framework net10.0-x64-desktop `
+            --noInst
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem Releases | Format-Table Name, Length
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $extra = @()
-          if ($tag -match '-(alpha|beta|rc)') { $extra += '--prerelease' }
-          gh release create $tag "${{ steps.pkg.outputs.zip }}" --title $tag --generate-notes @extra
+          $assets = @(Get-ChildItem Releases -File | Where-Object { $_.Name -match '\.(nupkg|zip|json)$' -or $_.Name -eq 'RELEASES' } | ForEach-Object FullName)
+          if (-not ($assets | Where-Object { $_ -like '*releases.win.json' })) { throw "没有生成 releases.win.json" }
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG @assets --clobber
+          } else {
+            gh release create $env:TAG @assets --title $env:TAG --notes-file notes.md --latest
+          }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

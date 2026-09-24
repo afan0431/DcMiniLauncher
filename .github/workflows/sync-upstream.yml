@@ -1,6 +1,7 @@
 # 每天把上游 AtmoOmen/FFXIVQuickLauncher 的 CN 分支合进本仓库的 CN。
 #
-# - 能干净合并：直接推到 CN（产生一个 merge commit，和手工 `git merge atmoomen/CN` 一样）。
+# - 能干净合并：直接推到 CN（产生一个 merge commit，和手工 `git merge atmoomen/CN` 一样），
+#   然后自动发版（release.yml），客户端下次启动自动更新。
 # - 有冲突 / 推不上去：不动 CN，开（或更新）一个带 `upstream-sync` 标签的 Issue，
 #   列出冲突文件和本地处理命令，等人来解。
 #
@@ -30,6 +31,8 @@ env:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,6 +82,29 @@ jobs:
           else
             echo "pushed=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # 自动发版：CN 已包含上游最新, 而最近一次发布还没包含它 → 打下一个 v<上游版本>-mini.N。
+      # 按「上游有没有发布过」判断而不是按「这次有没有合并」, 所以冲突被手工合并推上来之后,
+      # 下一次定时运行也会补发。我们自己的功能改动不会触发发版（那个手动推 tag）。
+      - name: Tag release
+        id: tag
+        if: steps.merge.outputs.result == 'up-to-date' || steps.push.outputs.pushed == 'true'
+        run: |
+          git fetch --tags --force origin
+          last=$(git tag -l 'v*-mini.*' --sort=-v:refname | head -1)
+          if [ -n "$last" ] && git merge-base --is-ancestor "$UPSTREAM_SHA" "$last"; then
+            echo "上游 ${UPSTREAM_SHA::8} 已随 $last 发布过, 不发版"
+            exit 0
+          fi
+
+          prefix=$(sed -n 's:.*<VersionPrefix>\(.*\)</VersionPrefix>.*:\1:p' src/XIVLauncher/XIVLauncher.csproj | head -1)
+          n=$(git tag -l "v$prefix-mini.*" | sed -E 's/.*-mini\.([0-9]+)$/\1/' | sort -n | tail -1)
+          tag="v$prefix-mini.$(( ${n:-0} + 1 ))"
+
+          git tag -a "$tag" -m "自动发版: 同步上游 ${UPSTREAM_SHA::8}" HEAD
+          git push origin "$tag"
+          echo "发版 $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Close resolved sync issue
         if: steps.merge.outputs.result == 'up-to-date' || steps.push.outputs.pushed == 'true'
@@ -134,3 +160,12 @@ jobs:
           else
             gh issue create --label "$ISSUE_LABEL" --title "上游同步需要手工处理（${UPSTREAM_SHA::8}）" --body "$body"
           fi
+
+  release:
+    needs: sync
+    if: needs.sync.outputs.tag != ''
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.sync.outputs.tag }}
+    permissions:
+      contents: write

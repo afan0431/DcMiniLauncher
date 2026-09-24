@@ -12,9 +12,12 @@
 
 ## 下载
 
-**[前往 Releases 下载最新版](https://github.com/afan0431/DcMiniLauncher/releases/latest)**（`DcMiniLauncher-*-win-x64.zip`），解压后运行 `XIVLauncherCN.exe`。
+**[前往 Releases 下载最新版](https://github.com/afan0431/DcMiniLauncher/releases/latest)**（`DcMiniLauncher-win-Portable.zip`），解压到任意目录，运行里面的 `XIVLauncherCN.exe`。
 
-本版本关闭了自动更新（原版的更新源会把它换回上游版本），有新版请回这里下载。
+之后**自动更新**：每次启动检查本仓库的 Releases，有新版自动下载安装。连不上 GitHub 时跳过检查、照常启动。
+
+与官方 XIVLauncherCN 共用 `%AppData%\XIVLauncherCN` 下的账号与设置；
+官方版保存设置时会丢掉本版独有的项（Minion 等），所以**不要两个启动器来回切换使用**。
 
 ## 构建
 
@@ -34,8 +37,9 @@ powershell -ExecutionPolicy Bypass -File src/XIVLauncher.MiniModule/build.ps1
 
 ## 上游同步
 
-每天由 GitHub Actions（`.github/workflows/sync-upstream.yml`）自动合并上游 `CN` 分支；
-有冲突时会开一个 `upstream-sync` Issue，需要手工合并。
+每天由 GitHub Actions（`.github/workflows/sync-upstream.yml`）自动合并上游 `CN` 分支，
+合并成功就自动发布新版（`v<上游版本>-mini.N`），客户端随之自动更新；
+有冲突时会开一个 `upstream-sync` Issue，手工合并推上去后，下一次定时运行会补发。
 
 ## 许可证
 

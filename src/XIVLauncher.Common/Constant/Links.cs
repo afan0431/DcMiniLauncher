@@ -29,8 +29,13 @@ public static class Links
 
     #region 启动器
 
-    /// <remarks>启动器 (Cloudflare R2)</remarks>
-    public const string LAUNCHER_DISTRIBUTE_BASE_URL = "https://xl-dis.atmoomen.top";
+    /// <remarks>
+    ///     启动器更新源。DcMiniLauncher: 指向本 fork 的 GitHub Releases, 不能用上游的
+    ///     (https://xl-dis.atmoomen.top) —— 那会把本 fork 「更新」回上游版本。
+    ///     每个 Release 都附带只含本版本的 releases.win.json + 完整 nupkg,
+    ///     latest/download/&lt;文件名&gt; 永远重定向到最新 Release 的同名附件, 所以 SimpleWebSource 直接可用。
+    /// </remarks>
+    public const string LAUNCHER_DISTRIBUTE_BASE_URL = "https://github.com/afan0431/DcMiniLauncher/releases/latest/download";
     
     #endregion
 
