@@ -30,7 +30,10 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
     /// </summary>
     public int DcTravelPort { get; private set; }
 
-    public DCTravelRuntimeService(Action<string> setSdoAreaAction)
+    public DCTravelRuntimeService
+    (
+        Action<string> setSdoAreaAction
+    )
     {
         ArgumentNullException.ThrowIfNull(setSdoAreaAction);
 
@@ -51,7 +54,10 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         };
     }
 
-    public void Bind(LoginSessionRefreshContext context) =>
+    public void Bind
+    (
+        LoginSessionRefreshContext context
+    ) =>
         Client.BindLoginSessionRefresh(context);
 
     /// <summary>
@@ -127,7 +133,10 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         return DcTravelPort;
     }
 
-    public void ConfigureQuickLoginRefresh(Func<Task<string>> refreshGameSessionIdByQuickLoginFunc)
+    public void ConfigureQuickLoginRefresh
+    (
+        Func<Task<string>> refreshGameSessionIdByQuickLoginFunc
+    )
     {
         ArgumentNullException.ThrowIfNull(refreshGameSessionIdByQuickLoginFunc);
         Client.RefreshGameSessionIDByQuickLoginFunc = refreshGameSessionIdByQuickLoginFunc;
@@ -162,7 +171,10 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
 
     #region 维护自动恢复
 
-    private void StartMaintenanceRecovery(int version)
+    private void StartMaintenanceRecovery
+    (
+        int version
+    )
     {
         if (recoveryTask is { IsCompleted: false })
             return;
@@ -181,7 +193,11 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         recoveryTask = null;
     }
 
-    private async Task RunMaintenanceRecoveryLoopAsync(int version, CancellationToken ct)
+    private async Task RunMaintenanceRecoveryLoopAsync
+    (
+        int               version,
+        CancellationToken ct
+    )
     {
         Log.Information("[DCTravelListener] 维护恢复定时器已启动, 间隔 {Interval} 分钟", MAINTENANCE_RECOVERY_INTERVAL_MINUTES);
 

@@ -1,22 +1,17 @@
 using System.ComponentModel;
-using System.Globalization;
 using System.Windows;
-using System.Windows.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Serilog;
 using XIVLauncher.Account;
 using XIVLauncher.Common.Game;
-using XIVLauncher.Dalamud;
 using XIVLauncher.DCTravel;
-using XIVLauncher.Login;
 using XIVLauncher.Login.Models;
 using XIVLauncher.Login.WeGame;
 using XIVLauncher.Login.Workflow;
 using XIVLauncher.Windows.Services;
-using XIVLauncher.Windows.ViewModel.Main.Handlers;
+using XIVLauncher.Windows.ViewModel.Main.Flows;
 using XIVLauncher.Windows.ViewModel.Main.Models;
-using XIVLauncher.Windows.ViewModel.Main.Providers;
 using XIVLauncher.Windows.ViewModel.Main.Services;
 
 namespace XIVLauncher.Windows.ViewModel.Main;
@@ -44,36 +39,40 @@ internal partial class MainWindowViewModel : ObservableObject
     public AccountManager AccountManager { get; private set; } = App.AccountManager;
     public Window         Window         { get; private set; }
 
-    public Action         Activate        { get; set; } = null!;
-    public Action         Hide            { get; set; } = null!;
-    public Action         ReloadHeadlines { get; set; } = null!;
-    public Action<string> ShowSnackbar    { get; set; } = null!;
-
-    public Action? RequestSwitchToCurrentAccount { get; set; }
+    public Action         Activate     { get; set; } = null!;
+    public Action         Hide         { get; set; } = null!;
+    public Action<string> ShowSnackbar { get; set; } = null!;
 
     [ObservableProperty]
     public partial bool IsLoggingIn { get; set; }
 
-    internal MainWindowDialogProvider  DialogProvider            { get; }
-    internal DCTravelRuntimeService    DCTravelRuntimeService    { get; }
-    internal GameLaunchService         GameLaunchService         { get; }
-    internal GameClientFileTaskService GameClientFileTaskService { get; }
-    internal GameUpdateMonitorService  GameUpdateMonitor         { get; }
+    internal CompanionAppService      CompanionAppService    { get; }
+    internal GameInjectionFlow        GameInjectionFlow      { get; }
+    internal GameClientFileFlow       GameClientFileFlow     { get; }
+    internal DCTravelRuntimeService   DCTravelRuntimeService { get; }
+    internal GameUpdateMonitorService GameUpdateMonitor      { get; }
 
-    internal LoginFlowHandler      LoginFlow      { get; }
-    internal GameLaunchFlowHandler GameLaunchFlow { get; }
-    internal DashboardFlowHandler  DashboardFlow  { get; }
+    internal NewsFlow      NewsFlow          { get; }
+    internal AccountFlow   AccountFlow       { get; }
+    internal StartupFlow   StartupFlow       { get; }
+    public DalamudStatusViewModel DalamudStatus { get; }
+
+    internal LoginFlow      LoginFlow      { get; }
+    internal GameLaunchFlow GameLaunchFlow { get; }
+    internal DashboardFlow  DashboardFlow  { get; }
 
     public GameLaunchContext? CurrentGameLaunchContext { get; set; }
 
     private LoginCardType injectModeSourceCard = LoginCardType.MainPage;
 
-    public MainWindowViewModel(Window window)
+    public MainWindowViewModel
+    (
+        Window window
+    )
     {
-        Window         = window;
-        Settings       = new(new DialogService(window), new ExternalLaunchService());
-        DialogProvider = new(window);
-        Launcher       = new();
+        Window   = window;
+        Settings = new(new DialogService(window), new ExternalLaunchService());
+        Launcher = new();
 
         var loginWorkflowService = new LoginWorkflowService(App.AccountManager, new WeGameTokenCaptureCoordinator());
 
@@ -82,6 +81,7 @@ internal partial class MainWindowViewModel : ObservableObject
             {
                 var matched = CurrentGameLaunchContext?.Areas.FirstOrDefault
                     (area => string.Equals(area.AreaName, name, StringComparison.Ordinal));
+
                 if (matched == null)
                 {
                     Log.Warning("[DCTravel] 当前登录上下文中不存在大区 {AreaName}, 忽略同步请求", name);
@@ -89,6 +89,7 @@ internal partial class MainWindowViewModel : ObservableObject
                 }
 
                 var account = App.AccountManager.CurrentAccount;
+
                 if (account == null)
                 {
                     Log.Warning("[DCTravel] 当前账号不存在, 忽略大区同步请求: {AreaName}", name);
@@ -120,12 +121,18 @@ internal partial class MainWindowViewModel : ObservableObject
                 );
             }
         );
-        GameLaunchService         = new GameLaunchService(window);
-        GameClientFileTaskService = new GameClientFileTaskService(window);
+        var dalamudLaunchService = new DalamudLaunchService(window);
+        CompanionAppService = new();
+        GameInjectionFlow   = new(window, dalamudLaunchService);
+        GameClientFileFlow  = new GameClientFileFlow(window);
 
-        LoginFlow      = new(this, loginWorkflowService, DialogProvider, DCTravelRuntimeService, GameClientFileTaskService);
-        GameLaunchFlow = new(this, GameLaunchService, GameClientFileTaskService);
+        LoginFlow      = new(this, loginWorkflowService, DCTravelRuntimeService, GameClientFileFlow);
+        GameLaunchFlow = new(this, CompanionAppService, GameClientFileFlow, dalamudLaunchService);
         DashboardFlow  = new(this);
+        NewsFlow       = new(this);
+        AccountFlow    = new(this);
+        StartupFlow    = new(this);
+        DalamudStatus  = new(window, Settings);
 
         AccountSwitcher = new AccountSwitcherViewModel
         (
@@ -151,7 +158,8 @@ internal partial class MainWindowViewModel : ObservableObject
         InjectPage = new InjectPageViewModel
         (
             window,
-            GameLaunchService,
+            GameInjectionFlow,
+            CompanionAppService,
             Settings,
             () => IsLoggingIn,
             ShowLoadingDialog,
@@ -193,16 +201,18 @@ internal partial class MainWindowViewModel : ObservableObject
                 }
             ),
             () => DCTravelRuntimeService.Client
-        );
+        )
+        {
+            AutoStartGameOnComplete = App.Settings.DCTravelAutoStartGameOnComplete
+        };
 
-        DCTravelPage.AutoStartGameOnComplete = App.Settings.DCTravelAutoStartGameOnComplete;
         DCTravelPage.PropertyChanged += (_, e) =>
         {
             if (e.PropertyName == nameof(DCTravelPage.AutoStartGameOnComplete))
                 App.Settings.DCTravelAutoStartGameOnComplete = DCTravelPage.AutoStartGameOnComplete;
         };
 
-        UpdateDalamudStatusText();
+        DalamudStatus.RefreshStatus();
 
         DCTravelRuntimeService.MaintenanceStateChanged += state =>
         {
@@ -210,26 +220,31 @@ internal partial class MainWindowViewModel : ObservableObject
             (() =>
                 {
                     var isMaintenance = state == DCTravelMaintenanceState.UnderMaintenance;
-                    DCTravelPage.IsUnderMaintenance          = isMaintenance;
-                    DCTravelPage.MaintenanceMessage          = isMaintenance ? "超域旅行服务维护中, 请稍后再试" : string.Empty;
+                    DCTravelPage.IsUnderMaintenance = isMaintenance;
+                    DCTravelPage.MaintenanceMessage = isMaintenance ?
+                                                          "超域旅行服务维护中, 请稍后再试" :
+                                                          string.Empty;
                     DashboardPage.IsDCTravelUnderMaintenance = isMaintenance;
                 }
             );
         };
 
-        App.Dalamud.StatusChanged += DalamudUpdaterStatusChanged;
         Settings.SettingsSaved += (_, _) =>
         {
             InjectPage.ReloadSettings();
             InjectionOptions.ReloadFromSettings();
-            RefreshDalamudInfoCommandState();
+            DalamudStatus.RefreshCommandState();
         };
+        Settings.SettingsSaved += (_, _) => NewsFlow.RefreshNow();
     }
 
     public void CloseAccountSwitcher() =>
         IsAccountSwitcherOpen = false;
 
-    private void OnAccountRemoved(string removedUserName) =>
+    private void OnAccountRemoved
+    (
+        string removedUserName
+    ) =>
         Window.Dispatcher.Invoke
         (() =>
             {
@@ -240,7 +255,11 @@ internal partial class MainWindowViewModel : ObservableObject
 
     #region 界面控制
 
-    public void SwitchCard(LoginCardType i, bool shouldCancelLogin = true) =>
+    public void SwitchCard
+    (
+        LoginCardType i,
+        bool          shouldCancelLogin = true
+    ) =>
         Window.Dispatcher.Invoke
         (() =>
             {
@@ -252,7 +271,9 @@ internal partial class MainWindowViewModel : ObservableObject
                     var currentCard = (LoginCardType)LoginCardTransitionerIndex;
                     if (currentCard != LoginCardType.InjectMode && currentCard != LoginCardType.Logining) injectModeSourceCard = currentCard;
 
-                    InjectPage.ReturnButtonText = injectModeSourceCard == LoginCardType.Dashboard ? "返回主页面" : "返回账号登录";
+                    InjectPage.ReturnButtonText = injectModeSourceCard == LoginCardType.Dashboard ?
+                                                      "返回主页面" :
+                                                      "返回账号登录";
                 }
 
                 LoginCardTransitionerIndex = (int)i;
@@ -262,7 +283,7 @@ internal partial class MainWindowViewModel : ObservableObject
         );
 
     /// <summary>
-    ///     取消当前登录流程, 委托至 LoginFlowHandler。
+    ///     取消当前登录流程, 委托至 LoginFlow。
     /// </summary>
     public void CancelLogin() =>
         LoginFlow.CancelLogin();
@@ -275,7 +296,10 @@ internal partial class MainWindowViewModel : ObservableObject
 
     #region Loading 弹窗
 
-    private void ShowLoadingDialog(string message)
+    private void ShowLoadingDialog
+    (
+        string message
+    )
     {
         IsLoadingDialogOpen  = true;
         LoadingDialogMessage = message;
@@ -286,68 +310,26 @@ internal partial class MainWindowViewModel : ObservableObject
 
     #endregion
 
-    #region Dalamud 状态
-
-    [RelayCommand(CanExecute = nameof(CanRefreshDalamudInfo))]
-    private void RefreshDalamudInfo() =>
-        App.Dalamud.RunUpdater(true);
-
-    private bool CanRefreshDalamudInfo() =>
-        Settings.EnableHooks && App.Dalamud.Updater.State != DalamudUpdater.DownloadState.Unknown;
-
-    private void DalamudUpdaterStatusChanged(DalamudStatusSnapshot _)
-    {
-        if (Window.Dispatcher == Dispatcher.CurrentDispatcher)
-        {
-            UpdateDalamudStatusText();
-            return;
-        }
-
-        Window.Dispatcher.Invoke(UpdateDalamudStatusText);
-    }
-
-    private void UpdateDalamudStatusText()
-    {
-        var updater = App.Dalamud.GetStatusSnapshot();
-
-        DalamudStatusText = updater.State switch
-        {
-            DalamudUpdater.DownloadState.Done        => string.IsNullOrWhiteSpace(DalamudUpdater.Version) ? "Dalamud 已就绪" : $"Dalamud {DalamudUpdater.Version}",
-            DalamudUpdater.DownloadState.NoIntegrity => "Dalamud 加载失败",
-            _                                        => GetDalamudLoadingText(updater)
-        };
-
-        RefreshDalamudInfoCommandState();
-    }
-
-    private void RefreshDalamudInfoCommandState() =>
-        RefreshDalamudInfoCommand.NotifyCanExecuteChanged();
-
-    private static string GetDalamudLoadingText(DalamudStatusSnapshot updater)
-    {
-        if (updater.LoadingProgress is { } progress)
-            return $"Dalamud 正在加载 {progress.ToString("0.##", CultureInfo.InvariantCulture)}%";
-
-        if (!string.IsNullOrWhiteSpace(updater.LoadingDetail))
-            return $"Dalamud {updater.LoadingDetail.TrimEnd('.')}";
-
-        return "Dalamud 正在加载";
-    }
-
-    #endregion
-
     #region 事件
 
-    public void OnWindowClosed(object? sender, object args)
+    public void OnWindowClosed
+    (
+        object? sender,
+        object  args
+    )
     {
-        App.Dalamud.StatusChanged -= DalamudUpdaterStatusChanged;
+        DalamudStatus.Detach();
         GameUpdateMonitor.Stop();
         InjectPage.StopRefreshing(true);
         CancelLogin();
         Application.Current.Shutdown();
     }
 
-    public void OnWindowClosing(object? sender, CancelEventArgs args)
+    public void OnWindowClosing
+    (
+        object?         sender,
+        CancelEventArgs args
+    )
     {
         if (!IsLoggingIn) return;
         args.Cancel = true;
@@ -378,15 +360,6 @@ internal partial class MainWindowViewModel : ObservableObject
 
     [ObservableProperty]
     public partial string LoadingDialogMessage { get; set; } = string.Empty;
-
-    [ObservableProperty]
-    public partial string DalamudStatusText { get; set; } = string.Empty;
-
-    #endregion
-
-    #region 常量
-
-    public const string PRESUDO_PASSWORD = "********假的密码********";
 
     #endregion
 }

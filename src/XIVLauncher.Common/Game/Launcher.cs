@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Text.RegularExpressions;
+using System.Threading;
 using Serilog;
 using XIVLauncher.Common.Constant;
 using XIVLauncher.Common.Game.Exceptions;
@@ -8,12 +10,14 @@ namespace XIVLauncher.Common.Game;
 
 public partial class Launcher
 {
+    public delegate Process? GameStarter(GameStartRequest request);
+
     public RestartMonitor RestartMonitor { get; } = new();
     public HttpClient     MockHttpClient { get; } = new(new HttpClientHandler { UseCookies = true });
 
     public FFXIVProcess? LaunchGame
     (
-        IGameRunner   runner,
+        GameStarter   startGame,
         string        sessionID,
         string        sndaID,
         int           dcTravelPort,
@@ -61,7 +65,7 @@ public partial class Launcher
                             ? argumentBuilder.BuildEncrypted()
                             : argumentBuilder.Build();
 
-        var process = runner.Start(exePath, workingDir, arguments, environment, dpiAwareness);
+        var process = startGame(new GameStartRequest(exePath, workingDir, arguments, environment, dpiAwareness));
         return process != null ? new FFXIVProcess(process) : null;
     }
 
@@ -84,10 +88,17 @@ public partial class Launcher
         );
         request.Headers.AddWithoutValidation("Referer", Links.SDO_LAUNCHER_REFERER_URL);
 
-        var resp = await MockHttpClient.SendAsync(request).ConfigureAwait(false);
-        return await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        using var cts  = new CancellationTokenSource(DOWNLOAD_TIMEOUT);
+        var       resp = await MockHttpClient.SendAsync(request, cts.Token).ConfigureAwait(false);
+        return await resp.Content.ReadAsByteArrayAsync(cts.Token).ConfigureAwait(false);
     }
 
     [GeneratedRegex(@"\s*(?<key>[^=]+)\s*=\s*(?<value>[^\s]+)\s*", RegexOptions.Compiled)]
     private static partial Regex AdditionalArgumentsRegex();
+
+    #region 常量
+
+    private static readonly TimeSpan DOWNLOAD_TIMEOUT = TimeSpan.FromSeconds(20);
+
+    #endregion
 }

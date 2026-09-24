@@ -1,4 +1,7 @@
 using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
 using Serilog;
 using XIVLauncher.Account;
 using XIVLauncher.Dalamud;
@@ -57,6 +60,9 @@ public partial class App
 
     public App()
     {
+        RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly;
+        Timeline.DesiredFrameRateProperty.OverrideMetadata(typeof(Timeline), new(60));
+
         try
         {
             AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
@@ -68,7 +74,11 @@ public partial class App
         }
     }
 
-    private async void App_OnStartup(object sender, StartupEventArgs e)
+    private async void App_OnStartup
+    (
+        object           sender,
+        StartupEventArgs e
+    )
     {
         try
         {
@@ -111,14 +121,22 @@ public partial class App
 
     #region 事件处理
 
-    private void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    private void OnUnobservedTaskException
+    (
+        object?                          sender,
+        UnobservedTaskExceptionEventArgs e
+    )
     {
         if (e.Observed) return;
 
         OnUnhandledException(sender, new UnhandledExceptionEventArgs(e.Exception, true));
     }
 
-    private void OnUnhandledException(object? sender, UnhandledExceptionEventArgs e) =>
+    private void OnUnhandledException
+    (
+        object?                     sender,
+        UnhandledExceptionEventArgs e
+    ) =>
         Dispatcher.Invoke
         (() =>
             {
@@ -152,5 +170,4 @@ public partial class App
 
     private static StartupContext GetStartupContext() =>
         StartupContext ?? throw new InvalidOperationException("启动上下文尚未初始化");
-
 }

@@ -7,10 +7,10 @@ using XIVLauncher.Account.Cred;
 using XIVLauncher.Common;
 using XIVLauncher.Common.Constant;
 using XIVLauncher.Common.Util;
-using XIVLauncher.Login.WeGame;
 using XIVLauncher.CompanionApp;
 using XIVLauncher.Dalamud;
 using XIVLauncher.Minion;
+using XIVLauncher.Login.WeGame;
 using XIVLauncher.Windows.Services;
 
 namespace XIVLauncher.Windows.ViewModel;
@@ -24,14 +24,19 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
         SelectedCompanionAppEntry?.CompanionApp != null;
 
     public Visibility GamePathWarningVisibility =>
-        string.IsNullOrWhiteSpace(GamePathWarningMessage) ? Visibility.Collapsed : Visibility.Visible;
+        string.IsNullOrWhiteSpace(GamePathWarningMessage) ?
+            Visibility.Collapsed :
+            Visibility.Visible;
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(OpenBackupToolCommand))]
     [NotifyCanExecuteChangedFor(nameof(OpenOriginalLauncherCommand))]
     public partial string GamePath { get; set; } = string.Empty;
 
-    partial void OnGamePathChanged(string value) =>
+    partial void OnGamePathChanged
+    (
+        string value
+    ) =>
         RefreshGamePathWarning();
 
     [ObservableProperty]
@@ -60,9 +65,9 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
         get;
         set
         {
-            var clamped = value.HasValue
-                              ? Math.Clamp(value.Value, 0, DalamudLaunchOptions.MAX_DELAY_INITIALIZE_MS)
-                              : value;
+            var clamped = value.HasValue ?
+                              Math.Clamp(value.Value, 0, DalamudLaunchOptions.MAX_DELAY_INITIALIZE_MS) :
+                              value;
 
             // 即便钳制后与当前值相同, 也要刷新 TextBox, 把超限的输入回退到上限
             if (!SetProperty(ref field, clamped) && value != clamped)
@@ -165,13 +170,19 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
     [ObservableProperty]
     public partial CredType SelectedCredType { get; set; } = CredType.WindowsCredManager;
 
-    partial void OnSelectedCredTypeChanged(CredType value) =>
+    partial void OnSelectedCredTypeChanged
+    (
+        CredType value
+    ) =>
         SyncSelectedCredTypeOption();
 
     [ObservableProperty]
     public partial CredTypeOptionItem? SelectedCredTypeOption { get; set; }
 
-    partial void OnSelectedCredTypeOptionChanged(CredTypeOptionItem? value)
+    partial void OnSelectedCredTypeOptionChanged
+    (
+        CredTypeOptionItem? value
+    )
     {
         if (value == null || SelectedCredType == value.Value)
             return;
@@ -199,7 +210,11 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
     private readonly IDialogService         _dialogService;
     private readonly IExternalLaunchService _externalLaunchService;
 
-    internal SettingsWindowViewModel(IDialogService? dialogService = null, IExternalLaunchService? externalLaunchService = null)
+    internal SettingsWindowViewModel
+    (
+        IDialogService?         dialogService         = null,
+        IExternalLaunchService? externalLaunchService = null
+    )
     {
         _dialogService         = dialogService         ?? new DialogService();
         _externalLaunchService = externalLaunchService ?? new ExternalLaunchService();
@@ -273,7 +288,9 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
     [RelayCommand(CanExecute = nameof(CanOpenGamePathCommand))]
     private void OpenOriginalLauncher()
     {
-        var gamePath = !string.IsNullOrWhiteSpace(GamePath) ? new DirectoryInfo(GamePath) : App.Settings.GamePath;
+        var gamePath = !string.IsNullOrWhiteSpace(GamePath) ?
+                           new DirectoryInfo(GamePath) :
+                           App.Settings.GamePath;
         GameHelpers.StartOfficialLauncher(gamePath);
     }
 
@@ -301,9 +318,9 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
     {
         var patchPath = Paths.ResolvePatchPath(App.Settings.PatchPath, Paths.RoamingPath);
 
-        GamePath           = App.Settings.GamePath?.FullName ?? string.Empty;
-        PatchPath          = patchPath.FullName;
-        WeGamePath         = App.Settings.WeGamePath?.FullName ?? string.Empty;
+        GamePath   = App.Settings.GamePath?.FullName ?? string.Empty;
+        PatchPath  = patchPath.FullName;
+        WeGamePath = App.Settings.WeGamePath?.FullName ?? string.Empty;
 
         AskBeforePatching                           = App.Settings.AskBeforePatchInstall;
         ExitLauncherAfterGameExit                   = App.Settings.ExitLauncherWhenGameExit;
@@ -333,7 +350,7 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
 
     public async Task<bool> SaveToSettingsAsync()
     {
-        if (string.Equals(GamePath, PatchPath, StringComparison.OrdinalIgnoreCase) ||
+        if (string.Equals(GamePath,   PatchPath, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(WeGamePath, PatchPath, StringComparison.OrdinalIgnoreCase))
         {
             _dialogService.ShowMessage
@@ -360,8 +377,12 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
             return false;
         }
 
-        var gamePath            = !string.IsNullOrWhiteSpace(GamePath) ? new DirectoryInfo(GamePath) : null;
-        var patchPath           = !string.IsNullOrWhiteSpace(PatchPath) ? new DirectoryInfo(PatchPath) : null!;
+        var gamePath = !string.IsNullOrWhiteSpace(GamePath) ?
+                           new DirectoryInfo(GamePath) :
+                           null;
+        var patchPath = !string.IsNullOrWhiteSpace(PatchPath) ?
+                            new DirectoryInfo(PatchPath) :
+                            null!;
         var companionAppEntries = CompanionAppEntries.ToList();
         var dpiAwareness        = (DPIAwareness)DpiAwarenessIndex;
         var speedLimitBytes     = (long)((SpeedLimitMb ?? 0) * BYTES_TO_MB);
@@ -402,9 +423,11 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
                 settings.DalamudLoadMethod                       = DalamudLoadMethod.EntryPoint;
                 settings.AdditionalLaunchArgs                    = LaunchArgs;
                 settings.DPIAwareness                            = dpiAwareness;
-                settings.SpeedLimitBytes                      = speedLimitBytes;
-                settings.WeGamePath                           = string.IsNullOrWhiteSpace(WeGamePath) ? null : new DirectoryInfo(WeGamePath);
-                settings.CredType                             = credTypeApplyResult.AppliedCredType;
+                settings.SpeedLimitBytes                         = speedLimitBytes;
+                settings.WeGamePath = string.IsNullOrWhiteSpace(WeGamePath) ?
+                                          null :
+                                          new DirectoryInfo(WeGamePath);
+                settings.CredType = credTypeApplyResult.AppliedCredType;
 
                 var minionInstallPath = MinionInstallPath.Trim();
                 var minionId          = MinionId.Trim();
@@ -445,7 +468,10 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
             SelectedCredType = App.AccountManager.CurrentCredType;
     }
 
-    private void ReplaceCredTypeOptions(IEnumerable<CredTypeOptionItem> options)
+    private void ReplaceCredTypeOptions
+    (
+        IEnumerable<CredTypeOptionItem> options
+    )
     {
         CredTypeOptions.Clear();
 
@@ -463,14 +489,27 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
             SelectedCredTypeOption = selectedOption;
     }
 
-    private static IReadOnlyList<CredTypeOptionItem> BuildCredTypeOptions(bool isWindowsHelloSupported) =>
+    private static IReadOnlyList<CredTypeOptionItem> BuildCredTypeOptions
+    (
+        bool isWindowsHelloSupported
+    ) =>
     [
         new(CredType.NoEncryption, "无加密（不推荐）", true),
         new(CredType.WindowsCredManager, "系统凭据管理器", true),
-        new(CredType.WindowsHello, isWindowsHelloSupported ? "Windows Hello" : "Windows Hello（当前设备不可用）", isWindowsHelloSupported)
+        new
+        (
+            CredType.WindowsHello,
+            isWindowsHelloSupported ?
+                "Windows Hello" :
+                "Windows Hello（当前设备不可用）",
+            isWindowsHelloSupported
+        )
     ];
 
-    private void ReplaceCompanionAppEntries(IEnumerable<CompanionAppEntry> entries)
+    private void ReplaceCompanionAppEntries
+    (
+        IEnumerable<CompanionAppEntry> entries
+    )
     {
         CompanionAppEntries.Clear();
         foreach (var entry in entries)
