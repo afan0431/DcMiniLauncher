@@ -1,0 +1,63 @@
+# 推 v* tag 就编译并发布到 GitHub Releases。
+#
+# - 用 ReleaseNoUpdate 配置（XL_NOAUTOUPDATE）：原版的自动更新指向上游的发布源，
+#   开着会把本 fork 的启动器「更新」回上游版本，改动全丢。
+# - 额外编译 native 模块 MiniLauncherModule.dll（上游 CI 不认识它）；缺了它游戏内超域旅行不可用，
+#   所以编不出来就直接失败，不发残缺的包。
+#
+#   git tag v2.5.0-mini.1 && git push origin v2.5.0-mini.1
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build launcher
+        run: |
+          cd src
+          dotnet restore
+          dotnet build XIVLauncher.slnx -c ReleaseNoUpdate
+
+      - name: Build native module
+        run: .\src\XIVLauncher.MiniModule\build.ps1 -Configuration Release
+
+      - name: Package
+        id: pkg
+        run: |
+          $out = "src\bin\win-x64"
+          foreach ($f in "XIVLauncherCN.exe", "MiniLauncherModule.dll") {
+            if (-not (Test-Path "$out\$f")) { throw "产物里缺 $f" }
+          }
+          $tag = "${{ github.ref_name }}"
+          $zip = "DcMiniLauncher-$tag-win-x64.zip"
+          $stage = "stage\DcMiniLauncher"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "$out\*" $stage -Recurse -Exclude *.pdb
+          Compress-Archive -Path $stage -DestinationPath $zip
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $extra = @()
+          if ($tag -match '-(alpha|beta|rc)') { $extra += '--prerelease' }
+          gh release create $tag "${{ steps.pkg.outputs.zip }}" --title $tag --generate-notes @extra
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

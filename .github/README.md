@@ -10,6 +10,12 @@
 
 原版的登录、超域传送等功能保持不变。
 
+## 下载
+
+**[前往 Releases 下载最新版](https://github.com/afan0431/DcMiniLauncher/releases/latest)**（`DcMiniLauncher-*-win-x64.zip`），解压后运行 `XIVLauncherCN.exe`。
+
+本版本关闭了自动更新（原版的更新源会把它换回上游版本），有新版请回这里下载。
+
 ## 构建
 
 需要 .NET 10 SDK；native 模块另需 VS Build Tools 的 C++ 工作负载。
