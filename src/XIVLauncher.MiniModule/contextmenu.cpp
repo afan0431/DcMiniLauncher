@@ -64,6 +64,8 @@ namespace
     {
         unsigned long long contentId;
         unsigned char      loginFlags;
+        unsigned char      entryIndex; // 条目自带的 Index（+0x10）
+        int                listIndex;  // 在选角列表向量里排第几 —— Minion 的 SelectCharacter 按这个选
         unsigned short     currentWorldId;
         unsigned short     homeWorldId;
         char               name[offsets::CHARA_ENTRY_NAME_LEN + 1];
@@ -190,6 +192,7 @@ namespace
         const auto count = static_cast<size_t>(last - first);
 
         const uint8_t* entry = index < count ? first[index] : nullptr;
+        int listIndex = entry != nullptr ? static_cast<int>(index) : -1;
 
         if (entry == nullptr || ReadAt<unsigned long long>(entry, offsets::CHARA_ENTRY_CONTENT_ID) != cid)
         {
@@ -198,7 +201,10 @@ namespace
             for (size_t i = 0; i < count && entry == nullptr; ++i)
             {
                 if (first[i] != nullptr && ReadAt<unsigned long long>(first[i], offsets::CHARA_ENTRY_CONTENT_ID) == cid)
-                    entry = first[i];
+                {
+                    entry     = first[i];
+                    listIndex = static_cast<int>(i);
+                }
             }
         }
 
@@ -207,6 +213,8 @@ namespace
 
         out->contentId      = ReadAt<unsigned long long>(entry, offsets::CHARA_ENTRY_CONTENT_ID);
         out->loginFlags     = ReadAt<unsigned char>(entry, offsets::CHARA_ENTRY_LOGIN_FLAGS);
+        out->entryIndex     = ReadAt<unsigned char>(entry, offsets::CHARA_ENTRY_INDEX);
+        out->listIndex      = listIndex;
         out->currentWorldId = ReadAt<unsigned short>(entry, offsets::CHARA_ENTRY_CURRENT_WORLD);
         out->homeWorldId    = ReadAt<unsigned short>(entry, offsets::CHARA_ENTRY_HOME_WORLD);
         CopyFixed(entry + offsets::CHARA_ENTRY_NAME,               out->name);
@@ -481,9 +489,9 @@ namespace
         char head[256];
         _snprintf_s(head, sizeof(head), _TRUNCATE,
                     "{\"seq\":%llu,\"action\":\"travel\",\"pid\":%lu,\"contentId\":\"%llu\",\"loginFlags\":%u,"
-                    "\"currentWorldId\":%u,\"homeWorldId\":%u,",
+                    "\"currentWorldId\":%u,\"homeWorldId\":%u,\"listIndex\":%d,\"entryIndex\":%u,",
                     seq, GetCurrentProcessId(), character.contentId, character.loginFlags,
-                    character.currentWorldId, character.homeWorldId);
+                    character.currentWorldId, character.homeWorldId, character.listIndex, character.entryIndex);
 
         std::string json = head;
         json += "\"name\":\"" + JsonEscape(character.name) + "\",";

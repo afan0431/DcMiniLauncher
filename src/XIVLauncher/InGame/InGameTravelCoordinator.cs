@@ -91,37 +91,12 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         if (state == null)
             return new { ok = false, message = error ?? "拿不到角色信息" };
 
-        // 超域中: 只能超域返回, 给目标列表没意义 —— 空着, 游戏内 UI 靠 away 决定画什么
-        if (state.Away)
-            return new
-            {
-                ok        = true,
-                character = state.Name,
-                area      = state.CurrentGroup.AreaName,
-                group     = state.CurrentGroup.GroupName,
-                away      = true,
-                visiting  = false,
-                homeArea  = state.HomeGroup.AreaName,
-                homeGroup = state.HomeGroup.GroupName,
-                areas     = Array.Empty<object>()
-            };
-
-        // 跨界传送中: 也去不了 —— 得先在游戏内返回原始世界。同样不给目标列表。
-        if (state.Visiting)
-            return new
-            {
-                ok        = true,
-                character = state.Name,
-                area      = state.CurrentGroup.AreaName,
-                group     = state.CurrentGroup.GroupName,
-                away      = false,
-                visiting  = true,
-                homeArea  = state.HomeGroup.AreaName,
-                homeGroup = state.HomeGroup.GroupName,
-                areas     = Array.Empty<object>()
-            };
-
-        // SDO 的超域业务以**原始服务器**为源 —— 角色跨界传送到同大区别的世界时也一样
+        // 目的地一律照给, 处境用 away / visiting 标出来, 由调用方决定先走哪一步:
+        //   away     超域中      —— POST 本身就会编排「超域返回 → 冷却 → 超域旅行」两段, 只想回去就 back:true
+        //   visiting 跨界传送中  —— 超域前得先在游戏内返回原始世界（主城大水晶）。那一步启动器做不了,
+        //                          由游戏内那侧（Afan 的跨区路线: 跨小区 → 跨大区）先走完, 再来 POST。
+        // 以前这两种情况都回空列表, 结果面板上什么都选不了 —— 用户要的是一键走完, 不是一句原因。
+        // SDO 的超域业务以**原始服务器**为源 —— 超域中 / 跨界传送中都一样, 目标列表按原始服务器查。
         var targets = await client.QueryGroupListTravelTarget(state.HomeGroup.AreaID, state.HomeGroup.GroupID).ConfigureAwait(false);
 
         return new
@@ -130,8 +105,8 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             character = state.Name,
             area      = state.CurrentGroup.AreaName,
             group     = state.CurrentGroup.GroupName,
-            away      = false,
-            visiting  = false,
+            away      = state.Away,
+            visiting  = state.Visiting,
             homeArea  = state.HomeGroup.AreaName,
             homeGroup = state.HomeGroup.GroupName,
             areas = targets.Select(area => new

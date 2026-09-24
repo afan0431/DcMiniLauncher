@@ -29,8 +29,8 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
 
     /// <summary>
     ///     <c>GET /dctravel/ingame-travel/areas</c> 的钩子 —— 游戏内 UI 用它问「我这个角色现在什么处境」:
-    ///     在原始大区就附上能去的大区/服务器和拥挤度（queueTime: 0=通畅, &lt;0=繁忙, &gt;0=排队分钟数）,
-    ///     超域中就只报所在地和原始大区。
+    ///     所在地、原始大区, 以及能去的大区/服务器和拥挤度（queueTime: 0=通畅, &lt;0=繁忙, &gt;0=排队分钟数）。
+    ///     超域中（away）/ 跨界传送中（visiting）也照给目的地, 由调用方按这两个标记决定先走哪一步。
     ///     角色是谁、人在哪见 <see cref="InGameTravelIdentity" />: 游戏内由 Lua 报,
     ///     标题/选角界面报不了时启动器改问注入的原生模块。
     /// </summary>
