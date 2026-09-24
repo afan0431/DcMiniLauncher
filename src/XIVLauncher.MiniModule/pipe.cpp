@@ -106,6 +106,12 @@ namespace
         if (command == "WHERE")
             return GameWhere();
 
+        if (command == "WHOLIST")
+            return GameWhoList();
+
+        if (command == "MENUSTATUS")
+            return ContextMenuStatus();
+
         if (command == "SKIPMOVIE")
             return GameSkipMovie();
 
@@ -178,7 +184,9 @@ namespace
 
             // SETSID 的参数是登录票据 —— 只记命令名
             const bool secret = command.rfind("SETSID", 0) == 0;
-            LogF("[pipe] < %s | > %s", secret ? "SETSID <已隐去>" : command.c_str(), response.c_str());
+            // WHOLIST 的正文是一整张角色表, 日志里只留第一行摘要（game.cpp 已记过）
+            const auto shown = response.substr(0, response.find('\n'));
+            LogF("[pipe] < %s | > %s", secret ? "SETSID <已隐去>" : command.c_str(), shown.c_str());
 
             DWORD written = 0;
             if (!WriteFile(pipe, response.c_str(), static_cast<DWORD>(response.size()), &written, nullptr))

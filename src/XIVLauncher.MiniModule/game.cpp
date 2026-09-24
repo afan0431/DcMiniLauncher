@@ -950,6 +950,176 @@ std::string GameWhere()
     }
 }
 
+// =============================================================================
+// WHOLIST —— 选角界面的角色列表（只读）
+//
+// WHY: 标题/选角界面 Lua 的 Player 无效, 拿不到角色名, 启动器的 /areas 就查不了。
+// 游戏自己的选角列表里有全部需要的东西: 名字、ContentId(=SDO roleId)、当前/原始世界的 ID 和名字、
+// LoginFlags（超域中）。世界名直接取条目里的字符串 —— 启动器那边没有世界 ID→名字的表。
+//
+// ⚠ 列表只在「角色选择」界面可信: 回到标题后向量里还留着上一个大区的旧列表,
+//   换过登录大区之后那份就是错的。所以同时回 where, 由调用方决定信不信。
+// =============================================================================
+
+namespace
+{
+    constexpr int WHOLIST_MAX = 48; // 一个账号在一个大区最多 8 服 × 8 角色, 48 够用且响应不超 8KB
+
+    struct CharaRow
+    {
+        unsigned long long contentId;
+        unsigned char      index;
+        unsigned char      loginFlags;
+        unsigned short     currentWorldId;
+        unsigned short     homeWorldId;
+        char               name[offsets::CHARA_ENTRY_NAME_LEN + 1];
+        char               currentWorldName[offsets::CHARA_ENTRY_NAME_LEN + 1];
+        char               homeWorldName[offsets::CHARA_ENTRY_NAME_LEN + 1];
+    };
+
+    struct WhoListData
+    {
+        int                where;
+        int                total;   // 向量里一共几个（可能 > WHOLIST_MAX）
+        int                count;   // 实际拷出几个
+        int                selectedIndex;
+        int                hoveredIndex;
+        unsigned long long selectedContentId;
+        unsigned long long hoveredContentId;
+        CharaRow           rows[WHOLIST_MAX];
+    };
+
+    // 定长 char[32] → 以 0 结尾的串; 顺手把制表符/换行换成空格, 免得弄乱行格式
+    void CopyFixedString(const uint8_t* source, char* destination)
+    {
+        size_t length = strnlen(reinterpret_cast<const char*>(source), offsets::CHARA_ENTRY_NAME_LEN);
+        memcpy(destination, source, length);
+        destination[length] = '\0';
+
+        for (size_t i = 0; i < length; ++i)
+        {
+            if (destination[i] == '\t' || destination[i] == '\r' || destination[i] == '\n')
+                destination[i] = ' ';
+        }
+    }
+
+    bool OpWhoList(const Pointers* p, WhoListData* out)
+    {
+        memset(out, 0, sizeof(WhoListData));
+        out->where = OpWhere(p);
+
+        __try
+        {
+            const auto lobby = reinterpret_cast<uint8_t*>(p->agentLobby);
+            if (lobby == nullptr)
+                return false;
+
+            out->selectedIndex     = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_SELECTED_CHARA_INDEX);
+            out->hoveredIndex      = ReadAt<signed char>(lobby, offsets::AGENT_LOBBY_HOVERED_CHARA_INDEX);
+            out->selectedContentId = ReadAt<unsigned long long>(lobby, offsets::AGENT_LOBBY_SELECTED_CONTENT_ID);
+            out->hoveredContentId  = ReadAt<unsigned long long>(lobby, offsets::AGENT_LOBBY_HOVERED_CONTENT_ID);
+
+            const auto vector = lobby + offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES;
+            const auto first  = ReadAt<uint8_t**>(vector, offsets::STD_VECTOR_FIRST);
+            const auto last   = ReadAt<uint8_t**>(vector, offsets::STD_VECTOR_LAST);
+
+            if (first == nullptr || last == nullptr || last < first)
+                return true; // 空列表不是错误
+
+            out->total = static_cast<int>(last - first);
+
+            // 超过一千个指针一定是读歪了, 宁可报空也别往下扫
+            if (out->total > 1000)
+            {
+                out->total = 0;
+                return false;
+            }
+
+            for (int i = 0; i < out->total && out->count < WHOLIST_MAX; ++i)
+            {
+                const auto entry = first[i];
+                if (entry == nullptr)
+                    continue;
+
+                auto& row = out->rows[out->count++];
+                row.contentId      = ReadAt<unsigned long long>(entry, offsets::CHARA_ENTRY_CONTENT_ID);
+                row.index          = ReadAt<unsigned char>(entry, offsets::CHARA_ENTRY_INDEX);
+                row.loginFlags     = ReadAt<unsigned char>(entry, offsets::CHARA_ENTRY_LOGIN_FLAGS);
+                row.currentWorldId = ReadAt<unsigned short>(entry, offsets::CHARA_ENTRY_CURRENT_WORLD);
+                row.homeWorldId    = ReadAt<unsigned short>(entry, offsets::CHARA_ENTRY_HOME_WORLD);
+
+                CopyFixedString(entry + offsets::CHARA_ENTRY_NAME,               row.name);
+                CopyFixedString(entry + offsets::CHARA_ENTRY_CURRENT_WORLD_NAME, row.currentWorldName);
+                CopyFixedString(entry + offsets::CHARA_ENTRY_HOME_WORLD_NAME,    row.homeWorldName);
+            }
+
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] WHOLIST 异常 code=0x%08X", GetExceptionCode());
+            return false;
+        }
+    }
+
+    const char* WhereName(int where)
+    {
+        switch (where)
+        {
+            case 3:  return "ingame";
+            case 2:  return "charaselect";
+            case 1:  return "title";
+            case 0:  return "busy";
+            default: return "unknown";
+        }
+    }
+}
+
+// 响应格式（第一行是摘要, 之后每个角色一行, 字段用 \t 分隔）:
+//   OK where=charaselect n=3 total=3 selected=<cid> selectedIndex=0 hovered=<cid> hoveredIndex=-1
+//   C  <contentId>  <index>  <loginFlags>  <curWorldId>  <homeWorldId>  <名字>  <当前世界名>  <原始世界名>
+std::string GameWhoList()
+{
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareCall(state, failure))
+        return failure;
+
+    auto data     = std::make_shared<WhoListData>();
+    auto captured = state;
+    auto list     = data;
+
+    if (!MainThreadRun([captured, list] { captured->ok = OpWhoList(&captured->pointers, list.get()); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    if (!state->ok)
+        return "FAIL exception";
+
+    char header[256];
+    _snprintf_s(header, sizeof(header), _TRUNCATE,
+                "OK where=%s n=%d total=%d selected=%llu selectedIndex=%d hovered=%llu hoveredIndex=%d",
+                WhereName(data->where), data->count, data->total,
+                data->selectedContentId, data->selectedIndex, data->hoveredContentId, data->hoveredIndex);
+
+    std::string response = header;
+
+    for (int i = 0; i < data->count; ++i)
+    {
+        const auto& row = data->rows[i];
+
+        char line[256];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "\nC\t%llu\t%u\t%u\t%u\t%u\t%s\t%s\t%s",
+                    row.contentId, row.index, row.loginFlags, row.currentWorldId, row.homeWorldId,
+                    row.name, row.currentWorldName, row.homeWorldName);
+        response += line;
+    }
+
+    LogF("[game] WHOLIST where=%s n=%d/%d selected=%llu", WhereName(data->where), data->count, data->total,
+         data->selectedContentId);
+    return response;
+}
+
 std::string GameReleaseLobbyContext()
 {
     CallStatePtr state;

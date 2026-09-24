@@ -77,19 +77,16 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
 
     /// <summary>
     ///     游戏内 UI 用: 报告<b>这个角色</b>现在的处境, 以及（在原始大区时）它能去哪。
-    ///     三个参数都由游戏内那侧给（<c>Player.name</c> + <c>FFXIVLib.API.World.GetWorldById</c>
-    ///     解出的当前世界名 / 原始世界名）—— 谁在玩、人在哪, 只有游戏进程自己知道。
+    ///     角色是谁、人在哪只有游戏进程自己知道: 游戏内由 Lua 报, 选角界面由原生模块读（见 <see cref="ResolveCharacterStateAsync" />）。
     ///     <c>queueTime</c>: 0=通畅, &lt;0=繁忙, &gt;0=预计排队分钟数。
     /// </summary>
     public async Task<object> QueryTargetsAsync
     (
-        string?           character,
-        string?           world,
-        string?           homeWorld,
-        CancellationToken cancellationToken
+        DCTravelListener.InGameTravelIdentity identity,
+        CancellationToken                     cancellationToken
     )
     {
-        var (state, error) = await ResolveCharacterStateAsync(character, world, homeWorld, cancellationToken).ConfigureAwait(false);
+        var (state, error) = await ResolveCharacterStateAsync(identity, cancellationToken).ConfigureAwait(false);
 
         if (state == null)
             return new { ok = false, message = error ?? "拿不到角色信息" };
@@ -360,8 +357,7 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         CancellationToken                    cancellationToken
     )
     {
-        var (state, stateError) = await ResolveCharacterStateAsync(request.Character, request.World, request.HomeWorld, cancellationToken)
-                                      .ConfigureAwait(false);
+        var (state, stateError) = await ResolveCharacterStateAsync(request.Identity, cancellationToken).ConfigureAwait(false);
 
         if (state == null)
             return ([], stateError);
@@ -477,29 +473,41 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     }
 
     /// <summary>
-    ///     按游戏内报上来的世界名定位角色。<paramref name="world" /> / <paramref name="homeWorld" />
-    ///     由游戏内那侧算好（<c>FFXIVLib.API.World.GetWorldById</c>），
-    ///     这里只把名字映射成 SDO 的服务器对象（要 GroupID / GroupCode 才能提交请求）。
-    ///     <para>
-    ///         只发一次 <c>queryGroupListTravelSource</c>。原先那套「挨个服务器问可迁移角色」
-    ///         的扫描（4 大区 28 个服务器、串行十几秒）已删除 —— 它不但慢，查的还是另一回事。
-    ///     </para>
+    ///     定位角色: 谁、现在在哪个服务器、原始服务器是哪个。
+    ///     <list type="bullet">
+    ///       <item>游戏内: Lua 报角色名 + 中文世界名（<c>Player.name</c> + <c>FFXIVLib.API.World.GetWorldById</c>）。</item>
+    ///       <item>
+    ///         标题/选角界面（或 Lua 报不全时）: 问原生模块要选角列表（<see cref="CharaSelectReader" />）,
+    ///         按右键菜单给的 contentId / 名字 / 当前选中挑一个。那里的世界名是内部代号 = SDO 的 groupCode。
+    ///       </item>
+    ///     </list>
+    ///     然后只把世界映射成 SDO 的服务器对象（要 GroupID / GroupCode 才能提交请求）,
+    ///     只发一次 <c>queryGroupListTravelSource</c>。原先「挨个服务器问可迁移角色」的扫描
+    ///     （4 大区 28 个服务器、串行十几秒）已删除 —— 它不但慢，查的还是另一回事。
     /// </summary>
     private async Task<(CharacterState? State, string? Error)> ResolveCharacterStateAsync
     (
-        string?           name,
-        string?           world,
-        string?           homeWorld,
-        CancellationToken cancellationToken
+        DCTravelListener.InGameTravelIdentity identity,
+        CancellationToken                     cancellationToken
     )
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (string.IsNullOrWhiteSpace(name))
-            return (null, "拿不到角色名（游戏内那侧没报上来）");
+        var name      = identity.Character;
+        var world     = identity.World;
+        var homeWorld = identity.HomeWorld;
 
-        if (string.IsNullOrWhiteSpace(world) || string.IsNullOrWhiteSpace(homeWorld))
-            return (null, "拿不到角色所在的世界（进游戏后再试）");
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(world) || string.IsNullOrWhiteSpace(homeWorld))
+        {
+            var (entry, entryError) = await PickFromCharaSelectAsync(identity, cancellationToken).ConfigureAwait(false);
+
+            if (entry == null)
+                return (null, entryError);
+
+            name      = entry.Name;
+            world     = entry.CurrentWorldCode;
+            homeWorld = entry.HomeWorldCode;
+        }
 
         var sourceAreas = await client.QueryGroupListTravelSource().ConfigureAwait(false);
 
@@ -582,9 +590,50 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         return roles.FirstOrDefault(x => string.Equals(x.Name, roleName, StringComparison.Ordinal));
     }
 
-    private static DCTravelGroup? FindGroupByName(List<DCTravelArea> areas, string groupName) =>
+    /// <summary>
+    ///     中文名（游戏内 Lua 报的）或游戏内部代号（选角列表里的, = SDO 的 groupCode）都认。
+    ///     groupCode 大小写不统一（<c>Longchaoshendian</c> / <c>HongChaChuan2</c>）, 所以忽略大小写。
+    /// </summary>
+    private static DCTravelGroup? FindGroupByName(List<DCTravelArea> areas, string groupNameOrCode) =>
         areas.SelectMany(x => x.GroupList)
-             .FirstOrDefault(x => string.Equals(x.GroupName, groupName, StringComparison.Ordinal));
+             .FirstOrDefault(x => string.Equals(x.GroupName, groupNameOrCode, StringComparison.Ordinal) ||
+                                  string.Equals(x.GroupCode, groupNameOrCode, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    ///     Lua 报不上角色时（标题/选角界面没有 Player）, 从选角列表里挑。
+    ///     错误文案给游戏内 UI 直接显示, 所以写成用户能照着做的话。
+    /// </summary>
+    private static async Task<(CharaSelectReader.Entry? Entry, string? Error)> PickFromCharaSelectAsync
+    (
+        DCTravelListener.InGameTravelIdentity identity,
+        CancellationToken                     cancellationToken
+    )
+    {
+        var (snapshot, error) = await CharaSelectReader.ReadAsync(identity.Pid, cancellationToken).ConfigureAwait(false);
+
+        if (snapshot == null)
+            return (null, error);
+
+        switch (snapshot.Where)
+        {
+            // 标题界面的列表是换登录大区之前那个大区的旧表, 不能信
+            case "title":
+                return (null, "当前在标题画面，进入角色选择后再选角色");
+            case "busy":
+            case "unknown":
+                return (null, "游戏界面还没就绪，请稍后再试");
+        }
+
+        var entry = snapshot.Pick(identity.ContentId, identity.Character);
+
+        if (entry == null)
+            return (null, identity.ContentId != null ? "角色列表里没有这个角色" : "请先在角色选择界面选中一个角色");
+
+        Log.Information("[InGameTravel] 选角列表定位: {Name} cid={ContentId} 当前={Current} 原始={Home} flags={Flags} (where={Where})",
+                        entry.Name, entry.ContentId, entry.CurrentWorldCode, entry.HomeWorldCode, entry.LoginFlags, snapshot.Where);
+
+        return (entry, null);
+    }
 
     private async Task<TravelContext> ResolveForwardContextAsync
     (

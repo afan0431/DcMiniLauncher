@@ -15,16 +15,23 @@ namespace
         const bool mainThreadOk = MainThreadInstall();
 
         if (!mainThreadOk)
+        {
             LogF("[module] 主线程通道未建立, 只能应答 PING/VERSION");
+        }
         else
+        {
             GameStartTitleGuard(); // 常驻: 别让客户端停在标题时飘进片头动画
+            ContextMenuInstall();  // 选角界面右键「跨区旅行」; 装不上只少这一项
+        }
 
         PipeServerRun();
 
-        // 顺序要紧: 先把自己起的线程收干净, 再谈还原窗口和卸载自己
+        // 顺序要紧: 先把自己起的线程收干净, 再还原各处 hook, 最后才谈卸载自己。
+        // 右键菜单的 hook 要在 Tick 之前还原 —— 它安装时借的是主线程通道。
         GameStopKeepAlive();
 
-        const bool restored = MainThreadUninstall();
+        const bool menuRestored = ContextMenuUninstall();
+        const bool restored     = MainThreadUninstall() && menuRestored;
 
         LogF("=== MiniLauncher 模块退出 (窗口已还原=%d) ===", restored ? 1 : 0);
         LogShutdown();

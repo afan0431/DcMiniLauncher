@@ -49,6 +49,34 @@ namespace offsets
     inline constexpr uintptr_t AGENT_LOBBY_UI_CLIENT_CONTEXT = AGENT_LOBBY_UI_CLIENT + 0x18;   // 0x60
     inline constexpr uintptr_t AGENT_LOBBY_UI_CLIENT_STATE   = AGENT_LOBBY_UI_CLIENT + 0x158;  // 0x1A0
 
+    // ---- 选角列表（WHOLIST）----------------------------------------------------
+    // 出处: ottercorp/FFXIVClientStructs 国服分支 7bbe59afc（2026-09-18）AgentLobby.cs。
+    // 上面那几个老字段在该版本里偏移没变, 说明 AgentLobby 这段布局近期稳定。
+    // LobbyData.CharaSelectEntries (:112) = StdVector<CharaSelectCharacterEntry*>, 在 LobbyData+0x8D8
+    inline constexpr uintptr_t AGENT_LOBBY_CHARA_SELECT_ENTRIES   = AGENT_LOBBY_LOBBY_DATA + 0x8D8; // 0x918
+    inline constexpr uintptr_t STD_VECTOR_FIRST                   = 0x00;
+    inline constexpr uintptr_t STD_VECTOR_LAST                    = 0x08;
+    inline constexpr uintptr_t AGENT_LOBBY_SELECTED_CHARA_INDEX   = 0x1241; // :38 byte
+    inline constexpr uintptr_t AGENT_LOBBY_HOVERED_CONTENT_ID     = 0x1248; // :40 ulong
+    inline constexpr uintptr_t AGENT_LOBBY_HOVERED_CHARA_INDEX    = 0x12CD; // :70 sbyte
+    inline constexpr uintptr_t AGENT_LOBBY_SELECTED_CONTENT_ID    = 0x12D0; // :72 ulong
+
+    // CharaSelectCharacterEntry (:131, Size 0x6F8)
+    inline constexpr uintptr_t CHARA_ENTRY_CONTENT_ID      = 0x08;  // ulong = SDO 的 roleId
+    inline constexpr uintptr_t CHARA_ENTRY_INDEX           = 0x10;  // byte
+    inline constexpr uintptr_t CHARA_ENTRY_LOGIN_FLAGS     = 0x11;  // byte, 见下
+    inline constexpr uintptr_t CHARA_ENTRY_CURRENT_WORLD   = 0x18;  // ushort
+    inline constexpr uintptr_t CHARA_ENTRY_HOME_WORLD      = 0x1A;  // ushort
+    inline constexpr uintptr_t CHARA_ENTRY_NAME            = 0x2C;  // char[32] UTF-8
+    inline constexpr uintptr_t CHARA_ENTRY_CURRENT_WORLD_NAME = 0x4C; // char[32]
+    inline constexpr uintptr_t CHARA_ENTRY_HOME_WORLD_NAME = 0x6C;  // char[32]
+    inline constexpr size_t    CHARA_ENTRY_NAME_LEN        = 32;
+
+    // LoginFlags (:156): DCTraveling=16 / Unk32=32 —— DCTraveler 把这两位都当「超域中」
+    // (ContextMenuManager.cs: 有其一就只给「返回至原始大区」)
+    inline constexpr unsigned char LOGIN_FLAG_DC_TRAVELING = 16;
+    inline constexpr unsigned char LOGIN_FLAG_UNK32        = 32;
+
     // ---- NetworkModule (Application/Network/NetworkModule.cs) --------------
     inline constexpr uintptr_t NETWORK_MODULE_PROXY_MODULE = 0x08;  // Client/Network/NetworkModuleProxy.cs:10
     inline constexpr uintptr_t NETWORK_MODULE_LOBBY_HOSTS  = 0x068; // :12 FixedSizeArray14<Utf8String>
@@ -125,4 +153,43 @@ namespace offsets
     // 这就是游戏自己在登出时调的处理函数, 不经聊天框、不弹确认框。
     // isExiting=false 表示登出到角色选择（true 是直接退出游戏), a3 是大厅那边按帧算的倒数。
     inline constexpr const char* AGENT_LOBBY_HANDLE_LOGOUT_SIG = "40 56 41 56 41 57 48 83 EC 40 80 B9";
+
+    // =========================================================================
+    // 选角界面右键菜单（contextmenu.cpp）
+    // 出处: ottercorp/Dalamud a5745232 Game/Gui/ContextMenu/ContextMenu.cs（与 goatcorp 字节一致）,
+    //       FFXIVClientStructs 国服分支 7bbe59af, DCTraveler 006cdce7 Managers/ContextMenuManager.cs。
+    // =========================================================================
+
+    // UIModuleInterface.cs: [VirtualFunction(7)] RaptureAtkModule* GetRaptureAtkModule()
+    inline constexpr int UI_MODULE_GET_RAPTURE_ATK_MODULE_VF = 7;
+
+    // RaptureAtkModule 虚表第 22 项 —— Dalamud 叫它 AtkModuleVf22OpenAddonByAgent, 打开右键菜单走这里。
+    // ⚠ CS 没记这一项, 原型只来自 Dalamud 的委托:
+    //   ushort (AtkModule*, byte* addonName, int valueCount, AtkValue* values, AgentInterface* agent, nint a7, bool a8)
+    inline constexpr int RAPTURE_ATK_MODULE_OPEN_ADDON_BY_AGENT_VF = 22;
+
+    // AddonContextMenu.cs [VirtualFunction(74)] bool OnMenuSelected(int selectedIdx, byte a3)
+    inline constexpr int ADDON_CONTEXT_MENU_ON_MENU_SELECTED_VF = 74;
+
+    inline constexpr int AGENT_ID_CONTEXT = 9; // AgentModule.cs AgentId.Context —— 右键菜单 MenuType.Default
+
+    inline constexpr uintptr_t ATK_UNIT_BASE_BLOCKED_PARENT_ID = 0x1EA; // AtkUnitBase.cs, ushort
+
+    // AtkValue: 0x10 字节, +0 u32 Type, +8 值
+    inline constexpr size_t   ATK_VALUE_SIZE      = 0x10;
+    inline constexpr unsigned ATK_VALUE_TYPE_INT  = 3;
+    inline constexpr unsigned ATK_VALUE_TYPE_UINT = 5;
+
+    // ContextMenu 的 AtkValue 头 8 项: [0]=项数 N, [2]=返回箭头掩码, [3]=子菜单掩码;
+    // 之后 [8, 8+N) 是各项名字, 若有置灰项再跟 [8+N, 8+2N) 的 Int 0/1
+    inline constexpr int CONTEXT_MENU_HEADER_COUNT = 8;
+
+    // AtkUnitManager::GetAddonById(ushort id) —— AtkUnitManager.cs
+    inline constexpr const char* GET_ADDON_BY_ID_SIG = "E8 ?? ?? ?? ?? 8B 6B 20";
+    // IMemorySpace::GetUISpace() (静态) / IMemorySpace::Free(void*, ulong) (静态) —— IMemorySpace.cs
+    inline constexpr const char* GET_UI_SPACE_SIG       = "E8 ?? ?? ?? ?? 48 8B D7 41 B8";
+    inline constexpr const char* MEMORY_SPACE_FREE_SIG  = "E8 ?? ?? ?? ?? FF 4B 78";
+    inline constexpr int         MEMORY_SPACE_MALLOC_VF = 3; // void* Malloc(ulong size, ulong alignment)
+    // AtkValue::SetManagedString(byte*) —— AtkValue.cs; 把字符串拷进游戏自己的内存
+    inline constexpr const char* ATK_VALUE_SET_MANAGED_STRING_SIG = "E8 ?? ?? ?? ?? 41 03 ED";
 }

@@ -11,7 +11,7 @@
 #include <string>
 
 // 模块版本, 通过 pipe 的 VERSION 命令回给启动器, 便于确认注进去的是哪一版
-#define MINIMODULE_VERSION "0.2.0-travel"
+#define MINIMODULE_VERSION "0.4.0-menu"
 
 // ---- 日志 (log.cpp) ----------------------------------------------------------
 // 日志落在 %TEMP%\minilauncher-module-<pid>.log —— 游戏目录不保证可写, 且这里天然按 PID 分开
@@ -52,6 +52,7 @@ std::string GameDump();    // 只读诊断: 摊开 Utf8String 头部 + 在 Netwo
 // ⚠ 只在角色选择/标题界面才会真的执行 —— 在世界里调 returnToTitle 实测必崩（见 game.cpp 注释）
 std::string GameReturnToTitle();
 std::string GameWhere();     // ingame / charaselect / title / busy(片头动画·读盘·过场)
+std::string GameWhoList();   // 选角列表（名字/ContentId/世界/LoginFlags）+ 当前界面; 格式见 game.cpp
 std::string GameSkipMovie(); // 给游戏窗口投 ESC 结束片头动画, 等到界面可操作为止
 // 游戏内登出到角色选择界面。direct=false 走 /logout 文本命令 + 确认框（等同玩家操作, 最保守);
 // direct=true 直接调 AgentLobby::HandleLogout（更底层, 不弹确认框)
@@ -69,6 +70,13 @@ std::string GameKeepAlive(bool enable);
 
 // ⚠ 卸载模块前必须调: 保活线程还在跑的时候 FreeLibrary = 它醒来跳进已解除映射的代码页, 直接把游戏带走
 void GameStopKeepAlive();
+
+// ---- 选角界面右键菜单 (contextmenu.cpp) -------------------------------------
+// 右键角色多一项「跨区旅行」, 点击后写 <ProgramData>\DcMiniLauncher\menu-<pid>.json 给游戏内 UI。
+// 装不上（特征码不全等）不影响其它功能。卸载时必须先 Uninstall, 返回 false 就不能 FreeLibrary。
+bool        ContextMenuInstall();
+bool        ContextMenuUninstall();
+std::string ContextMenuStatus();
 
 // ---- 命名管道服务端 (pipe.cpp) ----------------------------------------------
 // \\.\pipe\minilauncher-<pid> —— 按 PID 分开, 天然满足「多开不串」

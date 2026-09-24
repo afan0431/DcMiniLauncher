@@ -31,10 +31,10 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
     ///     <c>GET /dctravel/ingame-travel/areas</c> 的钩子 —— 游戏内 UI 用它问「我这个角色现在什么处境」:
     ///     在原始大区就附上能去的大区/服务器和拥挤度（queueTime: 0=通畅, &lt;0=繁忙, &gt;0=排队分钟数）,
     ///     超域中就只报所在地和原始大区。
-    ///     三个字符串参数依次是: 角色名 / 当前世界名 / 原始世界名, 全部由游戏内那侧给
-    ///     （<c>Player.name</c> + <c>FFXIVLib.API.World.GetWorldById</c>）—— 人在哪只有游戏进程知道。
+    ///     角色是谁、人在哪见 <see cref="InGameTravelIdentity" />: 游戏内由 Lua 报,
+    ///     标题/选角界面报不了时启动器改问注入的原生模块。
     /// </summary>
-    public Func<string?, string?, string?, CancellationToken, Task<object>>? InGameTravelAreasProvider { get; set; }
+    public Func<InGameTravelIdentity, CancellationToken, Task<object>>? InGameTravelAreasProvider { get; set; }
 
     /// <summary>
     ///     <c>POST /dctravel/ingame-travel/switch-area</c> 的钩子 —— 换登录大区（标题界面用）。
@@ -311,12 +311,38 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
         /// <summary>角色原始世界名。SDO 的超域业务以它所在的服务器为源。</summary>
         public string? HomeWorld { get; set; }
 
+        /// <summary>
+        ///     角色的 ContentId（选角界面右键菜单给的）。<b>字符串</b>: 它有 17 位,
+        ///     超出 Lua 数字（double）能精确表示的范围, 当数字传会被改掉末几位。
+        /// </summary>
+        public string? ContentId { get; set; }
+
         /// <summary>true = 返回原大区（不需要 area/group，目标记在当初那张跨区订单里）</summary>
         public bool Back { get; set; }
 
         /// <summary>true = 一直等到换完才回应；默认立刻返回, 进度用 /ingame-travel/status 查</summary>
         public bool Wait { get; set; }
+
+        public InGameTravelIdentity Identity => new(Character, World, HomeWorld, Pid, ContentId);
     }
+
+    /// <summary>
+    ///     「这个请求说的是哪个角色、人在哪」。
+    ///     <list type="bullet">
+    ///       <item>游戏内: Lua 报 <see cref="Character" /> / <see cref="World" /> / <see cref="HomeWorld" />（中文世界名）。</item>
+    ///       <item>标题/选角界面: Lua 拿不到 Player, 这三个为空 —— 启动器改问注入的原生模块（WHOLIST）,
+    ///             用 <see cref="ContentId" />（右键菜单给的）或当前选中的角色定位。</item>
+    ///     </list>
+    ///     世界名可以是中文名, 也可以是游戏内部代号（= SDO 的 groupCode, 如 <c>HongChaChuan2</c>）。
+    /// </summary>
+    public sealed record InGameTravelIdentity
+    (
+        string? Character,
+        string? World,
+        string? HomeWorld,
+        int?    Pid,
+        string? ContentId
+    );
 
     /// <summary>
     ///     换登录大区请求。
@@ -453,7 +479,8 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
 
         /// <summary>
         ///     游戏内 UI 问「我现在什么处境」用:
-        ///     <c>?character=名字&amp;world=晨曦王座&amp;homeWorld=红茶川</c>。
+        ///     <c>?character=名字&amp;world=晨曦王座&amp;homeWorld=红茶川&amp;pid=1234</c>（游戏内）,
+        ///     或 <c>?pid=1234&amp;contentId=…</c>（选角界面, 角色由原生模块读）。
         ///     角色一旦超域, 登录大区、原始大区、实际所在大区三者互不相同,
         ///     只有游戏进程自己知道在玩谁、人在哪。
         /// </summary>
@@ -469,10 +496,16 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
 
                 static string? Trim(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
 
-                payload = await provider(Trim(Request.QueryString["character"]),
-                                         Trim(Request.QueryString["world"]),
-                                         Trim(Request.QueryString["homeWorld"]),
-                                         listener.listenerCts.Token).ConfigureAwait(false);
+                var identity = new InGameTravelIdentity
+                (
+                    Trim(Request.QueryString["character"]),
+                    Trim(Request.QueryString["world"]),
+                    Trim(Request.QueryString["homeWorld"]),
+                    int.TryParse(Request.QueryString["pid"], out var pid) ? pid : null,
+                    Trim(Request.QueryString["contentId"])
+                );
+
+                payload = await provider(identity, listener.listenerCts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
