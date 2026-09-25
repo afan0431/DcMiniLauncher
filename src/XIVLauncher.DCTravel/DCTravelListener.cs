@@ -37,6 +37,12 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
     public Func<InGameTravelIdentity, CancellationToken, Task<object>>? InGameTravelAreasProvider { get; set; }
 
     /// <summary>
+    ///     <c>GET /dctravel/ingame-travel/chara-list?pid=</c> 的钩子 —— 选角界面当前的角色列表（原生模块读）。
+    ///     换过大区之后列表整个变了, 右键请求里的旧序号作废, 游戏内那侧按 contentId 在这里查新序号再登录。
+    /// </summary>
+    public Func<int?, CancellationToken, Task<object>>? InGameCharaListProvider { get; set; }
+
+    /// <summary>
     ///     <c>POST /dctravel/ingame-travel/switch-area</c> 的钩子 —— 换登录大区（标题界面用）。
     ///     和超域旅行是两回事: 不动角色、不下单、无冷却。
     /// </summary>
@@ -506,6 +512,28 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
                 );
 
                 payload = await provider(identity, listener.listenerCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                payload = new InGameTravelResponse { Ok = false, Message = UnwrapException(ex).Message };
+            }
+
+            await WriteJsonAsync(payload).ConfigureAwait(false);
+        }
+
+        /// <summary>选角界面当前的角色列表: <c>?pid=1234</c>。contentId 一律是字符串（17 位, 超 Lua double 精度）。</summary>
+        [Route(HttpVerbs.Get, "/ingame-travel/chara-list")]
+        public async Task GetInGameCharaList()
+        {
+            object payload;
+
+            try
+            {
+                var provider = listener.InGameCharaListProvider
+                               ?? throw new InvalidOperationException("本启动器未启用游戏内换大区");
+
+                payload = await provider(int.TryParse(Request.QueryString["pid"], out var pid) ? pid : null,
+                                         listener.listenerCts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

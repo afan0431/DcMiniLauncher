@@ -98,6 +98,8 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
                                                     ? InGameTravelJobs.Get(id) ?? new InGameTravelStatus { Pid = id }
                                                     : (object)InGameTravelJobs.All(),
             InGameTravelAreasProvider  = inGameTravel.QueryTargetsAsync,
+            //   GET  /dctravel/ingame-travel/chara-list    选角列表(原生模块读), 换大区后按 contentId 查新序号
+            InGameCharaListProvider    = InGameTravelCoordinator.QueryCharaListAsync,
             //   POST /dctravel/ingame-travel/switch-area   换登录大区(标题界面): 不动角色、不下单、无冷却
             //   GET  /dctravel/ingame-travel/login-areas   可切换的大区列表
             InGameSwitchAreaHandler    = inGameTravel.HandleSwitchAreaAsync,

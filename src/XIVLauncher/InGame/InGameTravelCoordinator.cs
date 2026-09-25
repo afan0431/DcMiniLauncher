@@ -140,6 +140,37 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     }
 
     /// <summary>
+    ///     选角界面当前的角色列表。<c>listIndex</c> 就是它在列表里的位置（Minion 的 SelectCharacter 按它选）。
+    ///     只有 <c>where=charaselect</c> 时列表可信 —— 标题界面里留着的是换大区之前那份。
+    /// </summary>
+    public static async Task<object> QueryCharaListAsync(int? pid, CancellationToken cancellationToken)
+    {
+        var (snapshot, error) = await CharaSelectReader.ReadAsync(pid, cancellationToken).ConfigureAwait(false);
+
+        if (snapshot == null)
+            return new { ok = false, message = error ?? "读不到选角列表" };
+
+        return new
+        {
+            ok       = true,
+            where    = snapshot.Where,
+            selected = snapshot.SelectedContentId,
+            characters = snapshot.Entries.Select((entry, listIndex) => new
+            {
+                contentId      = entry.ContentId,
+                name           = entry.Name,
+                listIndex,
+                entryIndex     = entry.Index,
+                loginFlags     = entry.LoginFlags,
+                currentWorldId = entry.CurrentWorldId,
+                homeWorldId    = entry.HomeWorldId,
+                currentWorld   = entry.CurrentWorldCode,
+                homeWorld      = entry.HomeWorldCode
+            })
+        };
+    }
+
+    /// <summary>
     ///     换登录大区（标题界面用）。<b>和超域旅行是两回事</b>: 只换用哪个大厅登录,
     ///     不动任何角色、不产生 SDO 订单、没有 60 秒冷却。所以这里不需要知道角色是谁,
     ///     也不需要查任何服务器 —— 只要目标大区的名字。
