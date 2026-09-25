@@ -441,7 +441,8 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
                 var request = JsonSerializer.Deserialize<InGameTravelRequest>(body, SerializerOptions)
                               ?? throw new InvalidOperationException("无效的请求负载");
 
-                if (string.IsNullOrWhiteSpace(request.Area))
+                // 超域返回不需要目标: 目的地记在当初那张跨区订单里（见 InGameTravelRequest.Back）
+                if (!request.Back && string.IsNullOrWhiteSpace(request.Area))
                     throw new InvalidOperationException("缺少目标大区 area");
 
                 Log.Information("[DCTravelListener] 收到游戏内换大区请求: area={Area} group={Group} pid={Pid}",

@@ -322,7 +322,7 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
 
                 result = leg.IsBack
                              ? await service.TravelBackAsync(gameProcess, context.SourceGroup!, context.ReturnOrderId!,
-                                                             context.TargetArea!, progress, CancellationToken.None).ConfigureAwait(false)
+                                                             context.TargetArea!, context.CharacterName, progress, CancellationToken.None).ConfigureAwait(false)
                              : await service.TravelAsync(gameProcess, context.SourceGroup!, context.TargetGroup!,
                                                          context.Character!, context.TargetArea!, progress, CancellationToken.None).ConfigureAwait(false);
 
@@ -433,7 +433,11 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             GroupCode = string.Empty
         };
 
-        return new TravelContext(state.CurrentGroup, homeGroup, null, homeArea, null) { ReturnOrderId = order.OrderID };
+        return new TravelContext(state.CurrentGroup, homeGroup, null, homeArea, null)
+        {
+            ReturnOrderId = order.OrderID,
+            CharacterName = state.Name
+        };
     }
 
     private sealed record TravelContext
@@ -447,6 +451,9 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     {
         /// <summary>「返回原大区」时要提交的那张跨区订单号</summary>
         public string? ReturnOrderId { get; init; }
+
+        /// <summary>跨完区在选角界面切到这个角色所在的服务器。返回单没有 <see cref="Character" />, 单独带名字。</summary>
+        public string? CharacterName { get; init; }
 
         public static TravelContext Failed(string error) => new(null, null, null, null, error);
     }

@@ -142,6 +142,10 @@ namespace
         if (command == "KEEPALIVE OFF")
             return GameKeepAlive(false);
 
+        // 角色名可能带空格（外服那种「名 姓」）, 所以整行剩下的都算参数, 不走下面的 Split
+        if (command.rfind("FOCUSCHARA ", 0) == 0)
+            return GameFocusCharacter(command.substr(11));
+
         const auto parts = Split(command);
 
         if (!parts.empty() && parts[0] == "SETHOSTS")

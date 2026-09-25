@@ -1,4 +1,4 @@
-// 选角界面右键菜单: 给角色加一项「跨区旅行」
+// 选角界面右键菜单: 给角色加「超域传送」, 超域中的角色再加「超域返回」
 //
 // 行为照抄 DCTraveler（Managers/ContextMenuManager.cs）: 只在角色选择界面、默认类型的右键菜单里出现,
 // 右键的是哪个角色看 AgentLobby.SelectedCharacterIndex / SelectedCharacterContentId。
@@ -33,9 +33,11 @@ namespace
     using SetManagedStrFn   = void (*)(void* atkValue, const char* value);
     using FireCallbackIntFn = bool (*)(void* addon, int value);
 
-    // 「跨区旅行」前面带 DCTraveler 同款的跨服图标（U+E05D）和颜色 34:
+    // 前面带 DCTraveler 同款的跨服图标（U+E05D）和颜色 34:
     //   UIForeground(34) = 02 48 02 23 03, 图标 EE 81 9D, 空格, UIForeground(0) = 02 48 02 01 03
-    constexpr char MENU_LABEL[] = "\x02\x48\x02\x23\x03\xEE\x81\x9D\x20\x02\x48\x02\x01\x03" "跨区旅行";
+    // 用词按国服官方: 超域传送 / 超域返回
+    constexpr char MENU_LABEL_TRAVEL[] = "\x02\x48\x02\x23\x03\xEE\x81\x9D\x20\x02\x48\x02\x01\x03" "超域传送";
+    constexpr char MENU_LABEL_BACK[]   = "\x02\x48\x02\x23\x03\xEE\x81\x9D\x20\x02\x48\x02\x01\x03" "超域返回";
 
     uintptr_t g_atkStageStatic  = 0;
     uintptr_t g_getAddonByName  = 0;
@@ -54,8 +56,10 @@ namespace
     std::atomic<bool> g_installed {false};
 
     // 当前打开的那个菜单是不是加了我们的项、我们的项排第几（= 游戏原有项数）
+    // 追加了几项: 1 =「超域传送」; 2 = 再加「超域返回」（超域中的角色）
     bool g_ours        = false;
     int  g_nativeCount = 0;
+    int  g_addedCount  = 0;
 
     std::atomic<int> g_opens  {0};
     std::atomic<int> g_clicks {0};
@@ -294,8 +298,13 @@ namespace
         if (native <= 0 || native > 30 || (rest != 0 && rest != native))
             return false;
 
+        // 超域中（LoginFlags 16/32, 与 DCTraveler 同判据）多给一项「超域返回」
+        const bool traveling = character.loginFlags == offsets::LOGIN_FLAG_DC_TRAVELING ||
+                               character.loginFlags == offsets::LOGIN_FLAG_UNK32;
+        const int  added     = traveling ? 2 : 1;
+
         const bool hasDisabled = rest == native;
-        const int  newCount    = (native + 1) * (hasDisabled ? 2 : 1) + offsets::CONTEXT_MENU_HEADER_COUNT;
+        const int  newCount    = (native + added) * (hasDisabled ? 2 : 1) + offsets::CONTEXT_MENU_HEADER_COUNT;
         const auto size        = static_cast<unsigned long long>(newCount) * offsets::ATK_VALUE_SIZE + 8;
 
         const auto space = reinterpret_cast<GetUISpaceFn>(g_getUISpace)();
@@ -316,21 +325,28 @@ namespace
         // 头 + 原有各项名字原样搬（按位拷, 与 Dalamud 一致; 托管串指针跟着走, 不重复释放）
         memcpy(fresh, values, static_cast<size_t>(head + native) * offsets::ATK_VALUE_SIZE);
 
-        // 原有的置灰表整体后移一格（名字多了一项）, 我们那一项不置灰
+        // 原有的置灰表整体后移 added 格（名字多了 added 项）, 我们的项都不置灰
         if (hasDisabled)
         {
-            memcpy(ValueAt(fresh, head + native + 1), ValueAt(values, head + native),
+            memcpy(ValueAt(fresh, head + native + added), ValueAt(values, head + native),
                    static_cast<size_t>(native) * offsets::ATK_VALUE_SIZE);
 
-            auto* flag = ValueAt(fresh, head + (native + 1) + native);
-            *reinterpret_cast<unsigned*>(flag)     = offsets::ATK_VALUE_TYPE_INT;
-            *reinterpret_cast<int*>(flag + 8)      = 0;
+            for (int i = 0; i < added; ++i)
+            {
+                auto* flag = ValueAt(fresh, head + (native + added) + native + i);
+                *reinterpret_cast<unsigned*>(flag) = offsets::ATK_VALUE_TYPE_INT;
+                *reinterpret_cast<int*>(flag + 8)  = 0;
+            }
         }
 
-        // 新项的名字: 此时它的 Type 是 0（刚 memset）, SetManagedString 会分配并拷贝
-        reinterpret_cast<SetManagedStrFn>(g_setManagedStr)(ValueAt(fresh, head + native), MENU_LABEL);
+        // 新项的名字: 此时 Type 是 0（刚 memset）, SetManagedString 会分配并拷贝
+        const auto setString = reinterpret_cast<SetManagedStrFn>(g_setManagedStr);
+        setString(ValueAt(fresh, head + native), MENU_LABEL_TRAVEL);
 
-        *reinterpret_cast<unsigned*>(fresh + 8) = static_cast<unsigned>(native + 1);
+        if (traveling)
+            setString(ValueAt(fresh, head + native + 1), MENU_LABEL_BACK);
+
+        *reinterpret_cast<unsigned*>(fresh + 8) = static_cast<unsigned>(native + added);
 
         out->block  = block;
         out->size   = size;
@@ -339,6 +355,7 @@ namespace
 
         g_pending     = character;
         g_nativeCount = native;
+        g_addedCount  = added;
         g_ours        = true;
         return true;
     }
@@ -427,8 +444,8 @@ namespace
             PatchContextMenuOnce();
 
             ++g_opens;
-            LogF("[menu] 选角右键菜单: 追加「跨区旅行」为第 %d 项, 角色=%s cid=%llu",
-                 g_nativeCount, g_pending.name, g_pending.contentId);
+            LogF("[menu] 选角右键菜单: 从第 %d 项起追加 %d 项（超域传送%s）, 角色=%s cid=%llu",
+                 g_nativeCount, g_addedCount, g_addedCount > 1 ? " + 超域返回" : "", g_pending.name, g_pending.contentId);
         }
 
         g_inside.fetch_sub(1);
@@ -480,7 +497,8 @@ namespace
     //
     // contentId 用字符串: 17 位, 超出 Lua 数字（double）的精确范围。
     // seq 用当前时间（毫秒）, 模块重载后也单调递增, 读的一方按 seq 去重。
-    bool WriteRequest(const Character& character)
+    // action: "travel" = 超域传送（打开面板选目的地）; "back" = 超域返回（回原始大区, 不用选）
+    bool WriteRequest(const Character& character, const char* action)
     {
         FILETIME now{};
         GetSystemTimeAsFileTime(&now);
@@ -488,9 +506,9 @@ namespace
 
         char head[256];
         _snprintf_s(head, sizeof(head), _TRUNCATE,
-                    "{\"seq\":%llu,\"action\":\"travel\",\"pid\":%lu,\"contentId\":\"%llu\",\"loginFlags\":%u,"
+                    "{\"seq\":%llu,\"action\":\"%s\",\"pid\":%lu,\"contentId\":\"%llu\",\"loginFlags\":%u,"
                     "\"currentWorldId\":%u,\"homeWorldId\":%u,\"listIndex\":%d,\"entryIndex\":%u,",
-                    seq, GetCurrentProcessId(), character.contentId, character.loginFlags,
+                    seq, action, GetCurrentProcessId(), character.contentId, character.loginFlags,
                     character.currentWorldId, character.homeWorldId, character.listIndex, character.entryIndex);
 
         std::string json = head;
@@ -548,15 +566,17 @@ namespace
 
         bool result;
 
-        if (g_ours && index == g_nativeCount)
+        if (g_ours && index >= g_nativeCount && index < g_nativeCount + g_addedCount)
         {
             g_ours = false;
             ++g_clicks;
 
-            LogF("[menu] 点了「跨区旅行」: %s (当前=%s 原始=%s flags=%u)",
+            const bool back = index == g_nativeCount + 1;
+
+            LogF("[menu] 点了「%s」: %s (当前=%s 原始=%s flags=%u)", back ? "超域返回" : "超域传送",
                  g_pending.name, g_pending.currentWorld, g_pending.homeWorld, g_pending.loginFlags);
 
-            WriteRequest(g_pending);
+            WriteRequest(g_pending, back ? "back" : "travel");
             CloseMenuGuarded(addon);
             result = false;
         }

@@ -93,6 +93,7 @@ public sealed class InGameTravelService(DCTravelClient client)
                            gameProcess,
                            targetArea,
                            ct => SubmitWithRetryAsync(sourceGroup, targetGroup, character, progress, ct),
+                           character.Name,
                            progress,
                            cancellationToken
                        ).ConfigureAwait(false);
@@ -115,6 +116,7 @@ public sealed class InGameTravelService(DCTravelClient client)
         DCTravelGroup      currentGroup,
         string             returnOrderId,
         LoginArea          homeArea,
+        string?            characterName,
         IProgress<string>? progress,
         CancellationToken  cancellationToken
     )
@@ -136,6 +138,7 @@ public sealed class InGameTravelService(DCTravelClient client)
                            gameProcess,
                            homeArea,
                            ct => SubmitReturnAsync(currentGroup, returnOrderId, progress, ct),
+                           characterName,
                            progress,
                            cancellationToken
                        ).ConfigureAwait(false);
@@ -182,6 +185,7 @@ public sealed class InGameTravelService(DCTravelClient client)
                            targetArea,
                            // 在线那半空跑 —— 换登录大区不下单
                            _ => Task.FromResult<string?>(null),
+                           null, // 换登录大区不针对哪个角色
                            progress,
                            cancellationToken
                        ).ConfigureAwait(false);
@@ -233,6 +237,7 @@ public sealed class InGameTravelService(DCTravelClient client)
         Process                                            gameProcess,
         LoginArea                                          targetArea,
         Func<CancellationToken, Task<string?>>             submitAsync,
+        string?                                            focusCharacter,
         IProgress<string>?                                 progress,
         CancellationToken                                  cancellationToken
     )
@@ -327,6 +332,12 @@ public sealed class InGameTravelService(DCTravelClient client)
             // 6. 点「开始游戏」
             Report(progress, "正在重新登录…");
             await CommandAsync(module, "LOGIN", cancellationToken).ConfigureAwait(false);
+
+            // 7. 进了选角界面切到角色现在所在的服务器 —— 游戏默认显示它自己记住的那个,
+            //    跨完区角色常常不在那里（用户实测: 拂晓之间 → 水晶塔, 进来停在别的服务器）。
+            //    这一步失败不影响跨区结果, 只记日志。
+            if (!string.IsNullOrWhiteSpace(focusCharacter))
+                await FocusCharacterAsync(module, focusCharacter, progress, cancellationToken).ConfigureAwait(false);
 
             Log.Information("[InGameTravel] 完成: {Area} (PID={Pid} 全程未变)", targetArea.AreaName, gameProcess.Id);
             return InGameTravelResult.Succeeded(targetArea.AreaName);
@@ -564,6 +575,73 @@ public sealed class InGameTravelService(DCTravelClient client)
         }
 
         return "等待传送结果超时, 订单可能仍在处理, 可稍后在历史记录中确认";
+    }
+
+    /// <summary>
+    ///     跨完区后: 等进角色选择界面, 再把左侧服务器切到这个角色现在所在的那个（模块的 FOCUSCHARA）。
+    ///     做法抄 DailyRoutines 的 AutoLogin.SelectWorld; DCTraveler 不做这一步。
+    ///     整段都是锦上添花 —— 任何失败只记日志, 不影响跨区结果。
+    /// </summary>
+    private static async Task FocusCharacterAsync(MiniModuleClient module, string character, IProgress<string>? progress, CancellationToken cancellationToken)
+    {
+        try
+        {
+            // LOGIN 之后要连大厅、拉角色列表, 一般几秒; 大厅排队时更久
+            var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(90);
+            var arrived  = false;
+
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                var where = await module.SendAsync("WHERE", cancellationToken).ConfigureAwait(false);
+
+                if (where.Contains("where=charaselect", StringComparison.Ordinal))
+                {
+                    arrived = true;
+                    break;
+                }
+
+                await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!arrived)
+            {
+                Log.Warning("[InGameTravel] 90 秒内没进角色选择界面, 不切服务器");
+                return;
+            }
+
+            Report(progress, $"正在切到 {character} 所在的服务器…");
+
+            // 刚进界面时角色列表 / 服务器列表可能还没载入完, 给几次重试
+            for (var attempt = 0; attempt < 10; ++attempt)
+            {
+                var response = await module.SendAsync($"FOCUSCHARA {character}", cancellationToken).ConfigureAwait(false);
+
+                if (response.StartsWith("OK", StringComparison.Ordinal))
+                {
+                    Log.Information("[InGameTravel] 选角界面已定位到 {Character}: {Response}", character, response);
+                    return;
+                }
+
+                if (!response.Contains("not-in-list", StringComparison.Ordinal) &&
+                    !response.Contains("no-world-list", StringComparison.Ordinal))
+                {
+                    Log.Warning("[InGameTravel] 切服务器失败（不影响跨区）: {Response}", response);
+                    return;
+                }
+
+                await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
+            }
+
+            Log.Warning("[InGameTravel] 选角列表里一直找不到 {Character}, 不切服务器", character);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[InGameTravel] 切服务器时出错（不影响跨区）");
+        }
     }
 
     private static async Task<bool> WaitForTitleAsync(MiniModuleClient module, IProgress<string>? progress, CancellationToken cancellationToken)

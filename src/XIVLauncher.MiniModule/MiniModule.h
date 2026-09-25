@@ -53,6 +53,7 @@ std::string GameDump();    // 只读诊断: 摊开 Utf8String 头部 + 在 Netwo
 std::string GameReturnToTitle();
 std::string GameWhere();     // ingame / charaselect / title / busy(片头动画·读盘·过场)
 std::string GameWhoList();   // 选角列表（名字/ContentId/世界/LoginFlags）+ 当前界面; 格式见 game.cpp
+std::string GameFocusCharacter(const std::string& who); // 选角界面切到该角色（名字或 ContentId）所在的服务器
 std::string GameSkipMovie(); // 给游戏窗口投 ESC 结束片头动画, 等到界面可操作为止
 // 游戏内登出到角色选择界面。direct=false 走 /logout 文本命令 + 确认框（等同玩家操作, 最保守);
 // direct=true 直接调 AgentLobby::HandleLogout（更底层, 不弹确认框)

@@ -1075,6 +1075,172 @@ namespace
     }
 }
 
+// =============================================================================
+// FOCUSCHARA —— 选角界面切到「这个角色现在所在的服务器」
+//
+// WHY: 跨完大区点「开始游戏」进选角界面, 游戏显示的是它自己记住的服务器, 不一定是角色刚到的那个
+//      （用户实测: 拂晓之间跨到水晶塔, 进来却停在别的服务器, 角色列表里看不到它）。
+// DCTraveler 不管这件事; 做法抄 DailyRoutines 的 AutoLogin.SelectWorld。
+// =============================================================================
+
+namespace
+{
+    using FireCallbackFn = bool (*)(void* addon, unsigned int count, void* values, bool close);
+
+    uintptr_t g_fireCallback = 0;
+
+    struct FocusResult
+    {
+        int            status;      // 2=已切换 1=本来就是 0=列表里没这个角色 -1=异常 -2=服务器列表不在 -3=没找到那个服务器
+        unsigned short targetWorld;
+        unsigned short beforeWorld;
+        int            slot;
+    };
+
+    // AtkValue{ Int }: +0 Type(u32)=3, +8 值
+    void SetIntValue(uint8_t* value, int number)
+    {
+        memset(value, 0, offsets::ATK_VALUE_SIZE);
+        *reinterpret_cast<unsigned*>(value) = offsets::ATK_VALUE_TYPE_INT;
+        *reinterpret_cast<int*>(value + 8)  = number;
+    }
+
+    bool FireWorldServer(void* addon, int eventId, int slot)
+    {
+        uint8_t values[3 * offsets::ATK_VALUE_SIZE];
+        SetIntValue(values,                              eventId);
+        SetIntValue(values + offsets::ATK_VALUE_SIZE,     0);
+        SetIntValue(values + 2 * offsets::ATK_VALUE_SIZE, slot);
+
+        return reinterpret_cast<FireCallbackFn>(g_fireCallback)(addon, 3, values, true);
+    }
+
+    void OpFocusCharacter(const Pointers* p, const char* name, unsigned long long contentId, FocusResult* out)
+    {
+        memset(out, 0, sizeof(FocusResult));
+
+        __try
+        {
+            const auto lobby = reinterpret_cast<uint8_t*>(p->agentLobby);
+            const auto first = ReadAt<uint8_t**>(lobby + offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES, offsets::STD_VECTOR_FIRST);
+            const auto last  = ReadAt<uint8_t**>(lobby + offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES, offsets::STD_VECTOR_LAST);
+
+            if (first == nullptr || last == nullptr || last <= first || last - first > 1000)
+                return; // status 0: 列表还没载入
+
+            uint8_t* entry = nullptr;
+
+            for (auto it = first; it < last && entry == nullptr; ++it)
+            {
+                if (*it == nullptr)
+                    continue;
+
+                const bool match = contentId != 0
+                                       ? ReadAt<unsigned long long>(*it, offsets::CHARA_ENTRY_CONTENT_ID) == contentId
+                                       : strncmp(reinterpret_cast<const char*>(*it + offsets::CHARA_ENTRY_NAME), name,
+                                                 offsets::CHARA_ENTRY_NAME_LEN) == 0;
+                if (match)
+                    entry = *it;
+            }
+
+            if (entry == nullptr)
+                return;
+
+            out->targetWorld = ReadAt<unsigned short>(entry, offsets::CHARA_ENTRY_CURRENT_WORLD);
+            out->beforeWorld = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_WORLD_ID);
+
+            if (out->beforeWorld == out->targetWorld)
+            {
+                out->status = 1;
+                return;
+            }
+
+            const auto find  = reinterpret_cast<GetAddonByNameFn>(g_getAddonByName);
+            const auto addon = find(p->unitManager, "_CharaSelectWorldServer", 1);
+
+            if (addon == nullptr)
+            {
+                out->status = -2;
+                return;
+            }
+
+            for (int slot = 0; slot < offsets::WORLD_SERVER_MAX_ENTRIES; ++slot)
+            {
+                FireWorldServer(addon, offsets::WORLD_SERVER_EVENT_HOVER, slot);
+
+                if (ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_WORLD_ID) == out->targetWorld)
+                {
+                    FireWorldServer(addon, offsets::WORLD_SERVER_EVENT_CONFIRM, slot);
+                    out->slot   = slot;
+                    out->status = 2;
+                    return;
+                }
+            }
+
+            out->status = -3;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] FOCUSCHARA 异常 code=0x%08X", GetExceptionCode());
+            out->status = -1;
+        }
+    }
+}
+
+// 参数: 角色名, 或纯数字的 ContentId
+std::string GameFocusCharacter(const std::string& who)
+{
+    if (who.empty())
+        return "FAIL usage: FOCUSCHARA <角色名|contentId>";
+
+    if (g_fireCallback == 0)
+        g_fireCallback = ScanText(offsets::FIRE_CALLBACK_SIG);
+
+    if (g_fireCallback == 0)
+        return "FAIL sigscan-failed";
+
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareCall(state, failure))
+        return failure;
+
+    if (state->pointers.unitManager == nullptr)
+        return "FAIL no-unit-manager";
+
+    const bool numeric   = who.find_first_not_of("0123456789") == std::string::npos;
+    const auto contentId = numeric ? _strtoui64(who.c_str(), nullptr, 10) : 0ULL;
+
+    auto result   = std::make_shared<FocusResult>();
+    auto name     = std::make_shared<std::string>(who);
+    auto captured = state;
+
+    if (!MainThreadRun([captured, result, name, contentId]
+        {
+            OpFocusCharacter(&captured->pointers, name->c_str(), contentId, result.get());
+        }, 3000))
+        return "FAIL mainthread-timeout";
+
+    LogF("[game] FOCUSCHARA %s → status=%d world %u→%u slot=%d",
+         who.c_str(), result->status, result->beforeWorld, result->targetWorld, result->slot);
+
+    char response[128];
+
+    switch (result->status)
+    {
+        case 2:
+            _snprintf_s(response, sizeof(response), _TRUNCATE, "OK switched world=%u slot=%d", result->targetWorld, result->slot);
+            return response;
+        case 1:
+            _snprintf_s(response, sizeof(response), _TRUNCATE, "OK already world=%u", result->targetWorld);
+            return response;
+        case 0:  return "FAIL not-in-list";       // 列表还没载入 / 没这个角色 —— 调用方可稍后重试
+        case -2: return "FAIL no-world-list";     // 不在角色选择界面
+        case -3: return "FAIL world-not-listed";  // 目标服务器不在当前大区的服务器列表里
+        default: return "FAIL exception";
+    }
+}
+
 // 响应格式（第一行是摘要, 之后每个角色一行, 字段用 \t 分隔）:
 //   OK where=charaselect n=3 total=3 selected=<cid> selectedIndex=0 hovered=<cid> hoveredIndex=-1
 //   C  <contentId>  <index>  <loginFlags>  <curWorldId>  <homeWorldId>  <名字>  <当前世界名>  <原始世界名>

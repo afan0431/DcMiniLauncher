@@ -60,6 +60,15 @@ namespace offsets
     inline constexpr uintptr_t AGENT_LOBBY_HOVERED_CONTENT_ID     = 0x1248; // :40 ulong
     inline constexpr uintptr_t AGENT_LOBBY_HOVERED_CHARA_INDEX    = 0x12CD; // :70 sbyte
     inline constexpr uintptr_t AGENT_LOBBY_SELECTED_CONTENT_ID    = 0x12D0; // :72 ulong
+    inline constexpr uintptr_t AGENT_LOBBY_WORLD_ID               = 0x1254; // :44 ushort, 选角界面当前选中的服务器
+
+    // 选角界面切服务器（FOCUSCHARA）—— 做法抄 DailyRoutines Modules/General/AutoLogin.cs SelectWorld:
+    //   对 _CharaSelectWorldServer 逐个发 Callback(9, 0, i), 发完看 AgentLobby.WorldId 对上了就再发 Callback(10, 0, i)
+    // AtkUnitBase::FireCallback(uint valueCount, AtkValue* values, bool close) —— AtkUnitBase.cs:217
+    inline constexpr const char* FIRE_CALLBACK_SIG           = "E8 ?? ?? ?? ?? 0F B6 E8 8B 44 24 20";
+    inline constexpr int         WORLD_SERVER_EVENT_HOVER    = 9;
+    inline constexpr int         WORLD_SERVER_EVENT_CONFIRM  = 10;
+    inline constexpr int         WORLD_SERVER_MAX_ENTRIES    = 16;
 
     // CharaSelectCharacterEntry (:131, Size 0x6F8)
     inline constexpr uintptr_t CHARA_ENTRY_CONTENT_ID      = 0x08;  // ulong = SDO 的 roleId
