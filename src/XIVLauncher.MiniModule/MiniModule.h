@@ -73,7 +73,7 @@ std::string GameKeepAlive(bool enable);
 void GameStopKeepAlive();
 
 // ---- 选角界面右键菜单 (contextmenu.cpp) -------------------------------------
-// 右键角色多一项「跨区旅行」, 点击后写 <ProgramData>\DcMiniLauncher\menu-<pid>.json 给游戏内 UI。
+// 右键角色多一项「超域传送」（超域中再加「超域返回」）, 点击后写 <ProgramData>\DcMiniLauncher\menu-<pid>.json 给游戏内 UI。
 // 装不上（特征码不全等）不影响其它功能。卸载时必须先 Uninstall, 返回 false 就不能 FreeLibrary。
 bool        ContextMenuInstall();
 bool        ContextMenuUninstall();
