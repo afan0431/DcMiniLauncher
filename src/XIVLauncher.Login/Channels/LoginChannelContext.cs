@@ -1,4 +1,5 @@
 using System.Net;
+using System.Runtime.ExceptionServices;
 using Newtonsoft.Json;
 using Serilog;
 using XIVLauncher.Account.DeviceProfiles;
@@ -320,7 +321,15 @@ public sealed class LoginChannelContext
     {
         try
         {
-            var result = JsonConvert.DeserializeObject<LoginResponse>(reply)!;
+            var result = JsonConvert.DeserializeObject<LoginResponse>(reply)
+                         ?? throw new InvalidDataException($"{endPoint} 返回了空响应: {reply}");
+
+            if (result.Data == null)
+            {
+                Log.Warning("{EndPoint} 响应缺少 data 字段: {Reply}", endPoint, reply);
+                result.Data = new LoginResponse.LoginResponseData();
+            }
+
             Log.Information
             (
                 "{EndPoint}:ErrorType={ResultErrorType}:ReturnCode={ResultReturnCode}:FailReason:{DataFailReason}:NextAction={DataNextAction}",
@@ -468,7 +477,7 @@ public sealed class LoginChannelContext
                 var       reply    = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
                 return DeserializeLoginResponse(endPoint, reply);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException && attempt == 0 && TrySwitchToFallbackDomain(ex))
+            catch (Exception ex) when (attempt == 0 && IsNetworkException(ex, cancellationToken) && TrySwitchToFallbackDomain(ex))
             {
             }
             catch (Exception ex)
@@ -478,8 +487,16 @@ public sealed class LoginChannelContext
             }
         }
 
-        throw lastException ?? new InvalidOperationException("Failed to request SDO login endpoint");
+        if (lastException != null)
+            ExceptionDispatchInfo.Throw(lastException);
+
+        throw new InvalidOperationException("Failed to request SDO login endpoint");
     }
+
+    // 只有连接失败、读流失败或请求超时才值得换域名；解析错误换域名也没用，反而会让本次运行后续请求都走备用域名
+    private static bool IsNetworkException(Exception ex, CancellationToken cancellationToken) =>
+        ex is HttpRequestException or IOException
+        || (ex is TaskCanceledException && !cancellationToken.IsCancellationRequested);
 
     private bool TrySwitchToFallbackDomain(Exception ex)
     {

@@ -1,4 +1,5 @@
 using System.Text;
+using Serilog;
 using XIVLauncher.Login.Client;
 using XIVLauncher.Login.Exceptions;
 using XIVLauncher.Login.Models;
@@ -76,15 +77,31 @@ public sealed class StaticLoginChannel
     {
         request.ShowLoginMessage?.Invoke("检测到安全手机验证，正在准备短信验证流程…");
 
-        _ = await context.GetSafePhoneSystemConfigAsync(cancellationToken).ConfigureAwait(false);
+        // 下发短信流程走不通时（接口报错、回包异常、没有 flowId），直接把 staticLogin 的原始风控提示抛给用户，
+        // 例如「通过安全手机发送短信 XXXXXX 至 106…」这类上行短信提示
+        var riskException = new LoginException(staticLoginResponse.ReturnCode, staticLoginResponse.Data.FailReason);
 
-        var initResult = await context.InitSafePhoneSmsLoginAsync(request.Account, staticLoginResponse.Data.FlowId, cancellationToken: cancellationToken).ConfigureAwait(false);
-        if (initResult.ReturnCode != 0 || initResult.ErrorType != 0)
-            throw new LoginException(initResult.ReturnCode, initResult.Data.FailReason);
+        LoginResponse initResult;
+        try
+        {
+            _ = await context.GetSafePhoneSystemConfigAsync(cancellationToken).ConfigureAwait(false);
+            initResult = await context.InitSafePhoneSmsLoginAsync(request.Account, staticLoginResponse.Data.FlowId, cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException && !string.IsNullOrWhiteSpace(staticLoginResponse.Data.FailReason))
+        {
+            Log.Error(ex, "[StaticLoginChannel] 安全手机短信流程初始化失败，改为直接提示风控信息");
+            throw riskException;
+        }
 
         var flowId = initResult.Data.FlowId ?? staticLoginResponse.Data.FlowId;
-        if (string.IsNullOrWhiteSpace(flowId))
-            throw new LoginException((int)LoginExceptionCode.RiskEnvironment, "检测到安全手机验证，但服务端没有返回可用的验证流程标识。");
+        if (initResult.ReturnCode != 0 || initResult.ErrorType != 0 || string.IsNullOrWhiteSpace(flowId))
+        {
+            if (!string.IsNullOrWhiteSpace(staticLoginResponse.Data.FailReason))
+                throw riskException;
+
+            throw new LoginException(initResult.ReturnCode != 0 ? initResult.ReturnCode : (int)LoginExceptionCode.RiskEnvironment,
+                                     initResult.Data.FailReason ?? "检测到安全手机验证，但服务端没有返回可用的验证流程标识。");
+        }
 
         if (RequiresCaptchaChallenge(initResult))
             throw new LoginException((int)LoginExceptionCode.RiskEnvironment, BuildCaptchaRequiredMessage(initResult));
