@@ -4,6 +4,7 @@ using System.Windows.Media;
 using System.Windows.Media.Animation;
 using Serilog;
 using XIVLauncher.Account;
+using XIVLauncher.CatHost;
 using XIVLauncher.Dalamud;
 using XIVLauncher.Settings;
 using XIVLauncher.Startup;
@@ -80,6 +81,12 @@ public partial class App
         StartupEventArgs e
     )
     {
+        if (CatHostMode.IsActive)
+        {
+            await RunCatHostAsync();
+            return;
+        }
+
         try
         {
             orchestrator   = new(Dispatcher);
@@ -129,6 +136,13 @@ public partial class App
     {
         if (e.Observed) return;
 
+        if (CatHostMode.IsActive)
+        {
+            CatHostRuntime.HandleUnobserved(e.Exception);
+            e.SetObserved();
+            return;
+        }
+
         OnUnhandledException(sender, new UnhandledExceptionEventArgs(e.Exception, true));
     }
 
@@ -136,7 +150,14 @@ public partial class App
     (
         object?                     sender,
         UnhandledExceptionEventArgs e
-    ) =>
+    )
+    {
+        if (CatHostMode.IsActive)
+        {
+            CatHostRuntime.HandleFatal((Exception)e.ExceptionObject);
+            return;
+        }
+
         Dispatcher.Invoke
         (() =>
             {
@@ -165,6 +186,7 @@ public partial class App
                 Environment.Exit(-1);
             }
         );
+    }
 
     #endregion
 

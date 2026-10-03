@@ -215,16 +215,23 @@ public static class MinionAccounts
 
     /// <summary>
     ///     按启动页选中的分组与账号 UID 取账号 —— 挂 Minion（F3）时用。
-    ///     UID 对不上（Accounts.json 改过）就退回该分组的第一个账号, 免得配置一变就挂不上。
+    ///     UID 对不上（Accounts.json 改过）返回 null, 不退回分组里的其它账号: 换一张卡挂上去可能把正在别处用的卡顶掉。
     /// </summary>
-    public static MinionAccount? FindAccount(string? group, string? uid, string? installPath = null)
-    {
-        var accountsInGroup = LoadAccounts(installPath)
-                              .Where(account => string.Equals(account.Group?.Trim(), group?.Trim(), StringComparison.OrdinalIgnoreCase))
-                              .ToList();
+    public static MinionAccount? FindAccount(string? group, string? uid, string? installPath = null) =>
+        FindAccount(LoadAccounts(installPath), group, uid);
 
-        return accountsInGroup.FirstOrDefault(account => string.Equals(account.Uid, uid, StringComparison.OrdinalIgnoreCase))
-               ?? accountsInGroup.FirstOrDefault();
+    /// <summary>
+    ///     在给定的账号列表里按分组与 UID 精确查找, 找不到返回 null
+    /// </summary>
+    public static MinionAccount? FindAccount(IEnumerable<MinionAccount> accounts, string? group, string? uid)
+    {
+        if (string.IsNullOrWhiteSpace(uid))
+            return null;
+
+        return accounts.FirstOrDefault
+        (account => string.Equals(account.Group?.Trim(), group?.Trim(), StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(account.Uid, uid, StringComparison.OrdinalIgnoreCase)
+        );
     }
 
     private static string? ReadString(JsonElement element, string propertyName)

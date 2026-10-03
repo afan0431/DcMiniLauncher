@@ -80,19 +80,54 @@ public static class MinionAttacher
     {
         var installPath = MinionAccounts.InstallPath;
 
-        MinionAccount? account;
+        IReadOnlyList<MinionAccount> accounts;
 
         try
         {
-            account = MinionAccounts.FindAccount(App.Settings.MinionGroup, App.Settings.MinionAccountUid, installPath);
+            accounts = MinionAccounts.LoadAccounts(installPath);
         }
         catch (Exception ex)
         {
             return MinionAttachResult.Failed($"读取 {MinionAccounts.GetAccountsJsonPath(installPath)} 失败: {ex.Message}");
         }
 
+        var group   = App.Settings.MinionGroup;
+        var account = MinionAccounts.FindAccount(accounts, group, App.Settings.MinionAccountUid);
+
         if (account == null)
-            return MinionAttachResult.Failed($"Minion 分组 {App.Settings.MinionGroup ?? "(未选择)"} 下没有账号, 请在启动页重新选择分组");
+        {
+            var hasAccountsInGroup = accounts.Any(x => string.Equals(x.Group?.Trim(), group?.Trim(), StringComparison.OrdinalIgnoreCase));
+
+            return MinionAttachResult.Failed
+            (
+                hasAccountsInGroup
+                    ? $"启动页选中的 Minion 账号在 Minion 分组 {group} 里找不到了（Accounts.json 可能改过）, 为免挂错卡顶掉别处的号, 本次没有挂载, 请在启动页重新选择 Keycode"
+                    : $"Minion 分组 {group ?? "(未选择)"} 下没有账号, 请在启动页重新选择分组"
+            );
+        }
+
+        var currentAccountId = App.AccountManager.CurrentAccountID;
+        var accountName      = App.AccountManager.Accounts.FirstOrDefault(x => x.ID == currentAccountId)?.UserName;
+
+        return await AttachAsync(account, gameProcess, gamePath, dalamudInjected, accountName, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     把指定的 Minion 账号行挂到 <paramref name="gameProcess" /> 上, 成功后写占用记录。不抛异常。
+    /// </summary>
+    /// <param name="account">要挂的 Accounts.json 行</param>
+    /// <param name="accountName">游戏账号名, 只写进占用记录</param>
+    public static async Task<MinionAttachResult> AttachAsync
+    (
+        MinionAccount     account,
+        Process           gameProcess,
+        DirectoryInfo?    gamePath,
+        bool              dalamudInjected,
+        string?           accountName,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var installPath = MinionAccounts.InstallPath;
 
         await WaitForGameWindowAsync(gameProcess, cancellationToken).ConfigureAwait(false);
 
@@ -124,6 +159,9 @@ public static class MinionAttacher
         // 所以按它自己的协议先替 bot 报一次「运行中」把计时器种上（见 MinionAppStatusReporter）
         if (result.Ok && MinionAppStatusReporter.IsMinionAppRunning())
             await MinionAppStatusReporter.SeedRunningStatusAsync(account, gameProcess, cancellationToken).ConfigureAwait(false);
+
+        if (result.Ok)
+            WriteOccupancy(account, gameProcess, accountName);
 
         return result;
     }
@@ -255,6 +293,33 @@ public static class MinionAttacher
         {
             Log.Debug(ex, "[Minion] 读取游戏进程的 exe 路径失败");
             return null;
+        }
+    }
+
+    private static void WriteOccupancy(MinionAccount account, Process gameProcess, string? accountName)
+    {
+        if (string.IsNullOrWhiteSpace(account.Keycode))
+            return;
+
+        try
+        {
+            MinionOccupancy.WriteAndDeleteOnExit
+            (
+                new MinionOccupancyRecord
+                {
+                    Pid              = gameProcess.Id,
+                    ProcessStartedAt = MinionOccupancy.GetProcessStartedAt(gameProcess),
+                    CardFingerprint  = MinionCards.Fingerprint(account.Keycode),
+                    Variant          = MinionCards.VariantOf(account),
+                    AccountName      = accountName,
+                    AttachedAt       = DateTimeOffset.UtcNow
+                },
+                gameProcess
+            );
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[Minion] 生成占用记录失败 PID={Pid}", gameProcess.Id);
         }
     }
 

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using Serilog;
 using XIVLauncher.Login.Models;
+using XIVLauncher.Minion;
 
 namespace XIVLauncher.InGame;
 
@@ -69,6 +70,8 @@ public static class RunningGameRegistry
     {
         if (ENTRIES.TryRemove(processId, out _))
             Log.Debug("[RunningGame] 注销 PID={Pid}", processId);
+
+        MinionOccupancy.Delete(processId);
 
         try
         {
@@ -176,6 +179,8 @@ public static class RunningGameRegistry
     /// </summary>
     public static void PruneStalePortFiles()
     {
+        MinionOccupancy.PruneStale();
+
         string[] files;
 
         try
