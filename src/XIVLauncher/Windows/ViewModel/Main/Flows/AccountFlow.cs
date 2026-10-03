@@ -33,6 +33,8 @@ internal sealed class AccountFlow
 
     public void SwitchAccount(XIVAccount account, bool saveAsCurrent)
     {
+        vm.AccountManager.RefreshFromDatabase(account);
+
         if (saveAsCurrent)
             vm.AccountManager.CurrentAccount = account;
 

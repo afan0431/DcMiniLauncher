@@ -149,6 +149,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         account = accountManager.FindAccount(request.AccountName, XIVAccountType.Sdo)
                   ?? throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "DcMiniLauncher 账号库里没有这个号, 需要先授权");
 
+        // 其它进程可能刚更新过这个号的凭证和设备, 启动前从数据库刷新这一行
+        accountManager.RefreshFromDatabase(account);
+
         gamePath = App.Settings.GetGamePath(XIVAccountType.Sdo) is { Exists: true } path
                        ? path
                        : throw new CatLaunchException(CatCodes.INVALID_GAME_PATH, "DcMiniLauncher 设置里的国服游戏目录无效");
