@@ -12,6 +12,9 @@ public sealed record MinionAccount
 
     public string? Keycode { get; init; }
 
+    /// <summary>
+    ///     这一行的「游戏执行程序」路径, 用来区分同一张卡的国服行与国际服行（见 <see cref="MinionCards.VariantOf(MinionAccount)" />）
+    /// </summary>
     public string? PathToExe { get; init; }
 
     public string? Group { get; init; }
@@ -31,12 +34,6 @@ public sealed record MinionAccount
     public int? Datacenter { get; init; }
 
     /// <summary>
-    ///     <c>-usebeta</c> —— 用户的分组里确实有勾 beta 的条目。
-    ///     ⚠ 光传这个没用, 真正决定跑不跑 beta 的是 <c>-datpath</c> 指向哪份 dat, 见 <c>MinionAttacher</c>。
-    /// </summary>
-    public bool UseBetaFiles { get; init; }
-
-    /// <summary>
     ///     <c>-streamermode</c>
     /// </summary>
     public bool StreamerMode { get; init; }
@@ -47,16 +44,15 @@ public sealed record MinionAccount
     public bool SetWindowTitle { get; init; }
 
     /// <summary>
-    ///     启动页下拉里显示的文字。同一分组里 beta 与非 beta 两条常常**共用同一个 Keycode**,
-    ///     光显示 Keycode 根本分不出来（用户的 3/4/5/6/7 组都是这样）, 所以把 beta 标在最前面
-    ///     —— 下拉窄, 尾部会被省略号吃掉。
+    ///     启动页下拉里显示的文字。同一张卡的国服行与国际服行共用同一个 Keycode,
+    ///     所以国际服行在最前面标 [国际服]（下拉窄, 尾部会被省略号吃掉）。
     /// </summary>
     public string DisplayText
     {
         get
         {
             var keycode = string.IsNullOrWhiteSpace(Keycode) ? "(无 Keycode)" : Keycode;
-            return UseBetaFiles ? $"[beta] {keycode}" : keycode;
+            return MinionCards.VariantOf(this) == MinionCards.VARIANT_GLOBAL ? $"[国际服] {keycode}" : keycode;
         }
     }
 
@@ -166,7 +162,6 @@ public static class MinionAccounts
                     Notes        = ReadString(element, "Notes"),
                     ProductId      = ReadInt(element, "ProductID"),
                     Datacenter     = ReadInt(element, "Datacenter"),
-                    UseBetaFiles   = ReadBool(element, "UseBetaFFXIVFiles"),
                     StreamerMode   = ReadBool(element, "StreamerMode"),
                     SetWindowTitle = ReadBool(element, "SetWindowTitle")
                 }

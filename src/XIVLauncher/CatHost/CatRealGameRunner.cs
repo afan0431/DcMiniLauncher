@@ -260,7 +260,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         var row = MinionCards.FindByCard(rows, request.CardFingerprint!, request.Variant!);
 
         if (row == null)
-            error = (CatCodes.MINION_CARD_NOT_FOUND, $"本机 Minion Accounts.json 里找不到卡 {request.CardFingerprint} 的{(request.Variant == MinionCards.VARIANT_GLOBAL ? "国际服" : "国服")}注入行");
+            error = (CatCodes.MINION_CARD_NOT_FOUND, $"本机 Minion Accounts.json 里找不到卡 {request.CardFingerprint} 的{(request.Variant == MinionCards.VARIANT_GLOBAL ? "国际服" : "国服")}注入行（按该行的游戏执行程序是否位于国服游戏目录之下区分）");
 
         return row;
     }
