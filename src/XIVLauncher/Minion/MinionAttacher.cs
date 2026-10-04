@@ -34,20 +34,12 @@ public static class MinionAttacher
     /// <summary>Accounts.json 里国服账号的 ProductID 都是 8, 缺失时兜底用它</summary>
     private const string PRODUCT_ID_CN = "8";
 
+    /// <summary>国服 bot 注入文件, 位于 bot 目录的 <c>MinionFiles\</c> 下</summary>
     private const string DAT_NAME_CN = "FFXIVMinionCN_64.dat";
-
-    /// <summary>
-    ///     beta 的 bot dat 在 <c>MinionFiles\Beta\</c> 下单独一份。
-    ///     ⚠ 决定 bot 跑不跑 beta 的是 <c>-datpath</c> 指向哪个 dat, 不是 <c>-usebeta</c> ——
-    ///     只给 usebeta=1 而 datpath 还是普通 dat, bot 会照常加载非 beta 的 LuaMods（2026-08-14 实测）。
-    /// </summary>
-    private const string BETA_DAT_NAME_CN = "FFXIVMinionCN_64_BETA.dat";
 
     private const string BOT_DIR_NAME = @"Bots\FFXIVMinion64";
 
     private const string MINION_FILES_DIR_NAME = "MinionFiles";
-
-    private const string BETA_DIR_NAME = "Beta";
 
     /// <summary>MinionLauncher 要能找到游戏窗口才肯 attach, 先等窗口出来再拉它</summary>
     private static readonly TimeSpan GAME_WINDOW_TIMEOUT = TimeSpan.FromMinutes(2);
@@ -80,19 +72,54 @@ public static class MinionAttacher
     {
         var installPath = MinionAccounts.InstallPath;
 
-        MinionAccount? account;
+        IReadOnlyList<MinionAccount> accounts;
 
         try
         {
-            account = MinionAccounts.FindAccount(App.Settings.MinionGroup, App.Settings.MinionAccountUid, installPath);
+            accounts = MinionAccounts.LoadAccounts(installPath);
         }
         catch (Exception ex)
         {
             return MinionAttachResult.Failed($"读取 {MinionAccounts.GetAccountsJsonPath(installPath)} 失败: {ex.Message}");
         }
 
+        var group   = App.Settings.MinionGroup;
+        var account = MinionAccounts.FindAccount(accounts, group, App.Settings.MinionAccountUid);
+
         if (account == null)
-            return MinionAttachResult.Failed($"Minion 分组 {App.Settings.MinionGroup ?? "(未选择)"} 下没有账号, 请在启动页重新选择分组");
+        {
+            var hasAccountsInGroup = accounts.Any(x => string.Equals(x.Group?.Trim(), group?.Trim(), StringComparison.OrdinalIgnoreCase));
+
+            return MinionAttachResult.Failed
+            (
+                hasAccountsInGroup
+                    ? $"启动页选中的 Minion 账号在 Minion 分组 {group} 里找不到了（Accounts.json 可能改过）, 为免挂错卡顶掉别处的号, 本次没有挂载, 请在启动页重新选择 Keycode"
+                    : $"Minion 分组 {group ?? "(未选择)"} 下没有账号, 请在启动页重新选择分组"
+            );
+        }
+
+        var currentAccountId = App.AccountManager.CurrentAccountID;
+        var accountName      = App.AccountManager.Accounts.FirstOrDefault(x => x.ID == currentAccountId)?.UserName;
+
+        return await AttachAsync(account, gameProcess, gamePath, dalamudInjected, accountName, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     把指定的 Minion 账号行挂到 <paramref name="gameProcess" /> 上, 成功后写占用记录。不抛异常。
+    /// </summary>
+    /// <param name="account">要挂的 Accounts.json 行</param>
+    /// <param name="accountName">游戏账号名, 只写进占用记录</param>
+    public static async Task<MinionAttachResult> AttachAsync
+    (
+        MinionAccount     account,
+        Process           gameProcess,
+        DirectoryInfo?    gamePath,
+        bool              dalamudInjected,
+        string?           accountName,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var installPath = MinionAccounts.InstallPath;
 
         await WaitForGameWindowAsync(gameProcess, cancellationToken).ConfigureAwait(false);
 
@@ -125,6 +152,9 @@ public static class MinionAttacher
         if (result.Ok && MinionAppStatusReporter.IsMinionAppRunning())
             await MinionAppStatusReporter.SeedRunningStatusAsync(account, gameProcess, cancellationToken).ConfigureAwait(false);
 
+        if (result.Ok)
+            WriteOccupancy(account, gameProcess, accountName);
+
         return result;
     }
 
@@ -153,26 +183,21 @@ public static class MinionAttacher
             );
 
         var botPath = Path.Combine(installPath, BOT_DIR_NAME);
-        var datPath = GetDatPath(botPath, account.UseBetaFiles);
+        var datPath = Path.Combine(botPath, MINION_FILES_DIR_NAME, DAT_NAME_CN);
 
         if (!File.Exists(datPath))
-            return MinionAttachResult.Failed
-            (
-                account.UseBetaFiles
-                    ? $"该账号勾了 beta, 但找不到 beta 的 bot 文件 {datPath}（用 MINIONAPP 起一次 beta 账号让它下载）"
-                    : $"找不到 bot 文件 {datPath}"
-            );
+            return MinionAttachResult.Failed($"找不到 bot 文件 {datPath}");
 
         if (BuildArguments(account, botPath, datPath, gameExePath, gameProcess.Id) is not { } arguments)
             return MinionAttachResult.Failed(DescribeMissingFields(account));
 
         Log.Information
         (
-            "[Minion] 挂载 bot: PID={GamePid}, 分组={Group}, 账号={Account}, beta={UseBeta}, 命令行={CommandLine}",
+            "[Minion] 挂载 bot: PID={GamePid}, 分组={Group}, 账号={Account}, 行={Variant}, 命令行={CommandLine}",
             gameProcess.Id,
             account.Group,
             account.Label,
-            account.UseBetaFiles,
+            MinionCards.VariantOf(account),
             Redact(launcherExe, arguments)
         );
 
@@ -181,16 +206,11 @@ public static class MinionAttacher
 
     /// <summary>
     ///     照抄 MINIONAPP 的命令行（research/investigation.md 抓到的真实参数）。
-    ///     其中 region/attachtype/datpath/botpath 是常量, 其余按账号取；
+    ///     其中 region/attachtype/datpath/botpath/usebeta 是常量, 其余按账号取；
     ///     <c>-account</c>/<c>-accountpass</c>/<c>-charname</c>/<c>-server</c> 不传 ——
     ///     游戏由本启动器起并已登录, Minion 只负责 attach。
     ///     缺必需字段时返回 null。
     /// </summary>
-    private static string GetDatPath(string botPath, bool useBeta) =>
-        useBeta
-            ? Path.Combine(botPath, MINION_FILES_DIR_NAME, BETA_DIR_NAME, BETA_DAT_NAME_CN)
-            : Path.Combine(botPath, MINION_FILES_DIR_NAME, DAT_NAME_CN);
-
     private static List<string>? BuildArguments(MinionAccount account, string botPath, string datPath, string gameExePath, int gamePid)
     {
         if (string.IsNullOrWhiteSpace(account.Uid)             ||
@@ -216,10 +236,9 @@ public static class MinionAttacher
             // -path 必填且**文件必须真的存在**, 否则 launcher 报 Invalid Game exe path 直接退出;
             // 给了 attachtopid 就不会拿它重开游戏, 只是校验
             $"-path={gameExePath}",
-            // beta 账号要指到 MinionFiles\Beta\ 下那份 dat, 只给 usebeta=1 是不够的
             $"-datpath={datPath}",
             $"-botpath={botPath}",
-            $"-usebeta={(account.UseBetaFiles ? "1" : "0")}",
+            "-usebeta=0",
             $"-datacenter={account.Datacenter ?? 0}",
             $"-streamermode={(account.StreamerMode ? "1" : "0")}",
             $"-setwindowtitle={(account.SetWindowTitle ? "1" : "0")}"
@@ -255,6 +274,33 @@ public static class MinionAttacher
         {
             Log.Debug(ex, "[Minion] 读取游戏进程的 exe 路径失败");
             return null;
+        }
+    }
+
+    private static void WriteOccupancy(MinionAccount account, Process gameProcess, string? accountName)
+    {
+        if (string.IsNullOrWhiteSpace(account.Keycode))
+            return;
+
+        try
+        {
+            MinionOccupancy.WriteAndDeleteOnExit
+            (
+                new MinionOccupancyRecord
+                {
+                    Pid              = gameProcess.Id,
+                    ProcessStartedAt = MinionOccupancy.GetProcessStartedAt(gameProcess),
+                    CardFingerprint  = MinionCards.Fingerprint(account.Keycode),
+                    Variant          = MinionCards.VariantOf(account),
+                    AccountName      = accountName,
+                    AttachedAt       = DateTimeOffset.UtcNow
+                },
+                gameProcess
+            );
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[Minion] 生成占用记录失败 PID={Pid}", gameProcess.Id);
         }
     }
 

@@ -65,13 +65,27 @@ public sealed class LoginWorkflowService
         loginResult = postQrResult.LoginResult;
         var resolvedDeviceProfile = postQrResult.ResolvedDeviceProfile;
         var pendingNewAccount     = postQrResult.PendingNewAccount;
+        var loggedInDeviceProfile = deviceProfileSnapshot;
         deviceProfileSnapshot = resolvedDeviceProfile.Snapshot;
 
-        if (deviceProfilePreparation.RequiresNewAccountDeviceProfileSetup      &&
-            resolvedLoginState.RequestedLoginType          == LoginType.QRCode &&
-            loginResult.State                              == LoginState.Ok    &&
-            loginResult.OAuthLogin                         != null             &&
-            pendingNewAccount?.DeviceProfileDynamicEnabled == true)
+        // 扫到已有账号且扫码时用的设备不是它自己的: 有快速登录密钥就用它自己的设备重登一次, 让会话和密钥落在正确的设备上
+        var isExistingAccount = pendingNewAccount != null && accountManager.Accounts.Contains(pendingNewAccount);
+        var isExistingAccountOnOtherDevice = isExistingAccount                                                       &&
+                                             resolvedLoginState.RequestedLoginType == LoginType.QRCode                &&
+                                             loginResult is { State: LoginState.Ok, OAuthLogin.QuickLoginSecret.Length: > 0 } &&
+                                             !loggedInDeviceProfile.Equals(deviceProfileSnapshot);
+
+        if (isExistingAccountOnOtherDevice)
+            Log.Information("[LoginWorkflow] 扫码账号已存在且有自己的设备设置, 用该设备重新快速登录一次");
+
+        var isNewAccountWithOwnDevice = !isExistingAccount                                                 &&
+                                        deviceProfilePreparation.RequiresNewAccountDeviceProfileSetup      &&
+                                        resolvedLoginState.RequestedLoginType          == LoginType.QRCode &&
+                                        loginResult.State                              == LoginState.Ok    &&
+                                        loginResult.OAuthLogin                         != null             &&
+                                        pendingNewAccount?.DeviceProfileDynamicEnabled == true;
+
+        if (isExistingAccountOnOtherDevice || isNewAccountWithOwnDevice)
         {
             var oAuthLogin = loginResult.OAuthLogin;
             loginResult = await LoginAsync

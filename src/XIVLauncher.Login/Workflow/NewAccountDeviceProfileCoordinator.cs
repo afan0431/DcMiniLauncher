@@ -21,7 +21,9 @@ internal sealed class NewAccountDeviceProfileCoordinator
 
         if (!requiresNewAccountDeviceProfileSetup || resolvedLoginState.RequestedLoginType == LoginType.QRCode)
         {
-            var resolvedDeviceProfile = accountManager.ResolveDeviceProfile(resolvedLoginState.Username, resolvedLoginState.AccountType);
+            // 扫码时登录用户名被清空, 改用界面当前选中的账号决定本次用哪套设备, 免得已设独立设备的号被拿共享设备去扫
+            var deviceProfileUsername = resolvedLoginState.RequestedLoginType == LoginType.QRCode ? request.Username : resolvedLoginState.Username;
+            var resolvedDeviceProfile = accountManager.ResolveDeviceProfile(deviceProfileUsername, resolvedLoginState.AccountType);
             return new DeviceProfilePreparation
             (
                 resolvedDeviceProfile,
@@ -118,6 +120,13 @@ internal sealed class NewAccountDeviceProfileCoordinator
 
     public PostQrDeviceProfileResult? ApplyAfterQrLogin(LoginWorkflowRequest request, DeviceProfilePreparation preparation, ResolvedLoginState resolvedLoginState, LoginResult loginResult)
     {
+        // 扫到的是账号库里已有的号: 沿用它自己的设备设置, 不当成新号, 也不改回共享设备
+        if (preparation.PendingNewAccount == null                  &&
+            resolvedLoginState.RequestedLoginType == LoginType.QRCode &&
+            loginResult is { State: LoginState.Ok, OAuthLogin: not null } &&
+            accountManager.FindAccount(loginResult.OAuthLogin.InputUserID, resolvedLoginState.AccountType) is { } existingAccount)
+            return new PostQrDeviceProfileResult(loginResult, accountManager.ResolveDeviceProfile(existingAccount), existingAccount);
+
         if (!preparation.RequiresNewAccountDeviceProfileSetup || resolvedLoginState.RequestedLoginType != LoginType.QRCode || loginResult.State != LoginState.Ok || loginResult.OAuthLogin == null)
             return new PostQrDeviceProfileResult(loginResult, preparation.ResolvedDeviceProfile, preparation.PendingNewAccount);
 

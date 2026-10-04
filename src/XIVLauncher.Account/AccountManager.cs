@@ -61,10 +61,13 @@ public class AccountManager
 
     private const CredType DEFAULT_CRED_TYPE = CredType.WindowsCredManager;
 
-    private static readonly string DeviceProfilePresetStorePath  = Path.Combine(Paths.RoamingPath, "deviceProfilePresets.json");
-    private static readonly string LegacySharedDeviceProfilePath = Path.Combine(Paths.RoamingPath, "sharedDeviceProfile.json");
-    private static readonly string DatabasePath                  = Path.Combine(Paths.RoamingPath, "accounts.db");
-    private static readonly string DatabaseJournalPath           = $"{DatabasePath}-journal";
+    private const int DEVICE_PROFILE_PRESET_STORE_IO_ATTEMPTS   = 3;
+    private const int DEVICE_PROFILE_PRESET_STORE_IO_DELAY_MS   = 100;
+
+    private readonly string deviceProfilePresetStorePath;
+    private readonly string legacySharedDeviceProfilePath;
+    private readonly string databasePath;
+    private readonly string databaseJournalPath;
 
     private static readonly JsonSerializerOptions DeviceProfilePresetStoreJsonOptions = new() { WriteIndented = true };
 
@@ -73,13 +76,46 @@ public class AccountManager
 
     private DeviceProfilePresetStoreState? deviceProfilePresetStore;
 
+    /// <summary>
+    ///     缓存的设备预设对应的文件时间戳与长度，用于发现其它进程写入的新内容
+    /// </summary>
+    private (long LastWriteUtcTicks, long Length)? deviceProfilePresetStoreStamp;
+
     private readonly HashSet<string> unavailableSavedSecretAccountIds = [];
 
+    /// <summary>
+    ///     每个账号最近一次与数据库一致时的各列取值，按账号 ID 索引，用于判断内存中哪些列被本进程改动
+    /// </summary>
+    private readonly Dictionary<string, object?[]> persistedAccountValues = new(StringComparer.Ordinal);
+
+    private readonly object accountSyncRoot = new();
+
+    private TableMapping.Column[]? accountColumns;
+
+    /// <summary>
+    ///     使用默认数据目录创建账号管理器
+    /// </summary>
+    /// <param name="setting">账号相关设置</param>
     public AccountManager(IAccountSettingsStore setting)
+        : this(setting, Paths.RoamingPath)
+    {
+    }
+
+    /// <summary>
+    ///     使用指定数据目录创建账号管理器
+    /// </summary>
+    /// <param name="setting">账号相关设置</param>
+    /// <param name="roamingPath">存放账号库、凭据密钥与设备预设的目录</param>
+    public AccountManager(IAccountSettingsStore setting, string roamingPath)
     {
         this.setting = setting;
 
-        var credPath = Path.Combine(Paths.RoamingPath, "cred.json");
+        deviceProfilePresetStorePath  = Path.Combine(roamingPath, "deviceProfilePresets.json");
+        legacySharedDeviceProfilePath = Path.Combine(roamingPath, "sharedDeviceProfile.json");
+        databasePath                  = Path.Combine(roamingPath, "accounts.db");
+        databaseJournalPath           = $"{databasePath}-journal";
+
+        var credPath = Path.Combine(roamingPath, "cred.json");
         credData     = new CredData("XIVLauncherCN", credPath);
         CredProvider = GetCredProvider(DEFAULT_CRED_TYPE);
 
@@ -97,33 +133,150 @@ public class AccountManager
         rotationDays < 1 ? DEFAULT_DEVICE_PROFILE_ROTATION_DAYS : rotationDays;
 
     /// <summary>
-    ///     将单个账号写入数据库
+    ///     将单个账号写入数据库，只写入本进程改动过的列，其余列采用数据库中的最新值
     /// </summary>
     /// <param name="account">待保存账号</param>
     public void Save(XIVAccount account)
     {
-        Database.RunInTransaction
-        (() =>
-            {
-                var record = Database.Table<XIVAccount>().FirstOrDefault(a => a.ID == account.ID);
+        lock (accountSyncRoot)
+        {
+            Database.RunInTransaction
+            (() =>
+                {
+                    var record   = Database.Table<XIVAccount>().FirstOrDefault(a => a.ID == account.ID);
+                    var baseline = persistedAccountValues.GetValueOrDefault(account.ID);
 
-                if (record == null)
-                    Database.Insert(account);
-                else
-                    Database.Update(account);
-            }
-        );
+                    if (record == null)
+                    {
+                        // 已被其它进程删除且本进程没有改动时不重新插入
+                        if (baseline != null && !HasLocalAccountChanges(account, baseline))
+                            return;
+
+                        Database.Insert(account);
+                    }
+                    else
+                    {
+                        account.Index = record.Index;
+
+                        if (MergeStoredAccountValues(account, record, baseline))
+                            Database.Update(account);
+                    }
+
+                    persistedAccountValues[account.ID] = CaptureAccountValues(account);
+                }
+            );
+        }
     }
 
     /// <summary>
-    ///     将当前内存中的所有账号写入数据库
+    ///     保存当前内存中的所有账号，未改动的行不写入
     /// </summary>
     public void Save()
     {
-        ApplySequentialSortOrder();
+        lock (accountSyncRoot)
+        {
+            ApplySequentialSortOrder();
 
-        foreach (var item in Accounts)
-            Save(item);
+            foreach (var item in Accounts.ToArray())
+                Save(item);
+        }
+    }
+
+    /// <summary>
+    ///     从数据库重新读取指定账号这一行，本进程未改动的列采用数据库中的最新值
+    /// </summary>
+    /// <param name="account">目标账号</param>
+    public void RefreshFromDatabase(XIVAccount? account)
+    {
+        if (account == null || string.IsNullOrWhiteSpace(account.ID))
+            return;
+
+        lock (accountSyncRoot)
+        {
+            var record = Database.Table<XIVAccount>().FirstOrDefault(a => a.ID == account.ID);
+            if (record == null)
+                return;
+
+            MergeStoredAccountValues(account, record, persistedAccountValues.GetValueOrDefault(account.ID));
+            account.Index                      = record.Index;
+            persistedAccountValues[account.ID] = CaptureAccountValues(record);
+        }
+    }
+
+    /// <summary>
+    ///     数据库表中除主键外的所有列
+    /// </summary>
+    private TableMapping.Column[] AccountColumns =>
+        accountColumns ??= Database.GetMapping<XIVAccount>().Columns.Where(column => !column.IsPK).ToArray();
+
+    /// <summary>
+    ///     记录账号当前各列的取值
+    /// </summary>
+    private object?[] CaptureAccountValues(XIVAccount account) =>
+        AccountColumns.Select(column => column.GetValue(account)).ToArray();
+
+    /// <summary>
+    ///     判断账号是否存在与基准值不同的列
+    /// </summary>
+    private bool HasLocalAccountChanges(XIVAccount account, object?[] baseline)
+    {
+        var columns = AccountColumns;
+
+        for (var i = 0; i < columns.Length; i++)
+        {
+            if (!Equals(columns[i].GetValue(account), baseline[i]))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    ///     将数据库记录合并到内存账号：与基准值相同的列采用数据库值，本进程改动过的列保留内存值
+    /// </summary>
+    /// <param name="account">内存中的账号</param>
+    /// <param name="record">数据库中的最新记录</param>
+    /// <param name="baseline">最近一次与数据库一致时的取值，为空表示所有列都按本进程改动处理</param>
+    /// <returns>存在需要写回数据库的列则返回 <see langword="true" /></returns>
+    private bool MergeStoredAccountValues(XIVAccount account, XIVAccount record, object?[]? baseline)
+    {
+        var columns        = AccountColumns;
+        var hasLocalChange = false;
+
+        for (var i = 0; i < columns.Length; i++)
+        {
+            var local  = columns[i].GetValue(account);
+            var stored = columns[i].GetValue(record);
+
+            if (Equals(local, stored))
+                continue;
+
+            if (baseline != null && Equals(local, baseline[i]))
+                columns[i].SetValue(account, stored);
+            else
+                hasLocalChange = true;
+        }
+
+        return hasLocalChange;
+    }
+
+    /// <summary>
+    ///     为需要改写全部行的操作准备账号：刷新内存账号，并附带数据库中本进程尚未加载的账号
+    /// </summary>
+    private List<XIVAccount> LoadAccountsForFullRewrite()
+    {
+        lock (accountSyncRoot)
+        {
+            foreach (var account in Accounts.ToArray())
+                RefreshFromDatabase(account);
+
+            var trackedIds = Accounts.Select(account => account.ID).ToHashSet(StringComparer.Ordinal);
+            var untracked = Database.Table<XIVAccount>()
+                                    .ToArray()
+                                    .Where(record => !string.IsNullOrWhiteSpace(record.ID) && !trackedIds.Contains(record.ID));
+
+            return [.. Accounts, .. untracked];
+        }
     }
 
     /// <summary>
@@ -133,7 +286,7 @@ public class AccountManager
     {
         Database = new SQLiteConnection
         (
-            DatabasePath,
+            databasePath,
             SQLiteOpenFlags.ReadWrite | SQLiteOpenFlags.Create | SQLiteOpenFlags.FullMutex
         );
         Database.CreateTable<XIVAccount>();
@@ -169,8 +322,15 @@ public class AccountManager
                                      .ToArray();
 
         Accounts.Clear();
+        persistedAccountValues.Clear();
+
         foreach (var account in storedAccounts)
+        {
             Accounts.Add(account);
+
+            if (!string.IsNullOrWhiteSpace(account.ID))
+                persistedAccountValues[account.ID] = CaptureAccountValues(account);
+        }
 
         foreach (var account in Accounts.ToArray())
         {
@@ -207,15 +367,15 @@ public class AccountManager
     /// <summary>
     ///     构造数据库不可用时的用户提示，明确说明数据库文件未被改动
     /// </summary>
-    private static string BuildDatabaseUnavailableMessage(Exception exception)
+    private string BuildDatabaseUnavailableMessage(Exception exception)
     {
         if (IsSqliteRuntimeUnavailable(exception))
-            return $"SQLite 运行库加载失败，账号数据库 {DatabasePath} 保持不变。{Environment.NewLine}"
+            return $"SQLite 运行库加载失败，账号数据库 {databasePath} 保持不变。{Environment.NewLine}"
                    + "请检查安装目录中的 SQLite-net.dll、SQLitePCLRaw.batteries_v2.dll、SQLitePCLRaw.core.dll、"
                    + "SQLitePCLRaw.provider.e_sqlite3.dll 与 e_sqlite3.dll 是否完整，"
                    + "并确认安全软件或云同步软件未损坏或占用这些文件，之后修复或重新安装启动器。";
 
-        return $"账号数据库 {DatabasePath} 无法打开，该文件保持不变。{Environment.NewLine}"
+        return $"账号数据库 {databasePath} 无法打开，该文件保持不变。{Environment.NewLine}"
                + $"请关闭可能占用它的程序（例如云同步、备份工具或另一个启动器实例）后重试。{Environment.NewLine}"
                + $"{exception.Message}";
     }
@@ -249,22 +409,22 @@ public class AccountManager
     {
         CloseDatabase();
 
-        if (!File.Exists(DatabasePath))
+        if (!File.Exists(databasePath))
             return;
 
-        var quarantinePath = $"{DatabasePath}.corrupt-{DateTime.Now:yyyyMMddHHmmssfff}";
+        var quarantinePath = $"{databasePath}.corrupt-{DateTime.Now:yyyyMMddHHmmssfff}";
 
         try
         {
-            File.Move(DatabasePath, quarantinePath);
+            File.Move(databasePath, quarantinePath);
 
-            if (File.Exists(DatabaseJournalPath))
-                File.Move(DatabaseJournalPath, $"{quarantinePath}-journal");
+            if (File.Exists(databaseJournalPath))
+                File.Move(databaseJournalPath, $"{quarantinePath}-journal");
         }
         catch (Exception ex)
         {
             throw new InvalidOperationException(
-                $"账号数据库已损坏，但无法将其改名备份。请关闭可能占用 {DatabasePath} 的程序后重试。",
+                $"账号数据库已损坏，但无法将其改名备份。请关闭可能占用 {databasePath} 的程序后重试。",
                 ex);
         }
 
@@ -394,7 +554,10 @@ public class AccountManager
                 requestedType.GetDisplayName()
             );
 
-            foreach (var item in Accounts)
+            // 先从数据库读取最新凭据再重新加密，避免用内存中的旧副本覆盖其它进程刚写入的值
+            var accountsToConvert = LoadAccountsForFullRewrite();
+
+            foreach (var item in accountsToConvert)
             {
                 if (HasUnavailableSecrets(item))
                 {
@@ -410,6 +573,9 @@ public class AccountManager
             CurrentCredType = requestedType;
             CredProvider    = newCred;
             Save();
+
+            foreach (var item in accountsToConvert.Where(item => !Accounts.Any(tracked => ReferenceEquals(tracked, item))))
+                Save(item);
 
             Log.Information
             (
@@ -731,6 +897,21 @@ public class AccountManager
             Save(account);
         }
 
+        // 其它进程新增、本进程未加载的账号同样改用替代预设
+        var trackedIds = Accounts.Select(account => account.ID).ToHashSet(StringComparer.Ordinal);
+        var untrackedRecords = Database.Table<XIVAccount>()
+                                       .Where(record => record.DeviceProfilePresetId == presetId)
+                                       .ToArray()
+                                       .Where(record => !string.IsNullOrWhiteSpace(record.ID) && !trackedIds.Contains(record.ID));
+
+        foreach (var record in untrackedRecords)
+        {
+            record.DeviceProfilePresetId              = replacementPreset.Id;
+            record.DeviceProfileLastGeneratedUtcTicks = replacementPreset.GeneratedUtcTicks;
+            ClearLegacyDeviceProfileSnapshot(record);
+            Save(record);
+        }
+
         return replacementPreset;
     }
 
@@ -800,7 +981,8 @@ public class AccountManager
             var state = GetDeviceProfilePresetStoreState();
 
             if (!string.Equals(state.SharedPresetId, account.DeviceProfilePresetId, StringComparison.Ordinal)
-                && Accounts.All(existing => !string.Equals(existing.DeviceProfilePresetId, account.DeviceProfilePresetId, StringComparison.Ordinal)))
+                && Accounts.All(existing => !string.Equals(existing.DeviceProfilePresetId, account.DeviceProfilePresetId, StringComparison.Ordinal))
+                && !IsDeviceProfilePresetUsedInDatabase(account.DeviceProfilePresetId, account.ID))
             {
                 var presets = state.Presets
                                    .Where(preset => !string.Equals(preset.Id, account.DeviceProfilePresetId, StringComparison.Ordinal))
@@ -818,15 +1000,28 @@ public class AccountManager
             }
         }
 
-        Database.RunInTransaction
-        (() =>
-            {
-                var record = Database.Table<XIVAccount>().FirstOrDefault(a => a.ID == account.ID);
-                if (record != null)
-                    Database.Delete(record);
-            }
-        );
+        lock (accountSyncRoot)
+        {
+            Database.RunInTransaction
+            (() =>
+                {
+                    var record = Database.Table<XIVAccount>().FirstOrDefault(a => a.ID == account.ID);
+                    if (record != null)
+                        Database.Delete(record);
+                }
+            );
+
+            persistedAccountValues.Remove(account.ID);
+        }
     }
+
+    /// <summary>
+    ///     判断数据库中除指定账号外是否还有账号使用该设备预设
+    /// </summary>
+    private bool IsDeviceProfilePresetUsedInDatabase(string presetId, string excludedAccountId) =>
+        Database.Table<XIVAccount>()
+                .Where(record => record.DeviceProfilePresetId == presetId && record.ID != excludedAccountId)
+                .Count() != 0;
 
     /// <summary>
     ///     清空当前账号选择
@@ -1126,31 +1321,80 @@ public class AccountManager
 
     private DeviceProfilePresetStoreState GetDeviceProfilePresetStoreState()
     {
-        deviceProfilePresetStore ??= LoadOrCreateDeviceProfilePresetStoreState();
+        // 文件被其它进程改写过时重新读取，避免基于旧副本整体写回而丢掉别人新增的预设
+        var stamp = ReadDeviceProfilePresetStoreStamp();
+        if (deviceProfilePresetStore == null || (stamp != null && stamp != deviceProfilePresetStoreStamp))
+            deviceProfilePresetStore = LoadOrCreateDeviceProfilePresetStoreState();
+
         return deviceProfilePresetStore ?? throw new InvalidOperationException("设备预设状态尚未初始化");
+    }
+
+    /// <summary>
+    ///     读取设备预设文件的最后写入时间与长度，文件不存在或无法访问时返回 <see langword="null" />
+    /// </summary>
+    private (long LastWriteUtcTicks, long Length)? ReadDeviceProfilePresetStoreStamp()
+    {
+        try
+        {
+            var info = new FileInfo(deviceProfilePresetStorePath);
+            return info.Exists ? (info.LastWriteTimeUtc.Ticks, info.Length) : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    ///     以允许其它进程同时替换或删除的方式读取文件全部文本
+    /// </summary>
+    private static string ReadAllTextShared(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        return reader.ReadToEnd();
     }
 
     private DeviceProfilePresetStoreState LoadOrCreateDeviceProfilePresetStoreState()
     {
-        try
+        if (File.Exists(deviceProfilePresetStorePath))
         {
-            if (File.Exists(DeviceProfilePresetStorePath))
-            {
-                var json       = File.ReadAllText(DeviceProfilePresetStorePath, Encoding.UTF8);
-                var stored     = JsonSerializer.Deserialize<DeviceProfilePresetStoreState>(json, DeviceProfilePresetStoreJsonOptions);
-                var normalized = NormalizeDeviceProfilePresetStoreState(stored);
+            Exception? lastError = null;
 
-                if (normalized != null)
+            // 另一个进程正在写入时可能读到不完整的内容，短暂等待后重试
+            for (var attempt = 1; attempt <= DEVICE_PROFILE_PRESET_STORE_IO_ATTEMPTS; attempt++)
+            {
+                try
                 {
-                    deviceProfilePresetStore = normalized;
-                    PersistDeviceProfilePresetStoreState(normalized);
-                    return normalized;
+                    var stamp      = ReadDeviceProfilePresetStoreStamp();
+                    var json       = ReadAllTextShared(deviceProfilePresetStorePath);
+                    var stored     = JsonSerializer.Deserialize<DeviceProfilePresetStoreState>(json, DeviceProfilePresetStoreJsonOptions);
+                    var normalized = NormalizeDeviceProfilePresetStoreState(stored);
+
+                    if (normalized != null)
+                    {
+                        deviceProfilePresetStore      = normalized;
+                        deviceProfilePresetStoreStamp = stamp;
+
+                        if (!string.Equals(JsonSerializer.Serialize(normalized, DeviceProfilePresetStoreJsonOptions), json, StringComparison.Ordinal))
+                            PersistDeviceProfilePresetStoreState(normalized);
+
+                        return normalized;
+                    }
+
+                    lastError = null;
                 }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                }
+
+                if (attempt < DEVICE_PROFILE_PRESET_STORE_IO_ATTEMPTS)
+                    Thread.Sleep(DEVICE_PROFILE_PRESET_STORE_IO_DELAY_MS);
             }
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "读取设备信息预设失败，将重新生成。");
+
+            Log.Warning(lastError, "读取设备信息预设失败，备份原文件后重新生成。");
+            BackupDamagedDeviceProfilePresetStore();
         }
 
         var legacyPreset = LoadLegacySharedDeviceProfilePreset()
@@ -1229,14 +1473,14 @@ public class AccountManager
         };
     }
 
-    private static DeviceProfilePreset? LoadLegacySharedDeviceProfilePreset()
+    private DeviceProfilePreset? LoadLegacySharedDeviceProfilePreset()
     {
         try
         {
-            if (!File.Exists(LegacySharedDeviceProfilePath))
+            if (!File.Exists(legacySharedDeviceProfilePath))
                 return null;
 
-            var json   = File.ReadAllText(LegacySharedDeviceProfilePath, Encoding.UTF8);
+            var json   = File.ReadAllText(legacySharedDeviceProfilePath, Encoding.UTF8);
             var legacy = JsonSerializer.Deserialize<DeviceProfilePreset>(json, DeviceProfilePresetStoreJsonOptions);
             if (legacy == null || !HasDeviceProfile(legacy.ToSnapshot()))
                 return null;
@@ -1258,12 +1502,12 @@ public class AccountManager
         }
     }
 
-    private static void TryDeleteLegacySharedDeviceProfileFile()
+    private void TryDeleteLegacySharedDeviceProfileFile()
     {
         try
         {
-            if (File.Exists(LegacySharedDeviceProfilePath))
-                File.Delete(LegacySharedDeviceProfilePath);
+            if (File.Exists(legacySharedDeviceProfilePath))
+                File.Delete(legacySharedDeviceProfilePath);
         }
         catch (Exception ex)
         {
@@ -1275,14 +1519,78 @@ public class AccountManager
     {
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(DeviceProfilePresetStorePath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(deviceProfilePresetStorePath)!);
             var json = JsonSerializer.Serialize(state, DeviceProfilePresetStoreJsonOptions);
-            File.WriteAllText(DeviceProfilePresetStorePath, json, new UTF8Encoding(false));
-            deviceProfilePresetStore = state;
+            WriteAllTextAtomic(deviceProfilePresetStorePath, json);
+            deviceProfilePresetStore      = state;
+            deviceProfilePresetStoreStamp = ReadDeviceProfilePresetStoreStamp();
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "保存设备信息预设失败。");
+        }
+    }
+
+    /// <summary>
+    ///     先写入同目录临时文件再整体替换目标文件，其它进程只会读到完整的旧内容或新内容
+    /// </summary>
+    private static void WriteAllTextAtomic(string path, string content)
+    {
+        var tempPath = $"{path}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
+
+        try
+        {
+            File.WriteAllText(tempPath, content, new UTF8Encoding(false));
+
+            for (var attempt = 1;; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                        File.Replace(tempPath, path, null, true);
+                    else
+                        File.Move(tempPath, path, true);
+
+                    return;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && attempt < DEVICE_PROFILE_PRESET_STORE_IO_ATTEMPTS)
+                {
+                    // 目标文件被其它进程短暂占用时稍后重试
+                    Thread.Sleep(DEVICE_PROFILE_PRESET_STORE_IO_DELAY_MS);
+                }
+            }
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                    File.Delete(tempPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "删除设备信息预设临时文件失败：{TempPath}", tempPath);
+            }
+        }
+    }
+
+    /// <summary>
+    ///     将无法解析的设备预设文件复制留存，重新生成前不丢弃原内容
+    /// </summary>
+    private void BackupDamagedDeviceProfilePresetStore()
+    {
+        try
+        {
+            if (!File.Exists(deviceProfilePresetStorePath))
+                return;
+
+            var backupPath = $"{deviceProfilePresetStorePath}.corrupt-{DateTime.Now:yyyyMMddHHmmssfff}";
+            File.Copy(deviceProfilePresetStorePath, backupPath, true);
+            Log.Warning("设备信息预设原文件已备份至 {BackupPath}", backupPath);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "备份设备信息预设原文件失败。");
         }
     }
 

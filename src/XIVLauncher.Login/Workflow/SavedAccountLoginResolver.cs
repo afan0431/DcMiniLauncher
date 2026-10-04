@@ -20,6 +20,7 @@ internal sealed class SavedAccountLoginResolver
         var quickLoginEnabled     = request.QuickLoginEnabled;
         var selectedArea          = request.CurrentArea;
         var savedAccount          = FindSavedAccount(request.LoginType, username);
+        accountManager.RefreshFromDatabase(savedAccount);
         var accountType           = ResolveAccountType(request.LoginType, savedAccount);
         var hasUnavailableSecrets = accountManager.HasUnavailableSecrets(savedAccount);
         var usedSavedCredential   = false;
@@ -97,6 +98,7 @@ internal sealed class SavedAccountLoginResolver
                     account => account.AccountType == XIVAccountType.WeGame
                                && string.Equals(account.WeGameLoginAccount, username, StringComparison.Ordinal)
                 );
+                accountManager.RefreshFromDatabase(savedAccount);
 
                 accountType = XIVAccountType.WeGame;
 
