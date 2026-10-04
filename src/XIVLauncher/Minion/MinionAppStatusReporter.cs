@@ -33,25 +33,48 @@ internal static class MinionAppStatusReporter
     public const string PROCESS_NAME = "MINIONAPP";
 
     /// <summary>MinionNetwork 里写死的监听端口</summary>
-    private const int UDP_PORT = 13451;
+    public const int UDP_PORT = 13451;
 
     /// <summary>GameStatus.GSRUNNING</summary>
-    private const byte STATUS_RUNNING = 5;
+    public const byte STATUS_RUNNING = 5;
 
     /// <summary>
     ///     GameStatus.GSNONE —— 它的状态机对这个状态直接 return（既不排队也不重启），
     ///     正是「这一行没在跑」该有的样子。
     ///     ⚠ 不要用 GSSTOPPING_ACCOUNT(-6)：那条分支会去 KillProcess + 杀 MinionLauncher_64 与 sdologin。
     /// </summary>
-    private const byte STATUS_NONE = 0;
+    public const byte STATUS_NONE = 0;
 
     /// <summary>MinionReceiveFilter 固定的包体长度</summary>
-    private const int PACKET_LENGTH = 40;
+    public const int PACKET_LENGTH = 40;
 
     private const int UID_LENGTH = 16;
 
+    /// <summary>补报「运行中」前等多久（UDP 不保证送达）</summary>
+    private static readonly TimeSpan ResendDelay = TimeSpan.FromSeconds(20);
+
+    /// <summary>同一进程的「停机」在这段时间内只报一次</summary>
+    private static readonly TimeSpan StopDedupWindow = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    ///     本次启动我们替哪个账号报过状态 —— 游戏退出时要按同一个账号报「停机」
+    /// </summary>
+    private static readonly ConcurrentDictionary<int, MinionAccount> ReportedAccounts = [];
+
+    /// <summary>最近报过「停机」的进程号与时间</summary>
+    private static readonly ConcurrentDictionary<int, DateTime> RecentlyStopped = [];
+
+    /// <summary>测试用: 代替「MINIONAPP 是否在运行」的判断</summary>
+    internal static Func<bool>? IsMinionAppRunningOverride { get; set; }
+
+    /// <summary>测试用: 代替 MINIONAPP 的 UDP 端口</summary>
+    internal static int? PortOverride { get; set; }
+
     public static bool IsMinionAppRunning()
     {
+        if (IsMinionAppRunningOverride is { } overrideCheck)
+            return overrideCheck();
+
         var processes = Process.GetProcessesByName(PROCESS_NAME);
 
         try
@@ -66,72 +89,100 @@ internal static class MinionAppStatusReporter
     }
 
     /// <summary>
-    ///     本次启动我们替哪个账号报过状态 —— 游戏退出时要按同一个账号报「停机」
+    ///     报一次「运行中」, 并在后台隔一会儿补一次（UDP 不保证送达; 种时间戳是幂等的, 多发无害）。不等补发, 立即返回。
     /// </summary>
-    private static readonly ConcurrentDictionary<int, MinionAccount> ReportedAccounts = [];
-
-    /// <summary>
-    ///     报一次「运行中」。UDP 不保证送达, 所以隔一会儿补一次（种时间戳是幂等的, 多发无害）。
-    /// </summary>
-    public static async Task SeedRunningStatusAsync(MinionAccount account, Process gameProcess, CancellationToken cancellationToken)
+    public static void SeedRunningStatus(MinionAccount account, Process gameProcess)
     {
-        if (BuildPacket(account, (uint)gameProcess.Id, STATUS_RUNNING) is not { } packet)
+        if (BuildPacket(account.Uid, account.Keycode, (uint)gameProcess.Id, STATUS_RUNNING) is not { } packet)
         {
             Log.Warning("[Minion] 账号 UID 不是 32 位十六进制({Uid}), 无法给 MINIONAPP 报状态", account.Uid);
             return;
         }
 
-        ReportedAccounts[gameProcess.Id] = account;
-        Send(packet, account, gameProcess.Id, "运行中");
+        var pid = gameProcess.Id;
+        ReportedAccounts[pid] = account;
+        RecentlyStopped.TryRemove(pid, out _);
+        Send(packet, account.Label, pid, "运行中");
 
-        try
-        {
-            await Task.Delay(TimeSpan.FromSeconds(20), cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            return;
-        }
+        _ = Task.Run
+        (async () =>
+            {
+                await Task.Delay(ResendDelay).ConfigureAwait(false);
 
-        if (gameProcess.HasExited)
-            return;
+                try
+                {
+                    if (gameProcess.HasExited)
+                        return;
+                }
+                catch (InvalidOperationException)
+                {
+                    return;
+                }
 
-        Send(packet, account, gameProcess.Id, "运行中");
+                Send(packet, account.Label, pid, "运行中");
+            }
+        );
     }
 
     /// <summary>
     ///     游戏退出后报「停机」—— 不报的话 MINIONAPP 会把这一行转成「排队开始」并过一分钟自己拉新实例。
-    ///     只对本启动器报过状态的进程做, 不碰 MINIONAPP 自己管的会话。
+    ///     只对本启动器挂过的进程做（本进程报过「运行中」的, 或占用记录里带 Minion 行 UID 的）, 不碰 MINIONAPP 自己管的会话。
     /// </summary>
-    public static void ReportStopped(int gamePid)
+    /// <param name="gamePid">已退出的游戏进程号</param>
+    /// <param name="minionUid">占用记录里的 Minion 行 UID（本进程没报过时用）</param>
+    public static void ReportStopped(int gamePid, string? minionUid = null)
     {
-        if (!ReportedAccounts.TryRemove(gamePid, out var account))
+        string? uid;
+        string? keycode = null;
+        string  label;
+
+        if (ReportedAccounts.TryRemove(gamePid, out var account))
+        {
+            uid     = account.Uid;
+            keycode = account.Keycode;
+            label   = account.Label;
+        }
+        else
+        {
+            uid   = minionUid ?? MinionOccupancy.Read(gamePid)?.MinionUid;
+            label = uid is { Length: >= 8 } ? uid[..8] : "?";
+        }
+
+        if (string.IsNullOrWhiteSpace(uid))
+            return;
+
+        var now = DateTime.UtcNow;
+
+        if (RecentlyStopped.TryGetValue(gamePid, out var last) && now - last < StopDedupWindow)
             return;
 
         if (!IsMinionAppRunning())
             return;
 
         // PID 报 0 = 这一行没有对应进程
-        if (BuildPacket(account, 0, STATUS_NONE) is not { } packet)
+        if (BuildPacket(uid, keycode, 0, STATUS_NONE) is not { } packet)
             return;
 
-        Send(packet, account, gamePid, "停机");
+        RecentlyStopped[gamePid] = now;
+        Send(packet, label, gamePid, "停机");
     }
 
-    private static void Send(byte[] packet, MinionAccount account, int gamePid, string what)
+    private static void Send(byte[] packet, string label, int gamePid, string what)
     {
+        var port = PortOverride ?? UDP_PORT;
+
         try
         {
             using var client = new UdpClient();
-            client.Send(packet, packet.Length, "127.0.0.1", UDP_PORT);
+            client.Send(packet, packet.Length, "127.0.0.1", port);
 
             Log.Information
             (
                 "[Minion] 已按 MINIONAPP 协议报「{What}」: 账号={Account}, PID={GamePid} → 127.0.0.1:{Port}",
                 what,
-                account.Label,
+                label,
                 gamePid,
-                UDP_PORT
+                port
             );
         }
         catch (Exception ex)
@@ -141,20 +192,21 @@ internal static class MinionAppStatusReporter
     }
 
     /// <summary>
-    ///     包体 40 字节: UuId(16) + KeyMd5(16) + PId(uint32) + Status(1) + 保留(3)
+    ///     包体 40 字节: UuId(16) + KeyMd5(16) + PId(uint32 小端) + Status(1) + 保留(3)
     ///     —— 见 MINIONAPP.Core.Networking 的 MinionPackage.GetStatusMessage / MinionReceiveFilter。
-    ///     KeyMd5 那 16 字节 MINIONAPP 收下但从不校验, 这里仍按 bot 的样子填 Keycode 的 MD5。
+    ///     KeyMd5 那 16 字节 MINIONAPP 收下但从不校验, 有 Keycode 时仍按 bot 的样子填它的 MD5, 没有就全 0。
+    ///     UID 不是 32 位十六进制时返回 null。
     /// </summary>
-    private static byte[]? BuildPacket(MinionAccount account, uint gamePid, byte status)
+    public static byte[]? BuildPacket(string? minionUid, string? keycode, uint gamePid, byte status)
     {
-        if (ParseUid(account.Uid) is not { } uid)
+        if (ParseUid(minionUid) is not { } uid)
             return null;
 
         var packet = new byte[PACKET_LENGTH];
         uid.CopyTo(packet, 0);
 
-        if (!string.IsNullOrWhiteSpace(account.Keycode))
-            MD5.HashData(Encoding.ASCII.GetBytes(account.Keycode)).CopyTo(packet, UID_LENGTH);
+        if (!string.IsNullOrWhiteSpace(keycode))
+            MD5.HashData(Encoding.ASCII.GetBytes(keycode)).CopyTo(packet, UID_LENGTH);
 
         BitConverter.GetBytes(gamePid).CopyTo(packet, 32);
         packet[36] = status;

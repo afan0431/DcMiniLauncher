@@ -28,12 +28,34 @@ public class RestartMonitor
         public static RestartOptions Normal => default;
     }
 
+    /// <summary>
+    ///     无人值守时的额外控制; 不传时行为与界面版一致（无限等崩溃处理器）
+    /// </summary>
+    public sealed record MonitorOptions
+    {
+        /// <summary>游戏退出后崩溃处理器最多再等多久（崩溃对话框没人选）; 超时结束崩溃处理器并按不重启处理。null = 一直等</summary>
+        public TimeSpan? CrashHandlerExitTimeout { get; init; }
+
+        /// <summary>游戏退出后崩溃处理器在这段时间内还没退出, 才算「崩溃对话框在等人」</summary>
+        public TimeSpan CrashDialogGrace { get; init; } = TimeSpan.FromSeconds(3);
+
+        /// <summary>游戏已退出而崩溃处理器还开着时回调, 参数为游戏进程号</summary>
+        public Action<int>? CrashHandlerOutlivedGame { get; init; }
+
+        /// <summary>崩溃处理器超时被结束时回调</summary>
+        public Action? CrashHandlerTimedOut { get; init; }
+
+        /// <summary>触发后不再重启: 游戏退出时不等崩溃处理器的决定, 还开着就结束它</summary>
+        public CancellationToken StopToken { get; init; }
+    }
+
     public async Task MonitorAsync
     (
         FFXIVProcess                              gameProcess,
         RestartOptions                            defaultRestartOptions,
         Func<RestartOptions, Task<FFXIVProcess?>> restartProcessAsync,
-        CancellationToken                         cancellationToken = default
+        CancellationToken                         cancellationToken = default,
+        MonitorOptions?                           monitorOptions    = null
     )
     {
         // 必须在游戏存活时就抓住崩溃处理器句柄: 重启 / 杀死路径下它终止游戏后会立即退出,
@@ -48,9 +70,20 @@ public class RestartMonitor
             return;
         }
 
-        // 崩溃处理器在终止游戏后才退出, 其退出码即重启决策
-        // 崩溃对话框可能长时间停留等待用户选择, 故此处无限等待(可取消)
-        await crashHandler.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+        if (monitorOptions == null)
+        {
+            // 崩溃处理器在终止游戏后才退出, 其退出码即重启决策
+            // 崩溃对话框可能长时间停留等待用户选择, 故此处无限等待(可取消)
+            await crashHandler.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else if (!await WaitForCrashHandlerAsync(crashHandler, gameProcess.ProcessID, monitorOptions, cancellationToken).ConfigureAwait(false))
+            return;
+
+        if (monitorOptions?.StopToken.IsCancellationRequested == true)
+        {
+            Log.Information("已要求停止守护, 不处理崩溃处理器的重启决定");
+            return;
+        }
 
         var exitCode = (uint)crashHandler.ExitCode;
 
@@ -73,6 +106,65 @@ public class RestartMonitor
 
         if (restartedProcess == null)
             Log.Error("重启游戏失败");
+    }
+
+    /// <summary>
+    ///     有限等待崩溃处理器退出。返回 true = 它已自己退出（可读退出码）; false = 超时或要求停止, 已结束它, 按不重启处理。
+    /// </summary>
+    private static async Task<bool> WaitForCrashHandlerAsync(Process crashHandler, int gamePid, MonitorOptions options, CancellationToken cancellationToken)
+    {
+        if (await WaitForExitAsync(crashHandler, options.CrashDialogGrace, options.StopToken, cancellationToken).ConfigureAwait(false))
+            return true;
+
+        if (!options.StopToken.IsCancellationRequested)
+        {
+            Log.Warning("游戏进程 {GamePid} 已退出, Dalamud 崩溃处理器仍开着（崩溃对话框在等人选择）", gamePid);
+            options.CrashHandlerOutlivedGame?.Invoke(gamePid);
+
+            if (await WaitForExitAsync(crashHandler, options.CrashHandlerExitTimeout, options.StopToken, cancellationToken).ConfigureAwait(false))
+                return true;
+        }
+
+        if (options.StopToken.IsCancellationRequested)
+            Log.Information("已要求停止守护, 结束仍开着的 Dalamud 崩溃处理器");
+        else
+        {
+            Log.Warning("Dalamud 崩溃处理器 {Timeout} 内没有退出, 结束它并按不重启处理", options.CrashHandlerExitTimeout);
+            options.CrashHandlerTimedOut?.Invoke();
+        }
+
+        try
+        {
+            if (!crashHandler.HasExited)
+                crashHandler.Kill();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "结束 Dalamud 崩溃处理器失败");
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    ///     等进程退出; timeout 为 null 时只受 stopToken / cancellationToken 限制。返回是否已退出。
+    /// </summary>
+    private static async Task<bool> WaitForExitAsync(Process process, TimeSpan? timeout, CancellationToken stopToken, CancellationToken cancellationToken)
+    {
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(stopToken, cancellationToken);
+
+        if (timeout is { } limit)
+            linked.CancelAfter(limit);
+
+        try
+        {
+            await process.WaitForExitAsync(linked.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return process.HasExited;
+        }
     }
 
     private static RestartOptions? MapRestartDecision(uint exitCode, RestartOptions defaultRestartOptions) =>

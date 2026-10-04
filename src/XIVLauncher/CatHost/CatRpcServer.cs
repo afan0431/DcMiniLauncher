@@ -23,10 +23,14 @@ public interface ICatRpcHandler
 /// <summary>
 ///     dml-cat/1 命名管道服务端: 一行一帧的 JSON-RPC 2.0, 第一帧必须是带正确令牌的 hello;
 ///     同一时刻只有一个连接, 断开后可用同一令牌重连; 没有连接时事件先缓存, 重连握手后补发。
+///     缓存满时先丢最旧的 launcher.log, 没有日志可丢才丢最旧的其它事件。
 /// </summary>
 public sealed class CatRpcServer : IDisposable
 {
-    private const int MAX_BUFFERED_EVENTS = 512;
+    /// <summary>断线期间最多缓存的事件数</summary>
+    public const int MAX_BUFFERED_EVENTS = 512;
+
+    private const string LOG_EVENT_METHOD = "launcher.log";
 
     private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(15);
 
@@ -38,7 +42,7 @@ public sealed class CatRpcServer : IDisposable
     private readonly string         launcherVersion;
 
     private readonly SemaphoreSlim  writeLock      = new(1, 1);
-    private readonly Queue<byte[]>  bufferedEvents = new();
+    private readonly LinkedList<(string Method, byte[] Frame)> bufferedEvents = new();
     private readonly object         stateLock      = new();
 
     private Stream?                 activeStream;
@@ -229,7 +233,7 @@ public sealed class CatRpcServer : IDisposable
 
             if (stream == null)
             {
-                Buffer(frame);
+                Buffer(method, frame);
                 return;
             }
         }
@@ -241,7 +245,7 @@ public sealed class CatRpcServer : IDisposable
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
         {
             lock (stateLock)
-                Buffer(frame);
+                Buffer(method, frame);
 
             DeactivateSession(stream);
         }
@@ -417,15 +421,15 @@ public sealed class CatRpcServer : IDisposable
                     return;
                 }
 
-                frame = bufferedEvents.Peek();
+                frame = bufferedEvents.First!.Value.Frame;
             }
 
             await WriteFrameAsync(stream, frame, cancellationToken).ConfigureAwait(false);
 
             lock (stateLock)
             {
-                if (bufferedEvents.Count > 0 && ReferenceEquals(bufferedEvents.Peek(), frame))
-                    bufferedEvents.Dequeue();
+                if (bufferedEvents.First is { } first && ReferenceEquals(first.Value.Frame, frame))
+                    bufferedEvents.RemoveFirst();
             }
         }
     }
@@ -442,12 +446,25 @@ public sealed class CatRpcServer : IDisposable
         }
     }
 
-    private void Buffer(byte[] frame)
+    private void Buffer(string method, byte[] frame)
     {
-        bufferedEvents.Enqueue(frame);
+        bufferedEvents.AddLast((method, frame));
 
         while (bufferedEvents.Count > MAX_BUFFERED_EVENTS)
-            bufferedEvents.Dequeue();
+        {
+            var victim = bufferedEvents.First;
+
+            for (var node = bufferedEvents.First; node != null; node = node.Next)
+            {
+                if (node.Value.Method == LOG_EVENT_METHOD)
+                {
+                    victim = node;
+                    break;
+                }
+            }
+
+            bufferedEvents.Remove(victim!);
+        }
     }
 
     private void ResetPipeConnection()

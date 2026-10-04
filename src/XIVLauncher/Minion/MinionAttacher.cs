@@ -147,13 +147,16 @@ public static class MinionAttacher
 
         var result = await SpawnLauncherAsync(account, installPath, gamePath, gameProcess, cancellationToken).ConfigureAwait(false);
 
-        // MINIONAPP 开着时, 它的看门狗会把「我们挂的、它没记过账的」会话当成卡死的杀掉,
-        // 所以按它自己的协议先替 bot 报一次「运行中」把计时器种上（见 MinionAppStatusReporter）
-        if (result.Ok && MinionAppStatusReporter.IsMinionAppRunning())
-            await MinionAppStatusReporter.SeedRunningStatusAsync(account, gameProcess, cancellationToken).ConfigureAwait(false);
+        if (!result.Ok)
+            return result;
 
-        if (result.Ok)
-            WriteOccupancy(account, gameProcess, accountName);
+        // 先落占用记录（带 Minion 行 UID, 本进程不在时别人也能据此补报停机）, 再报结果
+        WriteOccupancy(account, gameProcess, accountName);
+
+        // MINIONAPP 开着时, 它的看门狗会把「我们挂的、它没记过账的」会话当成卡死的杀掉,
+        // 所以按它自己的协议先替 bot 报一次「运行中」把计时器种上（见 MinionAppStatusReporter）; 补发在后台, 不拖慢结果
+        if (MinionAppStatusReporter.IsMinionAppRunning())
+            MinionAppStatusReporter.SeedRunningStatus(account, gameProcess);
 
         return result;
     }
@@ -293,6 +296,7 @@ public static class MinionAttacher
                     CardFingerprint  = MinionCards.Fingerprint(account.Keycode),
                     Variant          = MinionCards.VariantOf(account),
                     AccountName      = accountName,
+                    MinionUid        = string.IsNullOrWhiteSpace(account.Uid) ? null : account.Uid.Trim(),
                     AttachedAt       = DateTimeOffset.UtcNow
                 },
                 gameProcess

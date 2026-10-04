@@ -2,6 +2,7 @@ using System.Windows;
 using Serilog;
 using Velopack;
 using Velopack.Sources;
+using XIVLauncher.CatHost;
 using XIVLauncher.Common.Constant;
 using XIVLauncher.Common.Http;
 using XIVLauncher.Common.Network;
@@ -17,6 +18,16 @@ internal class UpdateOrchestrator
     INetworkEnvironmentService? networkEnvironmentService = null
 )
 {
+    /// <summary>有游戏在由 Cat 运行时给用户看的提示</summary>
+    internal const string CAT_RUNNING_MESSAGE = "有游戏正在由 Cat 运行, 本次先不更新启动器, 稍后再更新";
+
+    private static readonly TimeSpan CatRunningMessageDelay = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    ///     有游戏在由 Cat（无界面启动）运行时不应用更新: Velopack 应用更新会结束安装目录下的所有进程, 包括守护游戏的无界面进程
+    /// </summary>
+    internal static Func<bool> IsCatHostRunning { get; set; } = CatHostPresence.IsAnyRunning;
+
     public async Task<bool> Run
     (
         bool             downloadPrerelease,
@@ -27,6 +38,9 @@ internal class UpdateOrchestrator
     {
         _ = downloadPrerelease;
         _ = settings; // 只在上游「检查失败是否继续」那段用到, 本 fork 检查失败一律继续
+
+        if (await SkipBecauseCatIsRunningAsync(loadingDialog, "检查").ConfigureAwait(false))
+            return true;
 
         try
         {
@@ -76,6 +90,10 @@ internal class UpdateOrchestrator
                 }
             );
 
+            // 下载期间可能有游戏刚由 Cat 起来; 已下载的更新留到下次启动再装
+            if (await SkipBecauseCatIsRunningAsync(loadingDialog, "安装").ConfigureAwait(false))
+                return true;
+
             loadingDialog?.SetMessage("正在安装启动器更新...");
             loadingDialog?.ReportProgress(100);
 
@@ -115,6 +133,17 @@ internal class UpdateOrchestrator
             Log.Warning(ex, "启动器更新检查失败, 继续使用当前版本: {Error}", GetUpdateFailureMessage(ex));
             return true;
         }
+    }
+
+    private static async Task<bool> SkipBecauseCatIsRunningAsync(LoadingDialog? loadingDialog, string step)
+    {
+        if (!IsCatHostRunning())
+            return false;
+
+        Log.Information("有游戏正在由 Cat 运行, 跳过启动器更新{Step}", step);
+        loadingDialog?.SetMessage(CAT_RUNNING_MESSAGE);
+        await Task.Delay(CatRunningMessageDelay).ConfigureAwait(false);
+        return true;
     }
 
     internal static string GetUpdateFailureMessage(Exception exception) =>

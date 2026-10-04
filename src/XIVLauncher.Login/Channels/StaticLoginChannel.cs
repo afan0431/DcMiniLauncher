@@ -28,7 +28,12 @@ public sealed class StaticLoginChannel
                      ).ConfigureAwait(false);
 
         if (result.ReturnCode == (int)LoginExceptionCode.RiskEnvironment)
+        {
+            if (request.StopOnSafePhoneVerification)
+                throw new LoginException(result.ReturnCode, result.Data.FailReason ?? "登录环境存在风险, 需要安全手机短信验证");
+
             result = await LoginBySafePhoneSmsAsync(request, result, cancellationToken).ConfigureAwait(false);
+        }
 
         if (NeedsStaticCaptcha(result))
             result = await LoginByStaticCaptchaAsync(request, guid, result, cancellationToken).ConfigureAwait(false);

@@ -92,19 +92,68 @@ public static class MinionCards
     /// <param name="fingerprint">卡指纹</param>
     /// <param name="variant"><see cref="VARIANT_CN" /> 或 <see cref="VARIANT_GLOBAL" /></param>
     /// <param name="cnGameRoots">国服游戏目录, 空项忽略</param>
-    public static MinionAccount? FindByCard(IEnumerable<MinionAccount> accounts, string fingerprint, string variant, IEnumerable<string?> cnGameRoots)
+    public static MinionAccount? FindByCard(IEnumerable<MinionAccount> accounts, string fingerprint, string variant, IEnumerable<string?> cnGameRoots) =>
+        SelectRow(accounts, fingerprint, variant, cnGameRoots, new HashSet<string>()).Row;
+
+    /// <summary>
+    ///     按卡指纹与 variant 选一行, 跳过已挂在别的活着的游戏上的行（按占用记录里的 Minion 行 UID）;
+    ///     符合的行都被占用时仍取第一行并在说明里写明。说明逐行写出判定依据（UID 前 8 位、执行程序路径、判成的 variant、是否占用）, 不含 Keycode。
+    /// </summary>
+    /// <param name="accounts">Accounts.json 的全部行</param>
+    /// <param name="fingerprint">卡指纹</param>
+    /// <param name="variant"><see cref="VARIANT_CN" /> 或 <see cref="VARIANT_GLOBAL" /></param>
+    /// <param name="cnGameRoots">国服游戏目录, 空项忽略</param>
+    /// <param name="occupiedUids">已被占用的 Minion 行 UID（大小写不敏感比较）</param>
+    public static MinionCardSelection SelectRow
+    (
+        IEnumerable<MinionAccount> accounts,
+        string                     fingerprint,
+        string                     variant,
+        IEnumerable<string?>       cnGameRoots,
+        IReadOnlySet<string>       occupiedUids
+    )
     {
         if (!IsValidFingerprint(fingerprint) || !IsValidVariant(variant))
-            return null;
+            return new MinionCardSelection(null, ["卡指纹或 variant 无效"], false);
 
-        var roots = cnGameRoots.ToList();
+        var roots      = cnGameRoots.ToList();
+        var rootsText  = string.Join("; ", roots.Where(x => !string.IsNullOrWhiteSpace(x)));
+        var notes      = new List<string> { $"国服游戏目录: {(rootsText.Length == 0 ? "(未配置)" : rootsText)}" };
+        var candidates = new List<MinionAccount>();
 
-        return accounts.FirstOrDefault
-        (account => !string.IsNullOrWhiteSpace(account.Keycode) &&
-                    string.Equals(VariantOf(account, roots), variant, StringComparison.Ordinal) &&
-                    string.Equals(Fingerprint(account.Keycode), fingerprint, StringComparison.Ordinal)
-        );
+        foreach (var account in accounts)
+        {
+            if (string.IsNullOrWhiteSpace(account.Keycode) || !string.Equals(Fingerprint(account.Keycode), fingerprint, StringComparison.Ordinal))
+                continue;
+
+            var rowVariant = VariantOf(account, roots);
+            var occupied   = IsOccupied(account, occupiedUids);
+            var uid        = string.IsNullOrWhiteSpace(account.Uid) ? "(无 UID)" : account.Uid.Trim()[..Math.Min(8, account.Uid.Trim().Length)];
+
+            notes.Add
+            (
+                $"行 UID {uid}: 执行程序 {(string.IsNullOrWhiteSpace(account.PathToExe) ? "(空, 按国服)" : account.PathToExe)} → {rowVariant}" +
+                (occupied ? ", 已挂在别的游戏上" : string.Empty)
+            );
+
+            if (string.Equals(rowVariant, variant, StringComparison.Ordinal))
+                candidates.Add(account);
+        }
+
+        if (candidates.Count == 0)
+            return new MinionCardSelection(null, notes, false);
+
+        var free = candidates.FirstOrDefault(x => !IsOccupied(x, occupiedUids));
+
+        if (free != null)
+            return new MinionCardSelection(free, notes, false);
+
+        notes.Add("符合的行都已挂在别的游戏上, 仍选第一行");
+        return new MinionCardSelection(candidates[0], notes, true);
     }
+
+    private static bool IsOccupied(MinionAccount account, IReadOnlySet<string> occupiedUids) =>
+        !string.IsNullOrWhiteSpace(account.Uid) && occupiedUids.Contains(account.Uid.Trim());
 
     /// <summary>
     ///     规范化完整路径后按目录前缀比较（大小写不敏感）, 判断 <paramref name="path" /> 是否位于 <paramref name="directory" /> 之下
@@ -133,3 +182,11 @@ public static class MinionCards
         return fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 }
+
+/// <summary>
+///     按卡选行的结果
+/// </summary>
+/// <param name="Row">选中的行; 没有符合的行为 null</param>
+/// <param name="Notes">判定依据, 逐行写给日志</param>
+/// <param name="AllOccupied">符合的行都已被占用（仍选了第一行）</param>
+public sealed record MinionCardSelection(MinionAccount? Row, IReadOnlyList<string> Notes, bool AllOccupied);

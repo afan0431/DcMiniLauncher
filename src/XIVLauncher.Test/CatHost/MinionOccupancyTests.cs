@@ -91,7 +91,7 @@ public sealed class MinionOccupancyTests : IDisposable
             CardFingerprint  = "0123456789abcdef",
             Variant          = MinionCards.VARIANT_CN,
             AccountName      = "acc",
-            AttachedAt       = DateTimeOffset.UtcNow
+            AttachedAt       = DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
         };
 
     private static Process StartSleeper()

@@ -36,6 +36,9 @@ public partial class App
             exitCode = CatHostRuntime.EXIT_UNHANDLED;
         }
 
+        if (CatHostRuntime.Host is { } host && !await host.DrainEventsAsync(CatFinalDeliveryTimeout).ConfigureAwait(false))
+            Log.Warning("[CatHost] 退出前事件队列没有清空");
+
         if (CatHostRuntime.Server is { } server)
         {
             if (!await server.WaitForDeliveryAsync(CatFinalDeliveryTimeout).ConfigureAwait(false))
@@ -44,6 +47,7 @@ public partial class App
             server.Dispose();
         }
 
+        CatHostPresence.Release();
         Log.Information("[CatHost] 进程退出, 退出码 {ExitCode}", exitCode);
         await Log.CloseAndFlushAsync().ConfigureAwait(false);
         Environment.Exit(exitCode);
@@ -65,6 +69,9 @@ public partial class App
             AppUtil.GetGitHash(),
             CatHostMode.IsSimulate ? " 模拟模式" : string.Empty
         );
+
+        // 运行期间让界面版知道有游戏在由 Cat 运行, 不要应用启动器更新
+        CatHostPresence.Hold();
 
         var bootstrapLine = await ReadBootstrapLineAsync().ConfigureAwait(false);
 

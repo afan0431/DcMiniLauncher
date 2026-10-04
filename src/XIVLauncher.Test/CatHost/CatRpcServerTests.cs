@@ -159,7 +159,7 @@ public sealed class CatRpcServerTests : IDisposable
 
         runner.Reporter!.Started(777, DateTimeOffset.UtcNow);
         runner.Reporter.Exited(777, 0);
-        Assert.Equal(2, server.BufferedEventCount);
+        await WaitUntilAsync(() => server.BufferedEventCount == 2);
 
         await using var second = await ConnectAndHelloAsync();
         var seen = new List<(string Method, JsonNode? Params)>();
@@ -167,6 +167,142 @@ public sealed class CatRpcServerTests : IDisposable
 
         Assert.Equal(["game.started", "game.exited"], seen.Select(x => x.Method));
         Assert.Equal(0, server.BufferedEventCount);
+    }
+
+    [Fact]
+    public async Task Close_BeforeLaunch_EndsProcessWithExitOk_AndRejectsLaterLaunch()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var close = await client.RequestAsync("close", new { });
+        Assert.True(close["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal(0, await host.Completion.WaitAsync(Timeout));
+
+        var launch = await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false });
+        Assert.False(launch["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("closing", launch["result"]!["code"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Close_AfterLaunch_AsksRunnerToClose_WithTimeout_AndIsIdempotent()
+    {
+        await using var client = await ConnectAndHelloAsync();
+        await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false });
+        await runner.Started.Task.WaitAsync(Timeout);
+        runner.Reporter!.Started(4321, DateTimeOffset.UtcNow);
+        runner.Reporter.Stage(CatStages.RUNNING);
+
+        var first  = await client.RequestAsync("close", new { timeoutSeconds = 7 });
+        var second = await client.RequestAsync("close", new { });
+
+        Assert.True(first["result"]!["accepted"]!.GetValue<bool>());
+        Assert.True(second["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Closed.Task.WaitAsync(Timeout);
+        Assert.Equal(TimeSpan.FromSeconds(7), runner.CloseTimeout);
+
+        var inject = await client.RequestAsync("inject", new { minion = true });
+        Assert.Equal("notRunning", inject["result"]!["code"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Close_InvalidTimeout_IsRejected()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var close = await client.RequestAsync("close", new { timeoutSeconds = 100000 });
+
+        Assert.False(close["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", close["result"]!["code"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Launch_PassesCrashDialogTimeout_AndRejectsOutOfRange()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var bad = await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = true, crashDialogTimeoutSeconds = 0 });
+        Assert.Equal("invalidParams", bad["result"]!["code"]!.GetValue<string>());
+
+        var ok = await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = true, crashDialogTimeoutSeconds = 30 });
+        Assert.True(ok["result"]!["accepted"]!.GetValue<bool>());
+
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.Equal(TimeSpan.FromSeconds(30), runner.Request!.CrashDialogTimeout);
+    }
+
+    [Fact]
+    public async Task Inject_PassesForce_ToRunner()
+    {
+        await using var client = await ConnectAndHelloAsync();
+        await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false });
+        await runner.Started.Task.WaitAsync(Timeout);
+        runner.Reporter!.Started(1234, DateTimeOffset.UtcNow);
+        runner.Reporter.Stage(CatStages.RUNNING);
+
+        await client.RequestAsync("inject", new { minion = true });
+        var plain = client.WaitForEvent("game.agent", Timeout);
+        Assert.Equal("alreadyAttached", plain.Params!["code"]!.GetValue<string>());
+
+        await client.RequestAsync("inject", new { minion = true, force = true });
+        var forced = client.WaitForEvent("game.agent", Timeout);
+        Assert.Null(forced.Params!["code"]);
+    }
+
+    [Fact]
+    public async Task Crashed_And_ExitedWithReason_AreSentWithOperationId()
+    {
+        await using var client = await ConnectAndHelloAsync();
+        await client.RequestAsync("launch", new { operationId = "op-c", accountName = "acc", dalamud = true });
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        runner.Reporter!.Crashed(55);
+        runner.Reporter.Exited(55, 1, CatExitReasons.RESTART_FAILED, CatCodes.AUTHORIZATION_REQUIRED, "票据刷新失败");
+
+        var crashed = client.WaitForEvent("game.crashed", Timeout);
+        Assert.Equal("op-c", crashed.Params!["operationId"]!.GetValue<string>());
+        Assert.Equal(55, crashed.Params["pid"]!.GetValue<int>());
+
+        var exited = client.WaitForEvent("game.exited", Timeout);
+        Assert.Equal("restartFailed", exited.Params!["reason"]!.GetValue<string>());
+        Assert.Equal("authorizationRequired", exited.Params["code"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task BufferOverflow_DropsLogEventsFirst()
+    {
+        await server.NotifyAsync("game.started", new { pid = 1 });
+
+        for (var i = 0; i < CatRpcServer.MAX_BUFFERED_EVENTS + 20; i++)
+            await server.NotifyAsync("launcher.log", new { level = "information", message = $"log {i}" });
+
+        await server.NotifyAsync("game.exited", new { pid = 1 });
+
+        Assert.Equal(CatRpcServer.MAX_BUFFERED_EVENTS, server.BufferedEventCount);
+
+        await using var client = await ConnectAndHelloAsync();
+        var seen = new List<(string Method, JsonNode? Params)>();
+        client.WaitForEvent("game.exited", Timeout, seen);
+
+        Assert.Equal("game.started", seen[0].Method);
+        Assert.Equal(CatRpcServer.MAX_BUFFERED_EVENTS, seen.Count);
+    }
+
+    [Fact]
+    public async Task Host_DoesNotBlockReporter_WhenPublishingHangs()
+    {
+        var never = new TaskCompletionSource();
+        var stuck = new CatLaunchHost(new FakeGameRunner(), (_, _) => never.Task, new CatLogRedactor());
+
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+
+        for (var i = 0; i < 100; i++)
+            stuck.Stage(CatStages.RUNNING);
+
+        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(2));
+        Assert.True(stuck.PendingEventCount > 0);
+        Assert.False(await stuck.DrainEventsAsync(TimeSpan.FromMilliseconds(100)));
+        never.TrySetResult();
+        Assert.True(await stuck.DrainEventsAsync(Timeout));
     }
 
     [Fact]
