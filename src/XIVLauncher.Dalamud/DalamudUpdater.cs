@@ -133,7 +133,8 @@ public class DalamudUpdater
                         try
                         {
                             // 多个启动器进程（界面版、Cat 的无界面启动）共用同一个 addon 目录, 同一时刻只允许一个在更新
-                            using (await CrossProcessMutex.AcquireAsync(UpdateMutexName, UpdateMutexTimeout).ConfigureAwait(false))
+                            // 拿不到锁（超时、无权打开）时不加锁照常更新, 不让它成为失败原因
+                            using (await CrossProcessMutex.TryAcquireAsync(UpdateMutexName, UpdateMutexTimeout).ConfigureAwait(false))
                                 await UpdateDalamud(refreshVersionInfo).ConfigureAwait(false);
 
                             isUpdated = true;

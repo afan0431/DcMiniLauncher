@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using XIVLauncher.CatHost;
 using XIVLauncher.Common.Game;
+using XIVLauncher.Common.Util;
 using Xunit;
 
 namespace XIVLauncher.Test.CatHost;
@@ -42,7 +43,7 @@ public sealed class CatHostLifecycleTests
         {
             UseShellExecute = false,
             CreateNoWindow  = true,
-            Arguments       = $"/c start \"\" /b \"{handlerExe}\" -n 60 127.0.0.1 >nul & ping -n 3 127.0.0.1 >nul"
+            Arguments       = $"/c start \"\" /b \"{handlerExe}\" -n 60 127.0.0.1 >nul & ping -n 3 127.0.0.1 >nul & exit 3"
         };
 
         using var game = new FFXIVProcess(Process.Start(startInfo)!);
@@ -100,6 +101,126 @@ public sealed class CatHostLifecycleTests
     }
 
     [Fact]
+    public async Task RestartMonitor_DialogWhileGameAlive_ReportsCrash_ThenKillsGameAndHandlerAfterTimeout()
+    {
+        var (directory, handlerExe) = PrepareFakeCrashHandler();
+
+        // 「游戏」一直活着, 崩溃处理器（改名的 ping）是它的子进程; 用探测函数模拟「弹出了对话框」
+        var startInfo = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"))
+        {
+            UseShellExecute = false,
+            CreateNoWindow  = true,
+            Arguments       = $"/c start \"\" /b \"{handlerExe}\" -n 60 127.0.0.1 >nul & ping -n 60 127.0.0.1 >nul"
+        };
+
+        using var game = new FFXIVProcess(Process.Start(startInfo)!);
+
+        var crashedPid = 0;
+        var timedOut   = false;
+        var restarted  = false;
+
+        try
+        {
+            await new RestartMonitor().MonitorAsync
+                                      (
+                                          game,
+                                          RestartMonitor.RestartOptions.Normal,
+                                          _ =>
+                                          {
+                                              restarted = true;
+                                              return Task.FromResult<FFXIVProcess?>(null);
+                                          },
+                                          CancellationToken.None,
+                                          new RestartMonitor.MonitorOptions
+                                          {
+                                              CrashDialogDetector      = _ => true,
+                                              DialogPollInterval       = TimeSpan.FromMilliseconds(100),
+                                              CrashHandlerExitTimeout  = TimeSpan.FromSeconds(1),
+                                              CrashHandlerOutlivedGame = pid => crashedPid = pid,
+                                              CrashHandlerTimedOut     = () => timedOut = true
+                                          }
+                                      )
+                                      .WaitAsync(Timeout);
+
+            Assert.Equal(game.ProcessID, crashedPid);
+            Assert.True(timedOut);
+            Assert.False(restarted);
+            Assert.True(game.UnderlyingProcess.HasExited);
+            Assert.DoesNotContain(Process.GetProcessesByName("DalamudCrashHandler"), x => SafePath(x) == handlerExe);
+        }
+        finally
+        {
+            Cleanup(directory, handlerExe);
+
+            if (!game.UnderlyingProcess.HasExited)
+                game.UnderlyingProcess.Kill(true);
+        }
+    }
+
+    [Fact]
+    public async Task RestartMonitor_NormalGameExit_WithSlowHandler_DoesNotReportCrash()
+    {
+        var (directory, handlerExe) = PrepareFakeCrashHandler();
+
+        var startInfo = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"))
+        {
+            UseShellExecute = false,
+            CreateNoWindow  = true,
+            Arguments       = $"/c start \"\" /b \"{handlerExe}\" -n 60 127.0.0.1 >nul & ping -n 3 127.0.0.1 >nul & exit 0"
+        };
+
+        using var game = new FFXIVProcess(Process.Start(startInfo)!);
+
+        var crashed  = false;
+        var timedOut = false;
+
+        try
+        {
+            await new RestartMonitor().MonitorAsync
+                                      (
+                                          game,
+                                          RestartMonitor.RestartOptions.Normal,
+                                          _ => Task.FromResult<FFXIVProcess?>(null),
+                                          CancellationToken.None,
+                                          new RestartMonitor.MonitorOptions
+                                          {
+                                              CrashDialogDetector      = _ => false,
+                                              CrashDialogGrace         = TimeSpan.FromMilliseconds(300),
+                                              CrashHandlerExitTimeout  = TimeSpan.FromSeconds(1),
+                                              CrashHandlerOutlivedGame = _ => crashed = true,
+                                              CrashHandlerTimedOut     = () => timedOut = true
+                                          }
+                                      )
+                                      .WaitAsync(Timeout);
+
+            Assert.False(crashed);
+            Assert.False(timedOut);
+            Assert.DoesNotContain(Process.GetProcessesByName("DalamudCrashHandler"), x => SafePath(x) == handlerExe);
+        }
+        finally
+        {
+            Cleanup(directory, handlerExe);
+        }
+    }
+
+    [Fact]
+    public async Task CrossProcessMutex_IsExclusive_AndTryAcquireNeverThrows()
+    {
+        var name = "Local\\CatTestMutex-" + Guid.NewGuid().ToString("N");
+
+        using (await CrossProcessMutex.AcquireAsync(name, Timeout))
+            Assert.Null(await CrossProcessMutex.TryAcquireAsync(name, TimeSpan.FromMilliseconds(200)));
+
+        using (var again = await CrossProcessMutex.TryAcquireAsync(name, Timeout))
+            Assert.NotNull(again);
+
+        // 打不开的名字（不存在的命名空间）: 异常经任务抛出, 不会在后台线程里把进程带崩
+        var invalid = "NoSuchNamespace\\CatTestMutex";
+        await Assert.ThrowsAnyAsync<Exception>(() => CrossProcessMutex.AcquireAsync(invalid, Timeout));
+        Assert.Null(await CrossProcessMutex.TryAcquireAsync(invalid, Timeout));
+    }
+
+    [Fact]
     public async Task Host_RunnerFaultAfterStart_WaitsForGameToEnd_ThenSendsGuardError()
     {
         var events = new List<(string Method, string Json)>();
@@ -137,6 +258,36 @@ public sealed class CatHostLifecycleTests
 
         Assert.True(await CatGameCloser.CloseAsync(process, TimeSpan.FromMilliseconds(200)).WaitAsync(Timeout));
         Assert.True(process.HasExited);
+    }
+
+    private static (string Directory, string HandlerExe) PrepareFakeCrashHandler()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "cat-crash-handler-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+
+        var handlerExe = Path.Combine(directory, "DalamudCrashHandler.exe");
+        File.Copy(Path.Combine(Environment.SystemDirectory, "PING.EXE"), handlerExe);
+        return (directory, handlerExe);
+    }
+
+    private static void Cleanup(string directory, string handlerExe)
+    {
+        foreach (var process in Process.GetProcessesByName("DalamudCrashHandler"))
+        {
+            if (SafePath(process) == handlerExe)
+                process.Kill();
+        }
+
+        Thread.Sleep(200);
+
+        try
+        {
+            Directory.Delete(directory, true);
+        }
+        catch
+        {
+            // 进程刚退出时文件可能还占着
+        }
     }
 
     private static Task Record(List<(string Method, string Json)> events, string method, object parameters)

@@ -151,6 +151,13 @@ internal static class MinionAppStatusReporter
         if (string.IsNullOrWhiteSpace(uid))
             return;
 
+        // 同一行还挂在别的活着的游戏上（同卡的行都被占用时会这样）, 报停机会让 MINIONAPP 把那边当卡死处理
+        if (MinionOccupancy.IsUidAttachedElsewhere(uid, gamePid))
+        {
+            Log.Information("[Minion] Minion 行 {Uid} 还挂在别的游戏上, 不报「停机」(PID={GamePid})", label, gamePid);
+            return;
+        }
+
         var now = DateTime.UtcNow;
 
         if (RecentlyStopped.TryGetValue(gamePid, out var last) && now - last < StopDedupWindow)

@@ -124,6 +124,25 @@ public sealed class MinionStopReportTests : IDisposable
     }
 
     [Fact]
+    public async Task ReportStopped_Skips_WhenSameUidIsAttachedToAnotherLiveGame()
+    {
+        using var live = StartSleeper();
+
+        try
+        {
+            MinionOccupancy.Write(NewRecord(live.Id, MinionOccupancy.GetProcessStartedAt(live), UID));
+
+            MinionAppStatusReporter.ReportStopped(FindUnusedPid(), UID);
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => ReceiveAsync(TimeSpan.FromMilliseconds(500)));
+        }
+        finally
+        {
+            live.Kill();
+        }
+    }
+
+    [Fact]
     public async Task WriteAndDeleteOnExit_ReportsStopWhenGameExits()
     {
         using var process = StartSleeper();

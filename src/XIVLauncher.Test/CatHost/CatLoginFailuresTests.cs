@@ -35,14 +35,28 @@ public sealed class CatLoginFailuresTests
     [Theory]
     [InlineData((int)LoginExceptionCode.FirstLoginOnDevice)]
     [InlineData((int)LoginExceptionCode.OutdatedLoginInfo)]
+    [InlineData((int)LoginExceptionCode.ThirdPartyVerificationFailed)]
     [InlineData(-10242301)]
-    [InlineData(-1)]
-    public void OtherLoginCodes_AreRejected(int code) =>
+    public void KnownRejectionCodes_AreRejected(int code) =>
         Assert.Equal(CatLoginFailureKind.Rejected, CatLoginFailures.Classify(new LoginException(code, "被拒")));
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(-10999999)]
+    public void UnknownLoginCodes_AreUnknown_SoNoPasswordFallback(int code) =>
+        Assert.Equal(CatLoginFailureKind.Unknown, CatLoginFailures.Classify(new LoginException(code, "服务器繁忙")));
+
+    [Fact]
+    public void OAuthErrors_AreUnknown() =>
+        Assert.Equal(CatLoginFailureKind.Unknown, CatLoginFailures.Classify(new OAuthLoginException("getGuid 失败")));
 
     [Fact]
     public void UnexpectedErrors_AreUnknown() =>
         Assert.Equal(CatLoginFailureKind.Unknown, CatLoginFailures.Classify(new NullReferenceException()));
+
+    [Fact]
+    public void Describe_IncludesReturnCode() =>
+        Assert.Contains("-10999999", CatLoginFailures.Describe(new InvalidOperationException("包装", new LoginException(-10999999, "繁忙"))));
 
     [Fact]
     public void ToCode_MapsKinds()

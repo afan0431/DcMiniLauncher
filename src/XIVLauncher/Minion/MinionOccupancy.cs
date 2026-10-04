@@ -190,6 +190,12 @@ public static class MinionOccupancy
     }
 
     /// <summary>
+    ///     这个 Minion 行 UID 是否还挂在除 <paramref name="exceptPid" /> 以外的活着的游戏上
+    /// </summary>
+    public static bool IsUidAttachedElsewhere(string uid, int exceptPid) =>
+        ReadAllLive().Any(x => x.Pid != exceptPid && string.Equals(x.MinionUid?.Trim(), uid.Trim(), StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
     ///     进程还活着的全部记录
     /// </summary>
     public static IReadOnlyList<MinionOccupancyRecord> ReadAllLive() =>

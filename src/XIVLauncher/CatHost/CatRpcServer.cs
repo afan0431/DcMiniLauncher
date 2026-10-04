@@ -46,6 +46,7 @@ public sealed class CatRpcServer : IDisposable
     private readonly object         stateLock      = new();
 
     private Stream?                 activeStream;
+    private int                     pendingResponses;
     private TaskCompletionSource    clientReady = NewSignal();
     private NamedPipeServerStream?  pipe;
 
@@ -204,7 +205,9 @@ public sealed class CatRpcServer : IDisposable
                 if (string.IsNullOrWhiteSpace(line))
                     continue;
 
-                _ = Task.Run(() => DispatchAsync(stream, line, cancellationToken), CancellationToken.None);
+                // 回复写出前计数, 退出前等它归零（如 close 触发退出时, close 的回复要先送到）
+                Interlocked.Increment(ref pendingResponses);
+                _ = Task.Run(() => DispatchCountedAsync(stream, line, cancellationToken), CancellationToken.None);
             }
         }
         finally
@@ -252,7 +255,7 @@ public sealed class CatRpcServer : IDisposable
     }
 
     /// <summary>
-    ///     等到有已握手的连接且缓存事件都已送出, 或超时
+    ///     等到有已握手的连接、缓存事件都已送出且已收到的请求都已回复, 或超时
     /// </summary>
     public async Task<bool> WaitForDeliveryAsync(TimeSpan timeout)
     {
@@ -260,7 +263,7 @@ public sealed class CatRpcServer : IDisposable
 
         while (DateTime.UtcNow < deadline)
         {
-            if (HasClient && BufferedEventCount == 0)
+            if (HasClient && BufferedEventCount == 0 && Volatile.Read(ref pendingResponses) == 0)
             {
                 // 等正在写的帧写完
                 await writeLock.WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
@@ -276,7 +279,7 @@ public sealed class CatRpcServer : IDisposable
             await Task.WhenAny(ready, Task.Delay(100)).ConfigureAwait(false);
         }
 
-        return HasClient && BufferedEventCount == 0;
+        return HasClient && BufferedEventCount == 0 && Volatile.Read(ref pendingResponses) == 0;
     }
 
     /// <inheritdoc />
@@ -320,6 +323,18 @@ public sealed class CatRpcServer : IDisposable
         catch (Exception ex) when (ex is JsonException or InvalidOperationException)
         {
             return false;
+        }
+    }
+
+    private async Task DispatchCountedAsync(Stream stream, string line, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await DispatchAsync(stream, line, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref pendingResponses);
         }
     }
 

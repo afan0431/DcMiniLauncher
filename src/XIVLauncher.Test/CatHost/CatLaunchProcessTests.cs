@@ -186,6 +186,64 @@ public sealed class CatLaunchProcessTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task SimulatedLaunch_CloseBeforeLaunch_RepliesThenExitsWithCode0()
+    {
+        var exe = FindLauncherExe();
+        Assert.True(exe != null, "找不到 XIVLauncherCN.exe, 先编译 XIVLauncher 项目");
+
+        var roamingPath = Path.Combine(Path.GetTempPath(), "cat-dml-e2e-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(roamingPath);
+
+        var pipeName = CatTestNames.NewPipeName();
+        var token    = CatTestNames.NewToken();
+
+        var startInfo = new ProcessStartInfo(exe!)
+        {
+            UseShellExecute        = false,
+            RedirectStandardInput  = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            WorkingDirectory       = Path.GetDirectoryName(exe)!
+        };
+        startInfo.ArgumentList.Add("--cat-launch");
+        startInfo.ArgumentList.Add("--cat-simulate");
+        startInfo.ArgumentList.Add($"--roamingPath={roamingPath}");
+
+        using var launcher = Process.Start(startInfo)!;
+        launcher.BeginOutputReadLine();
+        launcher.BeginErrorReadLine();
+
+        try
+        {
+            await launcher.StandardInput.WriteLineAsync(JsonSerializer.Serialize(new { pipeName, token }));
+            await launcher.StandardInput.FlushAsync();
+
+            await using var client = await ConnectWithRetryAsync(pipeName);
+            await client.RequestAsync("hello", new { token });
+
+            var close = await client.RequestAsync("close", new { });
+            Assert.True(close["result"]!["accepted"]!.GetValue<bool>());
+
+            Assert.True(launcher.WaitForExit(Timeout));
+            Assert.Equal(0, launcher.ExitCode);
+        }
+        finally
+        {
+            if (!launcher.HasExited)
+                launcher.Kill(true);
+
+            try
+            {
+                Directory.Delete(roamingPath, true);
+            }
+            catch
+            {
+                // 日志文件可能还被占用
+            }
+        }
+    }
+
+    [Fact]
     public async Task InvalidBootstrap_ExitsWithCode2()
     {
         var exe = FindLauncherExe();
