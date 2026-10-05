@@ -163,12 +163,23 @@ internal sealed class FakeGameRunner : ICatGameRunner
         return Finish.Task;
     }
 
-    public Task InjectAsync(bool dalamud, bool minion, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    public TimeSpan? CloseTimeout { get; private set; }
+
+    public TaskCompletionSource Closed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task InjectAsync(bool dalamud, bool minion, bool force, ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
         if (dalamud)
             reporter.Agent(CatAgentKinds.DALAMUD, true);
         if (minion)
-            reporter.Agent(CatAgentKinds.MINION, true);
+            reporter.Agent(CatAgentKinds.MINION, true, force ? null : CatCodes.ALREADY_ATTACHED);
+        return Task.CompletedTask;
+    }
+
+    public Task CloseAsync(TimeSpan gracefulTimeout)
+    {
+        CloseTimeout = gracefulTimeout;
+        Closed.TrySetResult();
         return Task.CompletedTask;
     }
 }
@@ -198,14 +209,23 @@ internal sealed class RecordingReporter : ICatLaunchReporter
         Entries.Enqueue("started");
     }
 
-    public void Restarted(int oldPid, int pid, DateTimeOffset processStartedAt) =>
+    public void Restarted(int oldPid, int pid, DateTimeOffset processStartedAt)
+    {
+        Pid = pid;
         Entries.Enqueue("restarted");
+        Restart.TrySetResult();
+    }
+
+    public TaskCompletionSource Restart { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public void Crashed(int pid) =>
+        Entries.Enqueue("crashed");
 
     public void Agent(string kind, bool ok, string? code = null, string? message = null) =>
         Entries.Enqueue($"agent:{kind}:{(ok ? "ok" : code)}");
 
-    public void Exited(int pid, int? exitCode) =>
-        Entries.Enqueue("exited");
+    public void Exited(int pid, int? exitCode, string? reason = null, string? code = null, string? message = null) =>
+        Entries.Enqueue(reason == null ? "exited" : $"exited:{reason}");
 
     public void Failed(string code, string message) =>
         Entries.Enqueue($"failed:{code}");

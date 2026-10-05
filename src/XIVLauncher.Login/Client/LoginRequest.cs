@@ -18,6 +18,11 @@ public sealed class LoginRequest
     public Func<LoginCaptchaChallenge, string?>?  PromptCaptchaInput           { get; init; }
     public ILoginSessionRefreshSink?              LoginSessionRefreshSink      { get; init; }
 
+    /// <summary>
+    ///     无人值守: 密码登录遇到安全手机短信验证时直接失败, 不发起短信流程（没人能收短信, 发起了只会打扰客户）
+    /// </summary>
+    public bool StopOnSafePhoneVerification { get; init; }
+
     public static LoginRequest Create
     (
         string                                 account,

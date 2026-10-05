@@ -56,6 +56,11 @@ public class DalamudUpdater
         new(StringComparer.OrdinalIgnoreCase);
 
     private readonly DirectoryInfo addonDirectory;
+
+    /// <summary>等别的进程更新完 addon 目录的上限</summary>
+    private static readonly TimeSpan UpdateMutexTimeout = TimeSpan.FromMinutes(5);
+
+    private string UpdateMutexName => CrossProcessMutex.NameForPath("DcMiniLauncher-DalamudUpdate", addonDirectory.FullName);
     private readonly DirectoryInfo assetDirectory;
 
     private readonly HttpClient                 httpClient;
@@ -127,7 +132,11 @@ public class DalamudUpdater
                     {
                         try
                         {
-                            await UpdateDalamud(refreshVersionInfo).ConfigureAwait(false);
+                            // 多个启动器进程（界面版、Cat 的无界面启动）共用同一个 addon 目录, 同一时刻只允许一个在更新
+                            // 拿不到锁（超时、无权打开）时不加锁照常更新, 不让它成为失败原因
+                            using (await CrossProcessMutex.TryAcquireAsync(UpdateMutexName, UpdateMutexTimeout).ConfigureAwait(false))
+                                await UpdateDalamud(refreshVersionInfo).ConfigureAwait(false);
+
                             isUpdated = true;
                             break;
                         }

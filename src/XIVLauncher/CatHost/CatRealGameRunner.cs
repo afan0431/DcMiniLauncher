@@ -9,6 +9,7 @@ using XIVLauncher.Account.DeviceProfiles;
 using XIVLauncher.Common;
 using XIVLauncher.Common.Game;
 using XIVLauncher.Common.Game.Exceptions;
+using XIVLauncher.Common.Util;
 using XIVLauncher.CompanionApp;
 using XIVLauncher.Dalamud;
 using XIVLauncher.GamePatchV3.Update;
@@ -16,6 +17,7 @@ using XIVLauncher.GamePatchV3.Update.Models;
 using XIVLauncher.InGame;
 using XIVLauncher.Login.Channels;
 using XIVLauncher.Login.Client;
+using XIVLauncher.Login.Exceptions;
 using XIVLauncher.Login.Models;
 using XIVLauncher.Minion;
 using XIVLauncher.Support;
@@ -47,6 +49,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     private readonly SemaphoreSlim       quickKeyLock        = new(1, 1);
     private readonly object              cleanupLock         = new();
     private readonly HashSet<int>        cleanedPids         = [];
+    private readonly object              closeLock           = new();
+
+    /// <summary>选 Minion 行并写预占记录时持有, 防止同一张卡的号同时启动时选到同一行</summary>
+    private const string MINION_SELECT_MUTEX_NAME = @"Local\DcMiniLauncher-MinionSelect";
+
+    private static readonly TimeSpan MinionSelectMutexTimeout = TimeSpan.FromSeconds(30);
+    private readonly CancellationTokenSource closeCts        = new();
 
     private CatLaunchRequest       request        = null!;
     private AccountManager         accountManager = null!;
@@ -55,30 +64,58 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     private DeviceProfileSnapshot  device         = null!;
     private GameLaunchContext      context        = null!;
     private DCTravelRuntimeService? dcTravel;
-    private MinionAccount?         minionRow;
     private string?                quickKey;
     private FFXIVProcess?          currentProcess;
     private int                    lastPid;
     private int?                   lastExitCode;
+    private bool                   closeRequested;
+    private TimeSpan               closeTimeout = TimeSpan.FromSeconds(CatProtocol.DEFAULT_CLOSE_TIMEOUT_SECONDS);
+    private string?                exitReason;
+    private string?                exitFailureCode;
+    private string?                exitFailureMessage;
+
+    private bool IsCloseRequested
+    {
+        get
+        {
+            lock (closeLock)
+                return closeRequested;
+        }
+    }
 
     /// <inheritdoc />
     public async Task<int> RunAsync(CatLaunchRequest launchRequest, ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
         request = launchRequest;
 
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, closeCts.Token);
+
         try
         {
-            await PrepareAsync(reporter, cancellationToken).ConfigureAwait(false);
+            await PrepareAsync(reporter, linked.Token).ConfigureAwait(false);
 
-            using var final = await RunGameAsync(RestartMonitor.RestartOptions.Normal, null, reporter, cancellationToken).ConfigureAwait(false);
+            using var final = await RunGameAsync(RestartMonitor.RestartOptions.Normal, null, reporter, linked.Token, cancellationToken).ConfigureAwait(false);
 
-            reporter.Exited(lastPid, lastExitCode);
-            return 0;
+            if (IsCloseRequested)
+                reporter.Exited(lastPid, lastExitCode, CatExitReasons.CLOSED);
+            else
+                reporter.Exited(lastPid, lastExitCode, exitReason, exitFailureCode, exitFailureMessage);
+
+            return CatHostRuntime.EXIT_OK;
         }
-        catch (CatLaunchException ex)
+        catch (CatLaunchException ex) when (currentProcess == null)
         {
             reporter.Failed(ex.Code, ex.Message);
             return CatLaunchHost.EXIT_LAUNCH_FAILED;
+        }
+        catch (OperationCanceledException) when (currentProcess == null && IsCloseRequested)
+        {
+            reporter.Failed(CatCodes.CANCELLED, "启动途中收到关闭请求, 没有起游戏");
+            return CatLaunchHost.EXIT_LAUNCH_FAILED;
+        }
+        catch (Exception ex) when (currentProcess != null)
+        {
+            return await GuardAfterErrorAsync(ex, reporter).ConfigureAwait(false);
         }
         finally
         {
@@ -87,7 +124,59 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     }
 
     /// <inheritdoc />
-    public async Task InjectAsync(bool dalamud, bool minion, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    public async Task CloseAsync(TimeSpan gracefulTimeout)
+    {
+        FFXIVProcess? process;
+
+        lock (closeLock)
+        {
+            if (closeRequested)
+                return;
+
+            closeRequested = true;
+            closeTimeout   = gracefulTimeout;
+            process        = currentProcess;
+        }
+
+        Log.Information("[CatHost] 收到关闭请求, 不再崩溃重启");
+
+        // 取消启动途中的步骤、不再等崩溃处理器的重启决定
+        await closeCts.CancelAsync().ConfigureAwait(false);
+
+        // 游戏还没起来时由启动流程自己收尾; 正在创建进程时由创建方看到关闭请求后关
+        if (process != null)
+            await CatGameCloser.CloseAsync(process.UnderlyingProcess, gracefulTimeout).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     游戏起来后出了意外异常: 不再守护（崩溃重启、跨区刷新）, 但照样等游戏结束、补报 Minion 停机, 再发 game.exited。期间 close 仍可用。
+    /// </summary>
+    private async Task<int> GuardAfterErrorAsync(Exception exception, ICatLaunchReporter reporter)
+    {
+        var detail  = $"{exception.GetType().Name}: {exception.Message}";
+        var process = currentProcess!;
+
+        Log.Error(exception, "[CatHost] 守护游戏时出错");
+        reporter.Log("error", $"守护游戏时出错, 不再负责崩溃重启和跨区, 游戏结束后才会发 game.exited: {detail}");
+
+        try
+        {
+            await process.UnderlyingProcess.WaitForExitAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 等游戏进程退出失败");
+        }
+
+        CleanupProcess(process, null);
+
+        var closed = IsCloseRequested;
+        reporter.Exited(process.ProcessID, TryGetExitCode(process), closed ? CatExitReasons.CLOSED : CatExitReasons.GUARD_ERROR, null, closed ? null : detail);
+        return CatLaunchHost.EXIT_GUARD_ERROR;
+    }
+
+    /// <inheritdoc />
+    public async Task InjectAsync(bool dalamud, bool minion, bool force, ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
         var process = currentProcess;
 
@@ -107,15 +196,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
             if (minion)
             {
-                var row = ReloadMinionRow(out var error);
-
-                if (row == null)
-                    reporter.Agent(CatAgentKinds.MINION, false, error.Code, error.Message);
+                if (!force && IsMinionAttached(process.UnderlyingProcess))
+                    reporter.Agent(CatAgentKinds.MINION, true, CatCodes.ALREADY_ATTACHED, "这个游戏已经挂着 Minion, 没有重复挂; 要重新挂请带 force");
                 else
-                {
-                    minionRow = row;
                     await AttachMinionAsync(process, IsDalamudLoaded(process.UnderlyingProcess), reporter, cancellationToken).ConfigureAwait(false);
-                }
             }
         }
         finally
@@ -159,7 +243,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         await CheckGameUpdateAsync(cancellationToken).ConfigureAwait(false);
 
         if (request.Minion)
-            minionRow = ReloadMinionRow(out var minionError) ?? throw new CatLaunchException(minionError.Code, minionError.Message);
+        {
+            // 起游戏前先确认这张卡在本机有对应的行; 真正选哪一行在挂载前加锁再选并预占
+            _ = ReloadMinionRow(reporter, null, out var minionError) ?? throw new CatLaunchException(minionError.Code, minionError.Message);
+        }
 
         device = CatDeviceProfiles.Resolve(accountManager, account, out var isPerAccount)
                  ?? throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "这个号开了独立设备, 但账号库里找不到它的设备信息, 需要重新授权");
@@ -167,7 +254,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         if (!isPerAccount)
             reporter.Log("warning", "这个号在账号库里用的是共享设备, 不是独立设备");
 
-        var areas = await LoadAreasAsync().ConfigureAwait(false);
+        if (account.IsDeviceProfileRotation)
+            reporter.Log("warning", "这个号开着「定期自动更换设备」: 无界面启动不会换设备, 但界面版到期会换, 换了就要客户重新验证; 请在 DcMiniLauncher 账号设备设置里关掉");
+
+        var areas = await LoadAreasAsync(cancellationToken).ConfigureAwait(false);
         var area  = areas.FirstOrDefault(x => string.Equals(x.AreaName, account.AreaName, StringComparison.Ordinal)) ?? areas[0];
 
         dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel);
@@ -191,17 +281,17 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             checkResult = await GameUpdater.Check(gamePath, false, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             Log.Error(ex, "[CatHost] 启动前补丁检查失败");
-            throw new CatLaunchException(CatCodes.LAUNCH_FAILED, $"检查游戏更新失败: {ex.Message}");
+            throw new CatLaunchException(CatLoginFailures.ToCode(CatLoginFailures.Classify(ex), CatCodes.LAUNCH_FAILED), $"检查游戏更新失败: {ex.Message}");
         }
 
         if (checkResult.NeedsUpdate)
             throw new CatLaunchException(CatCodes.GAME_UPDATE_REQUIRED, "游戏有待安装的补丁, 请先在 DcMiniLauncher 界面里更新游戏");
     }
 
-    private static async Task<LoginArea[]> LoadAreasAsync()
+    private static async Task<LoginArea[]> LoadAreasAsync(CancellationToken cancellationToken)
     {
         LoginArea[] areas;
 
@@ -212,8 +302,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         catch (Exception ex)
         {
             Log.Error(ex, "[CatHost] 获取大区列表失败");
-            throw new CatLaunchException(CatCodes.LAUNCH_FAILED, $"获取大区列表失败: {ex.Message}");
+            throw new CatLaunchException(CatLoginFailures.ToCode(CatLoginFailures.Classify(ex), CatCodes.LAUNCH_FAILED), $"获取大区列表失败: {ex.Message}");
         }
+
+        cancellationToken.ThrowIfCancellationRequested();
 
         if (areas.Length == 0)
             throw new CatLaunchException(CatCodes.LAUNCH_FAILED, "获取大区列表失败: 列表为空");
@@ -221,7 +313,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         return areas;
     }
 
-    private MinionAccount? ReloadMinionRow(out (string Code, string Message) error)
+    private MinionAccount? ReloadMinionRow(ICatLaunchReporter reporter, int? selfPid, out (string Code, string Message) error)
     {
         error = default;
 
@@ -257,7 +349,20 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             return null;
         }
 
-        var row = MinionCards.FindByCard(rows, request.CardFingerprint!, request.Variant!);
+        var occupied = MinionOccupancy.ReadAllLive()
+                                      .Where(x => x.Pid != selfPid)
+                                      .Select(x => x.MinionUid)
+                                      .Where(uid => !string.IsNullOrWhiteSpace(uid))
+                                      .Select(uid => uid!.Trim())
+                                      .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var selection = MinionCards.SelectRow(rows, request.CardFingerprint!, request.Variant!, MinionCards.ConfiguredCnGameRoots(), occupied);
+        var row       = selection.Row;
+
+        Log.Information("[CatHost] 按卡 {Fingerprint} 选 {Variant} 行: {Notes}", request.CardFingerprint, request.Variant, string.Join(" | ", selection.Notes));
+
+        if (selection.AllOccupied)
+            reporter.Log("warning", $"卡 {request.CardFingerprint} 的{(request.Variant == MinionCards.VARIANT_GLOBAL ? "国际服" : "国服")}行都已挂在别的游戏上, 仍挂第一行, 可能把那边的 Minion 顶掉");
 
         if (row == null)
             error = (CatCodes.MINION_CARD_NOT_FOUND, $"本机 Minion Accounts.json 里找不到卡 {request.CardFingerprint} 的{(request.Variant == MinionCards.VARIANT_GLOBAL ? "国际服" : "国服")}注入行（按该行的游戏执行程序是否位于国服游戏目录之下区分）");
@@ -269,6 +374,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
     #region 登录与票据
 
+    /// <summary>
+    ///     用账号库里保存的凭证登录, 尽量少登录盛趣: 快速登录凭证优先; 网络错误不换密码（报 networkError 可重试）;
+    ///     要客户验证时报 riskControl; 只有凭证被拒且有密码才用密码登录一次; 其余报 authorizationRequired。
+    /// </summary>
     private async Task<LoginResult> LoginWithSavedCredentialAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
         var secretsAvailable = !accountManager.HasUnavailableSecrets(account);
@@ -309,8 +418,21 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             }
             catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
-                Log.Warning(ex, "[CatHost] 用已保存的快速登录凭证登录失败");
-                reporter.Log("warning", $"快速登录失败: {ex.Message}");
+                var kind   = CatLoginFailures.Classify(ex);
+                var detail = CatLoginFailures.Describe(ex);
+                Log.Warning(ex, "[CatHost] 用已保存的快速登录凭证登录失败 ({Kind}): {Detail}", kind, detail);
+
+                switch (kind)
+                {
+                    case CatLoginFailureKind.Network:
+                        throw new CatLaunchException(CatCodes.NETWORK_ERROR, $"连不上盛趣登录服务器, 稍后重试即可: {detail}");
+                    case CatLoginFailureKind.RiskControl:
+                        throw new CatLaunchException(CatCodes.RISK_CONTROL, $"盛趣要求客户验证: {detail}");
+                    case CatLoginFailureKind.Unknown:
+                        throw new CatLaunchException(CatCodes.LAUNCH_FAILED, $"快速登录出错, 没有改用密码: {ex.GetType().Name}: {detail}");
+                }
+
+                reporter.Log("warning", $"快速登录凭证被拒: {detail}");
                 lastError = ex;
             }
         }
@@ -330,12 +452,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                                  LoginType.Static,
                                  new LoginRequest
                                  {
-                                     Account                 = account.UserName,
-                                     Secret                  = savedPassword,
-                                     QuickLoginEnabled       = false,
-                                     DeviceProfile           = device,
-                                     LoginSessionRefreshSink = dcTravel,
-                                     ShowLoginMessage        = message => Log.Information("[CatHost] 登录: {Message}", message),
+                                     Account                     = account.UserName,
+                                     Secret                      = savedPassword,
+                                     QuickLoginEnabled           = false,
+                                     DeviceProfile               = device,
+                                     LoginSessionRefreshSink     = dcTravel,
+                                     ShowLoginMessage            = message => Log.Information("[CatHost] 登录: {Message}", message),
+                                     StopOnSafePhoneVerification = true,
 
                                      // 无人值守: 需要短信 / 图形验证码时不弹框, 直接按需要授权处理
                                      PromptTextInput    = (_, _, _) => null,
@@ -352,7 +475,21 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             }
             catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
-                Log.Warning(ex, "[CatHost] 用已保存的密码登录失败");
+                var kind   = CatLoginFailures.Classify(ex);
+                var detail = CatLoginFailures.Describe(ex);
+                Log.Warning(ex, "[CatHost] 用已保存的密码登录失败 ({Kind}): {Detail}", kind, detail);
+
+                // 密码登录被盛趣拒绝（含不认识的返回码, 如密码错）时仍报 authorizationRequired; 不是盛趣的回答才按启动失败报
+                switch (kind)
+                {
+                    case CatLoginFailureKind.Network:
+                        throw new CatLaunchException(CatCodes.NETWORK_ERROR, $"连不上盛趣登录服务器, 稍后重试即可: {detail}");
+                    case CatLoginFailureKind.RiskControl:
+                        throw new CatLaunchException(CatCodes.RISK_CONTROL, $"盛趣要求客户验证: {detail}");
+                    case CatLoginFailureKind.Unknown when ex is not LoginException:
+                        throw new CatLaunchException(CatCodes.LAUNCH_FAILED, $"密码登录出错: {ex.GetType().Name}: {detail}");
+                }
+
                 lastError = ex;
             }
         }
@@ -362,7 +499,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             CatCodes.AUTHORIZATION_REQUIRED,
             lastError == null
                 ? "这个号在账号库里没有可用的快速登录凭证或密码, 需要先授权"
-                : $"已保存的凭证登录失败, 需要重新授权: {lastError.Message}"
+                : $"已保存的凭证登录失败, 需要重新授权: {CatLoginFailures.Describe(lastError)}"
         );
     }
 
@@ -417,6 +554,14 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             if (oauth == null)
                 return string.Empty;
 
+            // 新 TGT 写回, 下次崩溃重启先用它换票据, 少登录一次
+            if (!string.IsNullOrEmpty(oauth.TGT) && !string.IsNullOrEmpty(oauth.Guid) && context?.LoginResult.OAuthLogin is { } current)
+            {
+                redactor.Register(oauth.TGT);
+                current.TGT  = oauth.TGT;
+                current.Guid = oauth.Guid;
+            }
+
             if (!string.IsNullOrEmpty(oauth.SessionID))
                 return oauth.SessionID;
 
@@ -433,13 +578,20 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
     }
 
-    private async Task EnsureFreshSessionIdAsync()
+    /// <summary>
+    ///     起游戏前现取一次性票据: 先用 TGT 换（不算登录）; 崩溃重启时 TGT 可能已过期, 换不到再用快速登录凭证刷新一次
+    /// </summary>
+    private async Task EnsureFreshSessionIdAsync(bool isRestart)
     {
         var oauthLogin = context.LoginResult.OAuthLogin!;
+        Exception? error = null;
 
         if (!string.IsNullOrEmpty(oauthLogin.TGT) && !string.IsNullOrEmpty(oauthLogin.Guid))
         {
             redactor.Register(oauthLogin.TGT);
+
+            // 用过的票据不能再用, 换不到新的就不能留着旧的
+            oauthLogin.SessionID = null!;
 
             try
             {
@@ -450,8 +602,38 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             catch (Exception ex)
             {
                 Log.Error(ex, "[CatHost] 通过 TGT 获取 session ticket 失败");
-                throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "登录会话已过期, 需要重新授权");
+                error = ex;
             }
+        }
+
+        if (error != null && isRestart && !string.IsNullOrEmpty(quickKey) && CatLoginFailures.Classify(error) != CatLoginFailureKind.Network)
+        {
+            try
+            {
+                Log.Information("[CatHost] 崩溃重启: TGT 已不可用, 用快速登录凭证刷新票据");
+                var sessionId = await RefreshSessionIdByQuickLoginAsync().ConfigureAwait(false);
+
+                if (!string.IsNullOrEmpty(sessionId))
+                {
+                    oauthLogin.SessionID = sessionId;
+                    redactor.Register(sessionId);
+                    error = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[CatHost] 用快速登录凭证刷新票据失败");
+                error = ex;
+            }
+        }
+
+        if (error != null)
+        {
+            throw new CatLaunchException
+            (
+                CatLoginFailures.ToCode(CatLoginFailures.Classify(error), CatCodes.AUTHORIZATION_REQUIRED),
+                $"登录会话已过期或无法刷新: {error.Message}"
+            );
         }
 
         if (string.IsNullOrEmpty(oauthLogin.SessionID))
@@ -484,15 +666,21 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     /// <summary>
     ///     起一次游戏并守到它退出; Dalamud 崩溃处理器要求重启时递归起新进程（进程号会变）。返回最后一个游戏进程。
     /// </summary>
+    /// <param name="options">本次启动的 Dalamud 选项</param>
+    /// <param name="restartedFromPid">崩溃重启时为旧进程号</param>
+    /// <param name="reporter">报告</param>
+    /// <param name="startToken">启动途中可被 close 取消</param>
+    /// <param name="cancellationToken">外部取消（等游戏退出用）</param>
     private async Task<FFXIVProcess> RunGameAsync
     (
         RestartMonitor.RestartOptions options,
         int?                          restartedFromPid,
         ICatLaunchReporter            reporter,
+        CancellationToken             startToken,
         CancellationToken             cancellationToken
     )
     {
-        var (launched, dalamudOk, companionAppManager) = await StartOnceAsync(options, restartedFromPid, reporter, cancellationToken).ConfigureAwait(false);
+        var (launched, dalamudOk, companionAppManager) = await StartOnceAsync(options, restartedFromPid, reporter, startToken).ConfigureAwait(false);
         FFXIVProcess result = launched;
 
         try
@@ -508,18 +696,36 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                                   {
                                       CleanupProcess(launched, companionAppManager);
 
+                                      if (IsCloseRequested)
+                                          return null;
+
                                       try
                                       {
-                                          result = await RunGameAsync(restartOptions, launched.ProcessID, reporter, cancellationToken).ConfigureAwait(false);
+                                          exitReason = null;
+                                          result     = await RunGameAsync(restartOptions, launched.ProcessID, reporter, startToken, cancellationToken).ConfigureAwait(false);
                                           return result;
                                       }
                                       catch (CatLaunchException ex)
                                       {
+                                          exitReason         = CatExitReasons.RESTART_FAILED;
+                                          exitFailureCode    = ex.Code;
+                                          exitFailureMessage = ex.Message;
                                           reporter.Log("error", $"崩溃后重启游戏失败: {ex.Message}");
                                           return null;
                                       }
+                                      catch (OperationCanceledException) when (IsCloseRequested)
+                                      {
+                                          return null;
+                                      }
                                   },
-                                  cancellationToken
+                                  cancellationToken,
+                                  new RestartMonitor.MonitorOptions
+                                  {
+                                      CrashHandlerExitTimeout  = request.CrashDialogTimeout,
+                                      CrashHandlerOutlivedGame = reporter.Crashed,
+                                      CrashHandlerTimedOut     = () => exitReason = CatExitReasons.CRASH_DIALOG_TIMEOUT,
+                                      StopToken                = closeCts.Token
+                                  }
                               )
                               .ConfigureAwait(false);
             }
@@ -539,7 +745,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         RestartMonitor.RestartOptions options,
         int?                          restartedFromPid,
         ICatLaunchReporter            reporter,
-        CancellationToken             cancellationToken
+        CancellationToken             startToken
     )
     {
         var dalamudOk = false;
@@ -549,7 +755,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             reporter.Stage(CatStages.UPDATING_DALAMUD);
 
-            var (session, error) = await Task.Run(() => PrepareDalamud(options.NoPlugins, options.NoThirdPlugins), cancellationToken).ConfigureAwait(false);
+            var (session, error) = await Task.Run(() => PrepareDalamud(options.NoPlugins, options.NoThirdPlugins), startToken).ConfigureAwait(false);
 
             if (session == null)
             {
@@ -567,18 +773,27 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
 
         // 票据单次有效且有时效, Dalamud 准备完再现取
-        await EnsureFreshSessionIdAsync().ConfigureAwait(false);
+        await EnsureFreshSessionIdAsync(restartedFromPid != null).ConfigureAwait(false);
 
         context.InGameAgents = (dalamudOk ? InGameAgents.Dalamud : InGameAgents.None) | (request.Minion ? InGameAgents.Minion : InGameAgents.None);
         Log.Information("[CatHost] 本次启动的游戏内代理: {InGameAgents}", context.InGameAgents);
 
+        startToken.ThrowIfCancellationRequested();
         reporter.Stage(CatStages.STARTING);
 
-        var launched = await Task.Run(() => LaunchProcess(dalamudOk, dalamudSession), cancellationToken).ConfigureAwait(false);
+        // 进程创建本身不可取消; 创建期间收到 close 时, 创建完由这里负责关掉
+        var launched = await Task.Run(() => LaunchProcess(dalamudOk, dalamudSession), CancellationToken.None).ConfigureAwait(false);
         var process  = launched.UnderlyingProcess;
-        var startedAt = MinionOccupancy.GetProcessStartedAt(process);
+        bool closeNow;
 
-        currentProcess = launched;
+        // 先记下进程再做别的: 之后任何异常都按「游戏已起来」处理, 不会把活着的游戏报成启动失败
+        lock (closeLock)
+        {
+            currentProcess = launched;
+            closeNow       = closeRequested;
+        }
+
+        var startedAt = SafeProcessStartedAt(process);
 
         if (restartedFromPid is { } oldPid)
             reporter.Restarted(oldPid, launched.ProcessID, startedAt);
@@ -599,31 +814,44 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             reporter.Log("warning", $"启动伴随程序失败: {ex.Message}");
         }
 
-        if (dalamudOk)
+        if (closeNow)
         {
-            reporter.Stage(CatStages.INJECTING);
-            var loaded = await WaitForDalamudAsync(process, cancellationToken).ConfigureAwait(false);
-            reporter.Agent(CatAgentKinds.DALAMUD, loaded, loaded ? null : CatCodes.DALAMUD_UNAVAILABLE, loaded ? null : "游戏进程里没有等到 Dalamud 加载");
+            _ = CatGameCloser.CloseAsync(process, closeTimeout);
+            return (launched, dalamudOk, companionAppManager);
         }
 
-        if (request.Minion)
+        try
         {
-            await AttachMinionAsync(launched, dalamudOk, reporter, cancellationToken).ConfigureAwait(false);
-
-            if (MiniModuleInjector.ModulePath.Exists)
+            if (dalamudOk)
             {
-                try
+                reporter.Stage(CatStages.INJECTING);
+                var loaded = await WaitForDalamudAsync(process, startToken).ConfigureAwait(false);
+                reporter.Agent(CatAgentKinds.DALAMUD, loaded, loaded ? null : CatCodes.DALAMUD_UNAVAILABLE, loaded ? null : "游戏进程里没有等到 Dalamud 加载");
+            }
+
+            if (request.Minion)
+            {
+                await AttachMinionAsync(launched, dalamudOk, reporter, startToken).ConfigureAwait(false);
+
+                if (MiniModuleInjector.ModulePath.Exists && !IsCloseRequested)
                 {
-                    await MiniModuleGate.RunAsync(process, cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error(ex, "[CatHost] 游戏内模块自检时发生异常（游戏不受影响）");
+                    try
+                    {
+                        await MiniModuleGate.RunAsync(process, startToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error(ex, "[CatHost] 游戏内模块自检时发生异常（游戏不受影响）");
+                    }
                 }
             }
         }
+        catch (OperationCanceledException) when (IsCloseRequested)
+        {
+            Log.Information("[CatHost] 收到关闭请求, 不再等注入");
+        }
 
-        if (!process.HasExited)
+        if (!process.HasExited && !IsCloseRequested)
             reporter.Stage(CatStages.RUNNING);
 
         return (launched, dalamudOk, companionAppManager);
@@ -830,9 +1058,11 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     {
         reporter.Stage(CatStages.ATTACHING_MINION);
 
+        var (minionRow, error, reserved) = await ReserveMinionRowAsync(launched.UnderlyingProcess, reporter).ConfigureAwait(false);
+
         if (minionRow == null)
         {
-            reporter.Agent(CatAgentKinds.MINION, false, CatCodes.MINION_CARD_NOT_FOUND, "没有可挂的 Minion 行");
+            reporter.Agent(CatAgentKinds.MINION, false, error.Code, error.Message);
             return;
         }
 
@@ -840,12 +1070,17 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             redactor.Register(minionRow.Keycode);
         redactor.Register(App.Settings.MinionPassword);
 
+        var ok = false;
+
         try
         {
             var result = await MinionAttacher.AttachAsync(minionRow, launched.UnderlyingProcess, gamePath, dalamudInjected, account.UserName, cancellationToken)
                                              .ConfigureAwait(false);
+            ok = result.Ok;
 
-            if (result.Ok)
+            if (IsCloseRequested)
+                Log.Information("[CatHost] 收到关闭请求, Minion 挂载结果不再上报: {Ok}", result.Ok);
+            else if (result.Ok)
                 reporter.Agent(CatAgentKinds.MINION, true);
             else
             {
@@ -857,6 +1092,81 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             Log.Error(ex, "[CatHost] 挂载 Minion 时发生未处理异常");
             reporter.Agent(CatAgentKinds.MINION, false, CatCodes.ATTACH_FAILED, $"挂载 Minion 时出错: {ex.Message}");
+        }
+        finally
+        {
+            // 没挂上就撤掉预占, 别让这一行一直显示被占用
+            if (reserved && !ok)
+                MinionOccupancy.Delete(launched.ProcessID);
+        }
+    }
+
+    /// <summary>
+    ///     加跨进程锁选 Minion 行, 并立即为这个游戏写占用记录作预占（挂载成功后由挂载流程覆盖成正式记录）。
+    ///     拿不到锁时不加锁照常选。这个游戏已有自己的记录（force 重挂）时不再写预占。
+    /// </summary>
+    private async Task<(MinionAccount? Row, (string Code, string Message) Error, bool Reserved)> ReserveMinionRowAsync(Process process, ICatLaunchReporter reporter)
+    {
+        using var gate = await CrossProcessMutex.TryAcquireAsync(MINION_SELECT_MUTEX_NAME, MinionSelectMutexTimeout).ConfigureAwait(false);
+
+        var row = ReloadMinionRow(reporter, process.Id, out var error);
+
+        if (row == null)
+            return (null, error, false);
+
+        var startedAt = SafeProcessStartedAt(process);
+
+        if (MinionOccupancy.Read(process.Id) is { } existing && existing.ProcessStartedAt == startedAt)
+            return (row, default, false);
+
+        var reserved = !string.IsNullOrWhiteSpace(row.Keycode) &&
+                       MinionOccupancy.Write
+                       (
+                           new MinionOccupancyRecord
+                           {
+                               Pid              = process.Id,
+                               ProcessStartedAt = startedAt,
+                               CardFingerprint  = MinionCards.Fingerprint(row.Keycode),
+                               Variant          = request.Variant ?? MinionCards.VARIANT_CN,
+                               AccountName      = account.UserName,
+                               MinionUid        = string.IsNullOrWhiteSpace(row.Uid) ? null : row.Uid.Trim(),
+                               AttachedAt       = DateTimeOffset.UtcNow
+                           }
+                       );
+
+        return (row, default, reserved);
+    }
+
+    /// <summary>
+    ///     进程创建时间; 读不到时用当前时间近似并记日志
+    /// </summary>
+    private static DateTimeOffset SafeProcessStartedAt(Process process)
+    {
+        try
+        {
+            return MinionOccupancy.GetProcessStartedAt(process);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 读取游戏进程创建时间失败, 用当前时间代替");
+            return DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        }
+    }
+
+    /// <summary>
+    ///     占用记录里这个游戏进程已挂着 Minion（同一进程: 创建时间一致）
+    /// </summary>
+    private static bool IsMinionAttached(Process process)
+    {
+        try
+        {
+            return MinionOccupancy.Read(process.Id) is { } record &&
+                   record.ProcessStartedAt == MinionOccupancy.GetProcessStartedAt(process);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[CatHost] 读取 Minion 占用记录失败");
+            return false;
         }
     }
 

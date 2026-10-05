@@ -16,6 +16,18 @@ public static class CatProtocol
     /// <summary>管道名前缀</summary>
     public const string PIPE_NAME_PREFIX = "cat-dml-";
 
+    /// <summary>崩溃对话框默认等待秒数: 游戏已退出而崩溃处理器还开着时, 等这么久没人选择就按不重启处理</summary>
+    public const int DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS = 120;
+
+    /// <summary>崩溃对话框等待秒数上限</summary>
+    public const int MAX_CRASH_DIALOG_TIMEOUT_SECONDS = 3600;
+
+    /// <summary>close 默认等游戏自己退出的秒数, 超时后结束进程</summary>
+    public const int DEFAULT_CLOSE_TIMEOUT_SECONDS = 15;
+
+    /// <summary>close 等待秒数上限</summary>
+    public const int MAX_CLOSE_TIMEOUT_SECONDS = 300;
+
     /// <summary>JSON 序列化选项: camelCase、忽略 null、中文不转义</summary>
     public static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -112,6 +124,40 @@ public static class CatCodes
 
     /// <summary>参数无效</summary>
     public const string INVALID_PARAMS = "invalidParams";
+
+    /// <summary>连不上盛趣登录服务器或网络出错, 可直接重试, 不需要客户</summary>
+    public const string NETWORK_ERROR = "networkError";
+
+    /// <summary>盛趣要求客户验证（安全手机短信 / 叨鱼扫码等风控）</summary>
+    public const string RISK_CONTROL = "riskControl";
+
+    /// <summary>启动途中收到 close, 没有起游戏</summary>
+    public const string CANCELLED = "cancelled";
+
+    /// <summary>上一次补注入还没结束</summary>
+    public const string BUSY = "busy";
+
+    /// <summary>这张卡已挂在当前游戏上, 没有重复挂</summary>
+    public const string ALREADY_ATTACHED = "alreadyAttached";
+
+    /// <summary>已收到 close, 不再接受 launch</summary>
+    public const string CLOSING = "closing";
+}
+
+/// <summary>game.exited 的 reason（不带 reason = 游戏自己退出或被外部结束）</summary>
+public static class CatExitReasons
+{
+    /// <summary>按 close 请求关闭</summary>
+    public const string CLOSED = "closed";
+
+    /// <summary>崩溃对话框超时没人选择, 按不重启处理</summary>
+    public const string CRASH_DIALOG_TIMEOUT = "crashDialogTimeout";
+
+    /// <summary>崩溃后要求重启, 但重启失败（带 code / message）</summary>
+    public const string RESTART_FAILED = "restartFailed";
+
+    /// <summary>游戏起来后本进程内部出错, 不再守护（崩溃重启、跨区失效）, 等到游戏结束才发</summary>
+    public const string GUARD_ERROR = "guardError";
 }
 
 /// <summary>代理类型</summary>
@@ -137,10 +183,13 @@ public sealed record CatHelloResult(string ProtocolVersion, string LauncherVersi
 public sealed record CatMinionParams(string? CardFingerprint, string? Variant);
 
 /// <summary>launch 参数</summary>
-public sealed record CatLaunchParams(string? OperationId, string? AccountName, bool Dalamud, CatMinionParams? Minion);
+public sealed record CatLaunchParams(string? OperationId, string? AccountName, bool Dalamud, CatMinionParams? Minion, int? CrashDialogTimeoutSeconds = null);
 
-/// <summary>inject 参数</summary>
-public sealed record CatInjectParams(bool? Dalamud, bool? Minion);
+/// <summary>inject 参数; force = 已挂着也重新挂 Minion</summary>
+public sealed record CatInjectParams(bool? Dalamud, bool? Minion, bool? Force = null);
+
+/// <summary>close 参数; timeoutSeconds = 请求游戏自己退出后等待的秒数, 超时结束进程</summary>
+public sealed record CatCloseParams(int? TimeoutSeconds);
 
 /// <summary>launch / inject 返回</summary>
 public sealed record CatAcceptResult(bool Accepted, string? Code = null, string? Message = null)
