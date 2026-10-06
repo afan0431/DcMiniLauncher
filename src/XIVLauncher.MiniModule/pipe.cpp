@@ -109,6 +109,19 @@ namespace
         if (command == "WHOLIST")
             return GameWhoList();
 
+        // ---- 自动选角 ----------------------------------------------------
+        if (command == "LOBBYSTATE")
+            return GameLobbyState();
+
+        if (command == "CHARAS")
+            return GameCharas();
+
+        if (command == "WHOAMI")
+            return GameWhoAmI();
+
+        if (command.rfind("DIALOG ", 0) == 0)
+            return GameDialog(command.substr(7));
+
         if (command == "MENUSTATUS")
             return ContextMenuStatus();
 
@@ -145,6 +158,16 @@ namespace
         // 角色名可能带空格（外服那种「名 姓」）, 所以整行剩下的都算参数, 不走下面的 Split
         if (command.rfind("FOCUSCHARA ", 0) == 0)
             return GameFocusCharacter(command.substr(11));
+
+        if (command.rfind("SELECTCHARA ", 0) == 0)
+            return GameSelectCharacter(command.substr(12));
+
+        // 不经确认框直接发登录请求的那条路线没有实现, 别把 DIRECT 当成角色名
+        if (command == "ENTERCHARA DIRECT" || command.rfind("ENTERCHARA DIRECT ", 0) == 0)
+            return "FAIL not-implemented";
+
+        if (command.rfind("ENTERCHARA ", 0) == 0)
+            return GameEnterCharacter(command.substr(11));
 
         const auto parts = Split(command);
 
@@ -188,7 +211,7 @@ namespace
 
             // SETSID 的参数是登录票据 —— 只记命令名
             const bool secret = command.rfind("SETSID", 0) == 0;
-            // WHOLIST 的正文是一整张角色表, 日志里只留第一行摘要（game.cpp 已记过）
+            // WHOLIST / CHARAS 的正文是一整张角色表, 日志里只留第一行摘要（game.cpp 已记过）
             const auto shown = response.substr(0, response.find('\n'));
             LogF("[pipe] < %s | > %s", secret ? "SETSID <已隐去>" : command.c_str(), shown.c_str());
 

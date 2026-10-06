@@ -191,6 +191,15 @@ internal sealed class FakeGameRunner : ICatGameRunner
         ConfirmedSms.Add(challengeId);
         return challengeId == "s-1" ? CatAcceptResult.Ok() : CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "这条短信验证已经不在了");
     }
+
+    /// <summary>收到的 selectCharacter 的 contentId</summary>
+    public List<string> SelectedCharacters { get; } = [];
+
+    public CatAcceptResult SelectCharacter(string contentId)
+    {
+        SelectedCharacters.Add(contentId);
+        return CatAcceptResult.Ok();
+    }
 }
 
 /// <summary>
@@ -275,6 +284,33 @@ internal sealed class RecordingReporter : ICatLaunchReporter
 
     public void WeGameSmsResult(string challengeId, bool passed) =>
         Entries.Enqueue($"smsResult:{challengeId}:{(passed ? "passed" : "notPassed")}");
+
+    /// <summary>报出来的角色列表, 按顺序</summary>
+    public ConcurrentQueue<(bool NeedsChoice, IReadOnlyList<CatCharacterInfo> Characters)> CharacterLists { get; } = new();
+
+    /// <summary>报出来的已进入游戏的角色, 按顺序</summary>
+    public ConcurrentQueue<CatCharacterInfo> EnteredCharacters { get; } = new();
+
+    public void Queueing(int? queuePosition) =>
+        Entries.Enqueue($"queue:{queuePosition?.ToString() ?? "?"}");
+
+    public void Characters(bool needsChoice, IReadOnlyList<CatCharacterInfo> characters)
+    {
+        CharacterLists.Enqueue((needsChoice, characters));
+        Entries.Enqueue($"characters:{(needsChoice ? "choose" : "auto")}:{characters.Count}");
+    }
+
+    public void Character(CatCharacterInfo character)
+    {
+        EnteredCharacters.Enqueue(character);
+        Entries.Enqueue($"character:{character.Name}@{character.HomeWorld}");
+    }
+
+    public void AutoEnterStopped(string code, string message)
+    {
+        Entries.Enqueue($"stopped:{code}");
+        Messages.Enqueue(message);
+    }
 }
 
 internal static class CatTestNames

@@ -93,6 +93,14 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     private string?                exitFailureCode;
     private string?                exitFailureMessage;
 
+    /// <summary>各游戏进程的自动进入角色: 取消源（进程收尾时取消）与后台任务</summary>
+    private readonly Dictionary<int, CancellationTokenSource> autoEnterCancellations = [];
+    private readonly List<Task>                               autoEnterTasks         = [];
+    private volatile CatAutoEnter?                            autoEnter;
+
+    /// <summary>等自动进入角色的后台任务收尾的上限（它们在游戏退出时已被取消, 这里只是不让事件落在 game.exited 后面）</summary>
+    private static readonly TimeSpan AutoEnterShutdownTimeout = TimeSpan.FromSeconds(5);
+
     private bool IsCloseRequested
     {
         get
@@ -114,6 +122,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             await PrepareAsync(reporter, linked.Token).ConfigureAwait(false);
 
             using var final = await RunGameAsync(RestartMonitor.RestartOptions.Normal, null, reporter, linked.Token, cancellationToken).ConfigureAwait(false);
+
+            await WaitAutoEnterEndAsync().ConfigureAwait(false);
 
             if (IsCloseRequested)
                 reporter.Exited(lastPid, lastExitCode, CatExitReasons.CLOSED);
@@ -171,6 +181,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     public CatAcceptResult ConfirmWeGameSms(string challengeId) =>
         weGameLogin?.ConfirmSms(challengeId) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证");
 
+    /// <inheritdoc />
+    public CatAcceptResult SelectCharacter(string contentId) =>
+        autoEnter?.SelectCharacter(contentId) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等人选角色");
+
     /// <summary>
     ///     游戏起来后出了意外异常: 不再守护（崩溃重启、跨区刷新）, 但照样等游戏结束、补报 Minion 停机, 再发 game.exited。期间 close 仍可用。
     /// </summary>
@@ -192,6 +206,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
 
         CleanupProcess(process, null);
+        await WaitAutoEnterEndAsync().ConfigureAwait(false);
 
         var closed = IsCloseRequested;
         reporter.Exited(process.ProcessID, TryGetExitCode(process), closed ? CatExitReasons.CLOSED : CatExitReasons.GUARD_ERROR, null, closed ? null : detail);
@@ -227,8 +242,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
         finally
         {
+            // 自动进入角色报过的阶段（如已进入游戏、等人选角色）不能被补注入冲掉
             if (!process.UnderlyingProcess.HasExited)
-                reporter.Stage(CatStages.RUNNING);
+                reporter.Stage(autoEnter?.CurrentStage ?? CatStages.RUNNING);
         }
     }
 
@@ -1062,7 +1078,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 reporter.Agent(CatAgentKinds.DALAMUD, loaded, loaded ? null : CatCodes.DALAMUD_UNAVAILABLE, loaded ? null : "游戏进程里没有等到 Dalamud 加载");
             }
 
-            if (request.Minion)
+            // 自动进入角色时 Minion 推迟到编排结束后再挂（见 StartAutoEnter）, 免得 Minion 自己的登录脚本和编排抢同一个界面
+            if (request.Minion && !request.AutoEnter)
             {
                 await AttachMinionAsync(launched, dalamudOk, reporter, startToken).ConfigureAwait(false);
 
@@ -1085,9 +1102,106 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
 
         if (!process.HasExited && !IsCloseRequested)
+        {
             reporter.Stage(CatStages.RUNNING);
 
+            if (request.AutoEnter)
+                StartAutoEnter(launched, dalamudOk, reporter, startToken);
+        }
+
         return (launched, dalamudOk, companionAppManager);
+    }
+
+    /// <summary>
+    ///     在后台自动进入角色（不挡崩溃守护）: 编排 → 带 Minion 的这时才挂 Minion → 之后隔一段时间看一次当前角色。
+    ///     等人选角色、排队都可能很久, 所以不在启动流程里等; 游戏进程收尾时取消。
+    ///     崩溃重启后的新进程接着登录上一次实际进的那个角色。
+    /// </summary>
+    private void StartAutoEnter(FFXIVProcess launched, bool dalamudInjected, ICatLaunchReporter reporter, CancellationToken startToken)
+    {
+        var process      = launched.UnderlyingProcess;
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(startToken);
+        var game         = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea);
+        var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, autoEnter?.EnteredContentId));
+        var token        = cancellation.Token;
+
+        autoEnter = flow;
+
+        lock (cleanupLock)
+        {
+            autoEnterCancellations[launched.ProcessID] = cancellation;
+            autoEnterTasks.Add
+            (
+                Task.Run
+                (async () =>
+                    {
+                        try
+                        {
+                            var outcome = await flow.RunAsync(token).ConfigureAwait(false);
+
+                            if (request.Minion && outcome != CatAutoEnterOutcome.Cancelled && !process.HasExited && !IsCloseRequested)
+                            {
+                                await AttachMinionAsync(launched, dalamudInjected, reporter, token).ConfigureAwait(false);
+
+                                if (!process.HasExited && !IsCloseRequested)
+                                    reporter.Stage(flow.CurrentStage ?? CatStages.RUNNING);
+                            }
+
+                            await flow.ObserveAsync(token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // 游戏退出或收到关闭请求
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, "[CatHost] 自动进入角色的后台任务出错（游戏不受影响）");
+                        }
+                        finally
+                        {
+                            game.Dispose();
+                        }
+                    }
+                )
+            );
+        }
+    }
+
+    /// <summary>
+    ///     角色换了大区才进的游戏: 把账号库和本次启动的大区改成它（换大厅本身不回写）, 下次启动、崩溃重启都从那里进
+    /// </summary>
+    private void RememberEnteredArea(string areaName)
+    {
+        if (!string.Equals(context.Area.AreaName, areaName, StringComparison.Ordinal))
+            SyncAreaFromDcTravel(areaName);
+    }
+
+    /// <summary>
+    ///     等自动进入角色的后台任务结束, 保证它们的事件都排在 game.exited 之前
+    /// </summary>
+    private async Task WaitAutoEnterEndAsync()
+    {
+        Task[] tasks;
+
+        lock (cleanupLock)
+        {
+            foreach (var cancellation in autoEnterCancellations.Values)
+                cancellation.Cancel();
+
+            tasks = autoEnterTasks.ToArray();
+        }
+
+        if (tasks.Length == 0)
+            return;
+
+        try
+        {
+            await Task.WhenAll(tasks).WaitAsync(AutoEnterShutdownTimeout).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 等自动进入角色的后台任务结束超时");
+        }
     }
 
     private FFXIVProcess LaunchProcess(bool dalamudOk, DalamudSession? dalamudSession)
@@ -1175,6 +1289,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             if (!cleanedPids.Add(launched.ProcessID))
                 return;
+
+            if (autoEnterCancellations.TryGetValue(launched.ProcessID, out var autoEnterCancellation))
+                autoEnterCancellation.Cancel();
         }
 
         try

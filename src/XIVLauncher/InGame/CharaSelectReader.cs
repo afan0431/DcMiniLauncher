@@ -71,6 +71,10 @@ public static class CharaSelectReader
         if (InGameTravelJobs.IsRunning(game.Process.Id))
             return (null, "这个客户端正在跨区中");
 
+        // 自动进入角色的编排同样占着管道（它占的是换服那把闸）
+        if (InGameTravelService.IsGateHeld(game.Process.Id))
+            return (null, "这个客户端的游戏内模块正忙, 请稍后再试");
+
         var injectError = MiniModuleInjector.Inject(game.Process);
 
         if (injectError != null)

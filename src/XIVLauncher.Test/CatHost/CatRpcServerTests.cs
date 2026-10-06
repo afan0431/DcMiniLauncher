@@ -806,6 +806,179 @@ public sealed class CatRpcServerTests : IDisposable
         await Task.CompletedTask;
     }
 
+    [Fact]
+    public async Task Launch_WithoutAutoEnter_KeepsTheOldBehaviour()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false });
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        Assert.False(runner.Request!.AutoEnter);
+        Assert.Null(runner.Request.CharacterName);
+        Assert.Null(runner.Request.CharacterHomeWorld);
+    }
+
+    [Fact]
+    public async Task Launch_WithCharacterAndAutoEnter_PassesThemToTheRunner()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new { operationId = "op1", accountName = "acc", dalamud = false, autoEnter = true, character = new { name = " 小白 ", homeWorld = "LaNuoXiYa" } }
+        );
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.True(runner.Request!.AutoEnter);
+        Assert.Equal("小白", runner.Request.CharacterName);
+        Assert.Equal("LaNuoXiYa", runner.Request.CharacterHomeWorld);
+    }
+
+    [Fact]
+    public async Task Launch_AutoEnterWithoutCharacter_IsAccepted()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, autoEnter = true, character = new { } });
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        Assert.True(runner.Request!.AutoEnter);
+        Assert.Null(runner.Request.CharacterName);
+    }
+
+    [Fact]
+    public async Task Launch_International_IgnoresAutoEnter()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        await client.RequestAsync
+        (
+            "launch",
+            new { operationId = "op1", accountName = "se", dalamud = false, platform = "international", password = "Pw-123456", autoEnter = true, character = new { name = "Xiao Bai" } }
+        );
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        Assert.False(runner.Request!.AutoEnter);
+        Assert.Equal("Xiao Bai", runner.Request.CharacterName);
+    }
+
+    [Fact]
+    public async Task Launch_CharacterNameTooLong_IsRejected()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new { operationId = "op1", accountName = "acc", dalamud = false, autoEnter = true, character = new { name = new string('名', CatLaunchHost.MAX_CHARACTER_NAME_LENGTH + 1) } }
+        );
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task SelectCharacter_IsOnlyAcceptedWhileWaitingForAChoice()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var early = await client.RequestAsync("selectCharacter", new { contentId = "11" });
+        Assert.Equal("notRunning", early["result"]!["code"]!.GetValue<string>());
+
+        await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, autoEnter = true });
+        await runner.Started.Task.WaitAsync(Timeout);
+        runner.Reporter!.Started(1234, DateTimeOffset.UtcNow);
+        runner.Reporter.Stage(CatStages.RUNNING);
+        runner.Reporter.Stage(CatStages.ENTERING_LOBBY);
+
+        var notYet = await client.RequestAsync("selectCharacter", new { contentId = "11" });
+        Assert.Equal("notRunning", notYet["result"]!["code"]!.GetValue<string>());
+
+        runner.Reporter.Stage(CatStages.AWAITING_CHARACTER_CHOICE);
+
+        var missing = await client.RequestAsync("selectCharacter", new { });
+        Assert.Equal("invalidParams", missing["result"]!["code"]!.GetValue<string>());
+
+        var odd = await client.RequestAsync("selectCharacter", new { contentId = "11 OR 1=1" });
+        Assert.Equal("invalidParams", odd["result"]!["code"]!.GetValue<string>());
+
+        var accepted = await client.RequestAsync("selectCharacter", new { contentId = " 11 " });
+        Assert.True(accepted["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal(["11"], runner.SelectedCharacters);
+
+        runner.Reporter.Stage(CatStages.ENTERING_WORLD);
+
+        var late = await client.RequestAsync("selectCharacter", new { contentId = "11" });
+        Assert.Equal("notRunning", late["result"]!["code"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task AutoEnterEvents_CarryTheDocumentedPayloads_AndInjectStillWorksAfterRunning()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, autoEnter = true });
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        var reporter = runner.Reporter!;
+        var listed   = new CatCharacterInfo("4611686018427387905", "小白", "LaNuoXiYa", "BaiYinXiang", "拉诺西亚", null, true, true);
+
+        reporter.Started(1234, DateTimeOffset.UtcNow);
+        reporter.Stage(CatStages.RUNNING);
+        reporter.Characters(true, [listed]);
+        reporter.Queueing(7);
+        reporter.Queueing(null);
+        reporter.AutoEnterStopped(CatAutoEnterStopCodes.LOBBY_ERROR, "大厅提示: 断开了");
+        reporter.Character(listed);
+        reporter.Stage(CatStages.IN_WORLD);
+
+        var characters = client.WaitForEvent("game.characters", Timeout).Params!;
+        Assert.Equal("op1", characters["operationId"]!.GetValue<string>());
+        Assert.True(characters["needsChoice"]!.GetValue<bool>());
+
+        var first = characters["characters"]![0]!;
+        Assert.Equal("4611686018427387905", first["contentId"]!.GetValue<string>());
+        Assert.Equal("小白", first["name"]!.GetValue<string>());
+        Assert.Equal("LaNuoXiYa", first["homeWorld"]!.GetValue<string>());
+        Assert.Equal("BaiYinXiang", first["currentWorld"]!.GetValue<string>());
+        Assert.Equal("拉诺西亚", first["homeWorldName"]!.GetValue<string>());
+        Assert.Null(first["currentWorldName"]);
+        Assert.True(first["travelling"]!.GetValue<bool>());
+        Assert.True(first["loginable"]!.GetValue<bool>());
+
+        var queue = client.WaitForEvent("game.stage", Timeout).Params!;
+        Assert.Equal("queueing", queue["stage"]!.GetValue<string>());
+        Assert.Equal(7, queue["queuePosition"]!.GetValue<int>());
+
+        var queueUnknown = client.WaitForEvent("game.stage", Timeout).Params!;
+        Assert.Equal("queueing", queueUnknown["stage"]!.GetValue<string>());
+        Assert.Null(queueUnknown["queuePosition"]);
+
+        var stopped = client.WaitForEvent("game.autoEnterStopped", Timeout).Params!;
+        Assert.Equal("lobbyError", stopped["code"]!.GetValue<string>());
+        Assert.Equal("大厅提示: 断开了", stopped["message"]!.GetValue<string>());
+
+        var entered = client.WaitForEvent("game.character", Timeout).Params!;
+        Assert.Equal("op1", entered["operationId"]!.GetValue<string>());
+        Assert.Equal("4611686018427387905", entered["contentId"]!.GetValue<string>());
+        Assert.Equal("小白", entered["name"]!.GetValue<string>());
+        Assert.Equal("LaNuoXiYa", entered["homeWorld"]!.GetValue<string>());
+        Assert.Equal("BaiYinXiang", entered["currentWorld"]!.GetValue<string>());
+        Assert.Null(entered["travelling"]);
+
+        Assert.Equal("inWorld", client.WaitForEvent("game.stage", Timeout).Params!["stage"]!.GetValue<string>());
+
+        var status = await client.RequestAsync("status", new { });
+        Assert.Equal("inWorld", status["result"]!["stage"]!.GetValue<string>());
+
+        // 进了游戏之后照样能补注入
+        var inject = await client.RequestAsync("inject", new { minion = true });
+        Assert.True(inject["result"]!["accepted"]!.GetValue<bool>());
+    }
+
     private async Task<CatTestClient> ConnectAndHelloAsync()
     {
         var client   = await CatTestClient.ConnectAsync(pipeName, Timeout);

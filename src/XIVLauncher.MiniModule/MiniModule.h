@@ -11,7 +11,7 @@
 #include <string>
 
 // 模块版本, 通过 pipe 的 VERSION 命令回给启动器, 便于确认注进去的是哪一版
-#define MINIMODULE_VERSION "0.5.0-focus"
+#define MINIMODULE_VERSION "0.6.0"
 
 // ---- 日志 (log.cpp) ----------------------------------------------------------
 // 日志落在 %TEMP%\minilauncher-module-<pid>.log —— 游戏目录不保证可写, 且这里天然按 PID 分开
@@ -54,6 +54,15 @@ std::string GameReturnToTitle();
 std::string GameWhere();     // ingame / charaselect / title / busy(片头动画·读盘·过场)
 std::string GameWhoList();   // 选角列表（名字/ContentId/世界/LoginFlags）+ 当前界面; 格式见 game.cpp
 std::string GameFocusCharacter(const std::string& who); // 选角界面切到该角色（名字或 ContentId）所在的服务器
+
+// ---- 自动选角 (game.cpp) ----------------------------------------------------
+// 每条只做一步、立即返回; 等待与重试在启动器那边。响应格式见 game.cpp 各函数上方的注释。
+std::string GameLobbyState();   // 只读: 界面位置、当前服务器、选中项、暂时锁定、排队名次、对话框及提示文字、是否读盘
+std::string GameCharas();       // 只读: 整个大区的角色, 格式同 WHOLIST
+std::string GameWhoAmI();       // 只读: 游戏内当前角色名、ContentId、当前/原始世界
+std::string GameSelectCharacter(const std::string& who); // 当前服务器的角色列表里选中（高亮）, 不进入
+std::string GameEnterCharacter(const std::string& who);  // 左键点击角色: 客户端自己检查并弹登录确认框
+std::string GameDialog(const std::string& button);       // YES / NO 点是否框; OK 点错误框或确定框（排队提示不点）
 std::string GameSkipMovie(); // 给游戏窗口投 ESC 结束片头动画, 等到界面可操作为止
 // 游戏内登出到角色选择界面。direct=false 走 /logout 文本命令 + 确认框（等同玩家操作, 最保守);
 // direct=true 直接调 AgentLobby::HandleLogout（更底层, 不弹确认框)

@@ -2,8 +2,8 @@
 #
 #   powershell -ExecutionPolicy Bypass -File src\XIVLauncher.MiniModule\test\run-gate-test.ps1
 #
-# 覆盖: 注入 → 管道通话 (VERSION/PING) → 主线程派发 (MAINTHREAD) → 自我卸载 (UNLOAD)
-# 不覆盖: 游戏自己的窗口线程是不是主线程、与 bot/其他 hook 共存 —— 那两条只有真机能答。
+# 覆盖: 注入 → 管道通话 (VERSION/PING) → 没有主线程通道时 MAINTHREAD 回超时 → 自动选角各命令在非游戏进程里安全回 FAIL → 自我卸载 (UNLOAD)
+# 不覆盖: 主线程派发（通道挂在游戏的 Framework::Tick 上, 假宿主没有）、与 bot/其他 hook 共存 —— 只有真机能答。
 
 $ErrorActionPreference = 'Stop'
 
@@ -129,13 +129,39 @@ try
         Write-Host "PING → $ping"
         if ($ping -ne 'OK PONG') { $failures += 'PING 没回 OK PONG' }
 
-        # 假宿主的主线程就是窗口线程, 所以这里必须 same=1; 真机上这一位才是未知数
+        # 主线程通道挂在游戏的 Framework::Tick 上, 要先解析出游戏的特征码; 假宿主里解析不出来,
+        # 所以这里只验它老实回超时而不是卡死或把宿主带走。真正的主线程派发只有真机能验
         $mainThread = Send-ModuleCommand -Pipe $pipe -Command 'MAINTHREAD'
         Write-Host "MAINTHREAD → $mainThread"
-        if ($mainThread -notmatch 'same=1') { $failures += "MAINTHREAD 没能在主线程上跑: $mainThread" }
+        if ($mainThread -ne 'FAIL mainthread-timeout') { $failures += "MAINTHREAD 的回应不对: $mainThread" }
 
         $unknown = Send-ModuleCommand -Pipe $pipe -Command 'NOSUCHCOMMAND'
         if ($unknown -ne 'FAIL unknown-command') { $failures += "未知命令的回应不对: $unknown" }
+
+        if ($version -notmatch 'version=0\.6\.0 ') { $failures += "模块版本不是 0.6.0: $version" }
+
+        # 自动选角的命令: 假宿主不是游戏, 特征码一条都命中不了, 每条都必须安全地回 FAIL, 宿主不能挂
+        $expected = [ordered]@{
+            'LOBBYSTATE'            = 'FAIL sigscan-failed'
+            'CHARAS'                = 'FAIL sigscan-failed'
+            'WHOAMI'                = 'FAIL sigscan-failed'
+            'FOCUSCHARA 测试角色'   = 'FAIL sigscan-failed'
+            'SELECTCHARA 测试角色'  = 'FAIL sigscan-failed'
+            'SELECTCHARA 123456'    = 'FAIL sigscan-failed'
+            'ENTERCHARA 测试角色'   = 'FAIL sigscan-failed'
+            'ENTERCHARA DIRECT 测试角色' = 'FAIL not-implemented'
+            'DIALOG YES'            = 'FAIL sigscan-failed'
+            'DIALOG NO'             = 'FAIL sigscan-failed'
+            'DIALOG OK'             = 'FAIL sigscan-failed'
+            'DIALOG MAYBE'          = 'FAIL usage: DIALOG <YES|NO|OK>'
+        }
+
+        foreach ($command in $expected.Keys)
+        {
+            $answer = Send-ModuleCommand -Pipe $pipe -Command $command
+            Write-Host "$command → $answer"
+            if ($answer -ne $expected[$command]) { $failures += "$command 的回应不对: $answer（应为 $($expected[$command])）" }
+        }
 
         $unload = Send-ModuleCommand -Pipe $pipe -Command 'UNLOAD'
         Write-Host "UNLOAD → $unload"

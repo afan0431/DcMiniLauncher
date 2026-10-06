@@ -6,6 +6,7 @@
 //
 // ⚠ 这是 F4 唯一的自维护脆弱面: 游戏大版本更新后这里全部要跟着 CS 重新对一遍。
 //   所以模块启动时会跑一次 PROBE 自检（读出当前大厅主机名等), 对不上就别往下写。
+//   「自动选角」一节的出处与核对状态单独写在那一节开头。
 #pragma once
 
 #include <cstdint>
@@ -61,14 +62,14 @@ namespace offsets
     inline constexpr uintptr_t AGENT_LOBBY_HOVERED_CHARA_INDEX    = 0x12CD; // :70 sbyte
     inline constexpr uintptr_t AGENT_LOBBY_SELECTED_CONTENT_ID    = 0x12D0; // :72 ulong
     inline constexpr uintptr_t AGENT_LOBBY_WORLD_ID               = 0x1254; // :44 ushort, 选角界面当前选中的服务器
+    // CharaSelectEntries 是按服务器现建现存的一份, 这里记着它是哪个服务器的（World 行号）。CS 没有这个字段。
+    // 静态: 取列表的函数（本机 exe RVA 0x4AE770）开头 cmp dx,[LobbyData+0x8F0], 相等直接返回 LobbyData+0x8D8,
+    //       不等就清空重建并把新的服务器写到这里: 先收原始服务器是它的角色, 再收当前服务器是它的角色。实机核对: 否
+    inline constexpr uintptr_t AGENT_LOBBY_CHARA_SELECT_ENTRIES_WORLD = AGENT_LOBBY_LOBBY_DATA + 0x8F0; // 0x930 ushort
 
-    // 选角界面切服务器（FOCUSCHARA）—— 做法抄 DailyRoutines Modules/General/AutoLogin.cs SelectWorld:
-    //   对 _CharaSelectWorldServer 逐个发 Callback(9, 0, i), 发完看 AgentLobby.WorldId 对上了就再发 Callback(10, 0, i)
     // AtkUnitBase::FireCallback(uint valueCount, AtkValue* values, bool close) —— AtkUnitBase.cs:217
+    // 本机 exe 静态核对: 唯一命中, 目标 RVA 0x6740E0。不在必中集合里, 用到的命令各自按需解析。
     inline constexpr const char* FIRE_CALLBACK_SIG           = "E8 ?? ?? ?? ?? 0F B6 E8 8B 44 24 20";
-    inline constexpr int         WORLD_SERVER_EVENT_HOVER    = 9;
-    inline constexpr int         WORLD_SERVER_EVENT_CONFIRM  = 10;
-    inline constexpr int         WORLD_SERVER_MAX_ENTRIES    = 16;
 
     // CharaSelectCharacterEntry (:131, Size 0x6F8)
     inline constexpr uintptr_t CHARA_ENTRY_CONTENT_ID      = 0x08;  // ulong = SDO 的 roleId
@@ -85,6 +86,116 @@ namespace offsets
     // (ContextMenuManager.cs: 有其一就只给「返回至原始大区」)
     inline constexpr unsigned char LOGIN_FLAG_DC_TRAVELING = 16;
     inline constexpr unsigned char LOGIN_FLAG_UNK32        = 32;
+
+    // =========================================================================
+    // 自动选角（LOBBYSTATE / CHARAS / WHOAMI / FOCUSCHARA / SELECTCHARA / ENTERCHARA / DIALOG）
+    //
+    // 出处: ottercorp/FFXIVClientStructs 国服分支 6e404c60（2026-09-30, 对应国服 2026.09.15.0000.0000）。
+    // 「静态」= 在本机磁盘上的 ffxiv_dx11.exe（同版本）里只读反汇编, 看到代码按这个偏移读写;
+    //           只说明代码里有这样的访问, 不说明运行时取值。
+    // ⚠ 这一节的每一项「是否已在实机核对」都是: 否。实机只读采样（test/probe-readonly.ps1）对上之前,
+    //   依赖它们的操作命令不得用于正式流程。
+    // =========================================================================
+
+    // MSVC std::vector: first / last / end 三个指针; end 只拿来做合理性校验
+    inline constexpr uintptr_t STD_VECTOR_END = 0x10;
+
+    // 读向量时的元素数上限, 超过就当读歪了。一个大区 8 个服务器 × 每服 8 个角色 = 64
+    inline constexpr int LOBBY_MAX_CHARACTERS = 64;
+    inline constexpr int LOBBY_MAX_WORLDS     = 64;
+
+    // ---- LobbyUIClient（LobbyUIClient.cs; 结构在 AgentLobby+0x48）----------
+    // CurrentDataCenterWorlds (:18) = StdVector<LobbyDataCenterWorldEntry>, 元素内联。
+    // 静态: ReceiveEvent case 21 里 lea rcx,[agent+0x78] 后按 0x54 做除法取数量。实机核对: 否
+    inline constexpr uintptr_t AGENT_LOBBY_DC_WORLDS  = AGENT_LOBBY_UI_CLIENT + 0x30;  // 0x78
+    inline constexpr size_t    DC_WORLD_ENTRY_SIZE    = 0x54;  // :27
+    // :28 ushort, World 表的行号。静态: 按下标取服务器的函数（RVA 0x4AF390）读的就是 元素[下标]+0 的 word。实机: 否
+    inline constexpr uintptr_t DC_WORLD_ENTRY_ID      = 0x00;
+
+    // CurrentDataCenterCharacters (:22) = StdVector<LobbyUIClientCharacterEntry>, 元素内联（整个大区的角色）。
+    // 前部字段偏移与下面的 CHARA_ENTRY_* 相同（LobbyUIClient.cs:48-58）。
+    // 静态: 重建当前服务器角色列表的函数（RVA 0x4AE770）从 LobbyData+0x100 取这个向量, 按 0x758 一个遍历,
+    //       用 +0x8 / +0x18 / +0x1A 筛选; 按序号取条目的函数（RVA 0x4AF110）检查 +0x740 与 +0x750。实机核对: 否
+    inline constexpr uintptr_t AGENT_LOBBY_DC_CHARACTERS        = AGENT_LOBBY_UI_CLIENT + 0xF8;  // 0x140
+    inline constexpr size_t    DC_CHARA_ENTRY_SIZE              = 0x758;  // :46
+    inline constexpr uintptr_t DC_CHARA_ENTRY_CONTENT_ID_MIRROR = 0x740;  // :64 ulong, 客户端自己要求它等于 +0x8
+    inline constexpr uintptr_t DC_CHARA_ENTRY_DELETED_FLAG      = 0x750;  // :67 byte, 客户端自己要求它为 0
+
+    // ---- AgentLobby 其它字段（AgentLobby.cs）--------------------------------
+    // WorldIndex (:43) short = 在 CurrentDataCenterWorlds 里的下标。静态: case 24 / 25 写入, case 21 读取。实机: 否
+    inline constexpr uintptr_t AGENT_LOBBY_WORLD_INDEX      = 0x1252;
+    // DialogAddonId (:46) uint。静态: OpenLoginWaitDialog 把新开的对话框 id 写到这里。实机: 否
+    inline constexpr uintptr_t AGENT_LOBBY_DIALOG_ADDON_ID  = 0x1258;
+    // LobbyUpdateStage (:61) byte。静态: 排队分支里 mov word [agent+0x129C], 0x11F。实机: 否
+    inline constexpr uintptr_t AGENT_LOBBY_UPDATE_STAGE     = 0x129C;
+    // LobbyUIStage (:63) byte。静态: 多处写入。实机: 否
+    inline constexpr uintptr_t AGENT_LOBBY_UI_STAGE         = 0x129F;
+    // QueuePosition (:68) int。静态: UpdateLoginPosition 里 mov [agent+0x12C8], r15d。实机: 否（不排队时的取值未知）
+    inline constexpr uintptr_t AGENT_LOBBY_QUEUE_POSITION   = 0x12C8;
+    // TemporaryLocked (:79) bool。静态: eventKind=3 确认登录时置 1, 点击登录的处理函数开头检查它。实机: 否
+    inline constexpr uintptr_t AGENT_LOBBY_TEMPORARY_LOCKED = 0x13D8;
+
+    // LobbyData 里「已登录角色」的那几项（AgentLobby.cs:115-121, LobbyData 在 AgentLobby+0x40）。
+    // Dalamud 只在 IsLoggedIn 为真时采信。静态: 相对偏移在大厅代码里有引用, 只能算旁证。实机: 否
+    inline constexpr uintptr_t AGENT_LOBBY_LOGGED_CONTENT_ID  = AGENT_LOBBY_LOBBY_DATA + 0x8F8;  // 0x938 ulong
+    inline constexpr uintptr_t AGENT_LOBBY_HOME_WORLD_NAME    = AGENT_LOBBY_LOBBY_DATA + 0x900;  // 0x940 Utf8String
+    inline constexpr uintptr_t AGENT_LOBBY_CURRENT_WORLD_NAME = AGENT_LOBBY_LOBBY_DATA + 0x9D0;  // 0xA10 Utf8String
+    inline constexpr uintptr_t AGENT_LOBBY_CURRENT_WORLD_ID   = AGENT_LOBBY_LOBBY_DATA + 0xA3C;  // 0xA7C ushort
+    inline constexpr uintptr_t AGENT_LOBBY_HOME_WORLD_ID      = AGENT_LOBBY_LOBBY_DATA + 0xA3E;  // 0xA7E ushort
+
+    // ---- 选角界面的回调编号（7.0 起; 6.x 的 9 / 10 / 17 / 18 已失效）--------
+    // 对 addon 发 FireCallback, 以 eventKind=0 落到 AgentLobby::ReceiveEvent（虚表第 0 项, 本机 exe RVA 0x4E0E30）。
+    // 静态: 跳转表里 case 21 / 25 / 29 的行为与下面的注释一致; addon 一侧怎么转给 Agent 没有反汇编。实机核对: 否
+    // 出处: ECommons _CharaSelectListMenu.cs / _CharaSelectWorldServer.cs, DailyRoutines AutoLogin.cs, Aida-Enna AutoLogin
+    inline constexpr int LOBBY_EVENT_SELECT_CHARA = 21;  // _CharaSelectListMenu ← (21, 序号): 只高亮
+    inline constexpr int LOBBY_EVENT_SELECT_WORLD = 25;  // _CharaSelectWorldServer ← (25, 0, 服务器下标)
+    inline constexpr int LOBBY_EVENT_CLICK_CHARA  = 29;  // _CharaSelectListMenu ← (29, 0, 序号): 左键点击, 弹登录确认框
+
+    // LoginFlags (AgentLobby.cs:156): Locked=1 / NameChangeRequired=2 / MissingExVersionForLogin=4,
+    // 带其中任何一位的角色点了也进不去, ENTERCHARA 直接拒绝
+    inline constexpr unsigned char LOGIN_FLAG_BLOCKING_MASK = 7;
+
+    // ---- PlayerState（Client/Game/UI/PlayerState.cs）-----------------------
+    // [StaticAddress(..., 3)] 直接是结构体地址（不是指针）。
+    // 静态: 唯一命中, RVA 0x2ACC3B8, 与 UIState.Instance（RVA 0x2ACB980）正好差 UIState.PlayerState 的偏移 0xA38。
+    // 不在必中集合里: 命中不了只让 WHOAMI 返回 FAIL sigscan-failed:PlayerState。
+    inline constexpr const char* PLAYER_STATE_SIG        = "48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 84 C0 75 06 F6 43 18 02";
+    inline constexpr int         PLAYER_STATE_SIG_OFFSET = 3;
+    inline constexpr uintptr_t PLAYER_STATE_IS_LOADED  = 0x00;  // :14 bool。静态: 否  实机: 否
+    inline constexpr uintptr_t PLAYER_STATE_NAME       = 0x01;  // :15 char[64] UTF-8。静态: 否  实机: 否
+    inline constexpr size_t    PLAYER_STATE_NAME_LEN   = 64;
+    inline constexpr uintptr_t PLAYER_STATE_CONTENT_ID = 0x68;  // :19 ulong。静态: 否  实机: 否
+
+    // ---- AtkUnitBase / 对话框（Component/GUI/AtkUnitBase.cs）----------------
+    // 以下各项静态: 否  实机: 否（0x1E4 紧挨着右键菜单已在用的 BlockedParentId 0x1EA, 仅此旁证）
+    inline constexpr uintptr_t ATK_UNIT_BASE_ATK_VALUES       = 0x178;  // :30 AtkValue*
+    inline constexpr uintptr_t ATK_UNIT_BASE_FLAGS198         = 0x198;  // :38 uint
+    inline constexpr unsigned  ATK_UNIT_BASE_VISIBLE_BIT      = 21;     // :35 VisibilityState 占 bit 20-23, Show = 1<<1
+    inline constexpr uintptr_t ATK_UNIT_BASE_FLAGS1A1         = 0x1A1;  // :45 byte
+    inline constexpr unsigned  ATK_UNIT_BASE_READY_BIT        = 0;      // :42 IsReady
+    inline constexpr uintptr_t ATK_UNIT_BASE_ATK_VALUES_COUNT = 0x1E2;  // :112 ushort
+    inline constexpr uintptr_t ATK_UNIT_BASE_ID               = 0x1E4;  // :113 ushort
+
+    // AddonSelectYesno.cs:13 / AddonSelectOk.cs:13 —— 两个对话框的提示文字节点在同一偏移。静态: 否  实机: 否
+    inline constexpr uintptr_t ADDON_SELECT_PROMPT_TEXT = 0x238;  // AtkTextNode*
+    inline constexpr uintptr_t ATK_TEXT_NODE_NODE_TEXT  = 0xD0;   // AtkTextNode.cs:22 Utf8String。静态: 否  实机: 否
+
+    // AtkValue.cs:3-15 —— 类型的低 4 位; 0x20 是 Managed 标志
+    inline constexpr unsigned ATK_VALUE_TYPE_MASK         = 0xF;
+    inline constexpr unsigned ATK_VALUE_TYPE_STRING       = 0x8;
+    inline constexpr unsigned ATK_VALUE_TYPE_CONST_STRING = 0xA;
+
+    inline constexpr int SELECT_YESNO_NO = 1;  // FireCallbackInt(1) = 否（Aida-Enna AutoLogin）。实机: 否
+    inline constexpr int SELECT_OK_OK    = 0;  // SelectOk: FireCallbackInt(0) = 确定。实机: 否
+
+    // Dialogue（大厅错误 / 断线提示框）的确定按钮 = 组件按钮 4（DailyRoutines AutoLogin.cs:226, AutoRetainer BailoutManager.cs:126）。
+    // 点法同各插件的 ClickAddonButton: 取按钮所属节点事件链上的那条 ButtonClick, 用它自己的 Param 调 addon 的 ReceiveEvent。
+    // 以下各项静态: 否  实机: 否
+    inline constexpr int       DIALOGUE_OK_BUTTON_ID         = 4;
+    inline constexpr uintptr_t ATK_COMPONENT_BASE_OWNER_NODE = 0xA8;  // AtkComponentBase.cs:17 AtkComponentNode*（开头就是 AtkResNode）
+    inline constexpr uintptr_t ATK_EVENT_PARAM               = 0x18;  // AtkEvent.cs:118 uint
+    inline constexpr uintptr_t ATK_EVENT_NEXT                = 0x20;  // AtkEvent.cs:119 AtkEvent*
+    inline constexpr uintptr_t ATK_EVENT_TYPE                = 0x28;  // AtkEvent.cs:120,128 State.EventType byte
 
     // ---- NetworkModule (Application/Network/NetworkModule.cs) --------------
     inline constexpr uintptr_t NETWORK_MODULE_PROXY_MODULE = 0x08;  // Client/Network/NetworkModuleProxy.cs:10

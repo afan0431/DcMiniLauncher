@@ -1076,26 +1076,266 @@ namespace
 }
 
 // =============================================================================
-// FOCUSCHARA —— 选角界面切到「这个角色现在所在的服务器」
+// 自动选角 —— 选角界面的只读状态与单步操作
 //
-// WHY: 跨完大区点「开始游戏」进选角界面, 游戏显示的是它自己记住的服务器, 不一定是角色刚到的那个
-//      （用户实测: 拂晓之间跨到水晶塔, 进来却停在别的服务器, 角色列表里看不到它）。
-// DCTraveler 不管这件事; 做法抄 DailyRoutines 的 AutoLogin.SelectWorld。
+// 分工: 这里每条命令只做一步、立即返回; 等待、重试、判断（等确认框、等排队、等进游戏）全在启动器那边。
+// 操作命令（FOCUSCHARA / SELECTCHARA / ENTERCHARA / DIALOG）动手前先过界面闸, 不该动的时候一律拒绝。
+// 读结构体时做合理性校验, 读歪了回 FAIL 而不是错数据 —— 偏移的出处与核对状态见 offsets.h「自动选角」一节。
 // =============================================================================
 
 namespace
 {
     using FireCallbackFn = bool (*)(void* addon, unsigned int count, void* values, bool close);
 
-    uintptr_t g_fireCallback = 0;
+    // 这两条特征码不在 GameResolve 的必中集合里: 用到时才解析, 命中不了只让依赖它的命令失败
+    uintptr_t g_fireCallback      = 0;
+    bool      g_fireCallbackTried = false;
+    uintptr_t g_playerState       = 0;
+    bool      g_playerStateTried  = false;
 
-    struct FocusResult
+    bool ResolveFireCallback()
     {
-        int            status;      // 2=已切换 1=本来就是 0=列表里没这个角色 -1=异常 -2=服务器列表不在 -3=没找到那个服务器
-        unsigned short targetWorld;
-        unsigned short beforeWorld;
-        int            slot;
-    };
+        if (!g_fireCallbackTried)
+        {
+            g_fireCallbackTried = true;
+            g_fireCallback      = ScanText(offsets::FIRE_CALLBACK_SIG);
+
+            LogF("[game]   FireCallback            RVA=0x%llX",
+                 static_cast<unsigned long long>(g_fireCallback ? g_fireCallback - ModuleBase() : 0));
+        }
+
+        return g_fireCallback != 0;
+    }
+
+    bool ResolvePlayerState()
+    {
+        if (!g_playerStateTried)
+        {
+            g_playerStateTried = true;
+            g_playerState      = ScanStaticAddress(offsets::PLAYER_STATE_SIG, offsets::PLAYER_STATE_SIG_OFFSET);
+
+            LogF("[game]   PlayerState 静态地址    RVA=0x%llX",
+                 static_cast<unsigned long long>(g_playerState ? g_playerState - ModuleBase() : 0));
+        }
+
+        return g_playerState != 0;
+    }
+
+    // 堆对象指针的合理性: 非空、落在用户态地址范围内、按 8 字节对齐
+    bool PlausiblePointer(const void* pointer)
+    {
+        const auto value = reinterpret_cast<uintptr_t>(pointer);
+        return value >= 0x10000 && value < 0x00007FFFFFFF0000ULL && (value & 7) == 0;
+    }
+
+    // 读一个 std::vector 的元素个数。空向量返回 0; 指针不合理、长度不是元素大小的整数倍、
+    // 或元素数超过上限都返回 -1（读歪了）
+    int VectorCount(uint8_t* vector, size_t elementSize, int maxCount, uint8_t** firstOut)
+    {
+        *firstOut = nullptr;
+
+        const auto first = ReadAt<uint8_t*>(vector, offsets::STD_VECTOR_FIRST);
+        const auto last  = ReadAt<uint8_t*>(vector, offsets::STD_VECTOR_LAST);
+        const auto end   = ReadAt<uint8_t*>(vector, offsets::STD_VECTOR_END);
+
+        if (first == nullptr && last == nullptr)
+            return 0;
+
+        if (!PlausiblePointer(first) || last < first || end < last)
+            return -1;
+
+        const auto bytes = static_cast<size_t>(last - first);
+
+        if (bytes % elementSize != 0 || bytes / elementSize > static_cast<size_t>(maxCount))
+            return -1;
+
+        *firstOut = first;
+        return static_cast<int>(bytes / elementSize);
+    }
+
+    // 从 text 起的一个合法 UTF-8 序列占几个字节; 不合法返回 0
+    size_t Utf8SequenceLength(const uint8_t* text, size_t remaining)
+    {
+        const uint8_t lead = text[0];
+        size_t        need = 0;
+
+        if (lead < 0x80)
+            return 1;
+
+        if (lead >= 0xC2 && lead <= 0xDF)
+            need = 2;
+        else if (lead >= 0xE0 && lead <= 0xEF)
+            need = 3;
+        else if (lead >= 0xF0 && lead <= 0xF4)
+            need = 4;
+        else
+            return 0;
+
+        if (remaining < need)
+            return 0;
+
+        for (size_t i = 1; i < need; ++i)
+        {
+            if ((text[i] & 0xC0) != 0x80)
+                return 0;
+        }
+
+        // 过长编码、代理区、超出 U+10FFFF
+        if ((lead == 0xE0 && text[1] < 0xA0) || (lead == 0xED && text[1] > 0x9F) ||
+            (lead == 0xF0 && text[1] < 0x90) || (lead == 0xF4 && text[1] > 0x8F))
+            return 0;
+
+        return need;
+    }
+
+    // 定长名字字段 → 以 0 结尾的串。必须在 capacity 字节内以 0 结尾、是合法 UTF-8、不含控制字符,
+    // 否则返回 false（读歪了）。destination 至少要有 capacity 字节
+    bool CopyCheckedName(const uint8_t* source, size_t capacity, char* destination, bool allowEmpty)
+    {
+        destination[0] = '\0';
+
+        const size_t length = strnlen(reinterpret_cast<const char*>(source), capacity);
+
+        if (length >= capacity)
+            return false;
+
+        if (length == 0)
+            return allowEmpty;
+
+        for (size_t i = 0; i < length;)
+        {
+            if (source[i] < 0x20 || source[i] == 0x7F)
+                return false;
+
+            const size_t step = Utf8SequenceLength(source + i, length - i);
+            if (step == 0)
+                return false;
+
+            i += step;
+        }
+
+        memcpy(destination, source, length);
+        destination[length] = '\0';
+        return true;
+    }
+
+    // 把一个角色条目读成一行。CharaSelectCharacterEntry 与 LobbyUIClientCharacterEntry 前部字段偏移相同, 共用
+    bool ReadCharaRow(uint8_t* entry, CharaRow* row)
+    {
+        row->contentId      = ReadAt<unsigned long long>(entry, offsets::CHARA_ENTRY_CONTENT_ID);
+        row->index          = ReadAt<unsigned char>(entry, offsets::CHARA_ENTRY_INDEX);
+        row->loginFlags     = ReadAt<unsigned char>(entry, offsets::CHARA_ENTRY_LOGIN_FLAGS);
+        row->currentWorldId = ReadAt<unsigned short>(entry, offsets::CHARA_ENTRY_CURRENT_WORLD);
+        row->homeWorldId    = ReadAt<unsigned short>(entry, offsets::CHARA_ENTRY_HOME_WORLD);
+
+        if (row->contentId == 0)
+            return false;
+
+        return CopyCheckedName(entry + offsets::CHARA_ENTRY_NAME, offsets::CHARA_ENTRY_NAME_LEN, row->name, false) &&
+               CopyCheckedName(entry + offsets::CHARA_ENTRY_CURRENT_WORLD_NAME, offsets::CHARA_ENTRY_NAME_LEN,
+                               row->currentWorldName, true) &&
+               CopyCheckedName(entry + offsets::CHARA_ENTRY_HOME_WORLD_NAME, offsets::CHARA_ENTRY_NAME_LEN,
+                               row->homeWorldName, true);
+    }
+
+    // 大区角色列表里客户端自己不认的条目（空位、已删除、或 ContentId 与镜像对不上）—— 它按序号取条目时查的就是这三样
+    bool DcEntryUsable(uint8_t* entry)
+    {
+        const auto contentId = ReadAt<unsigned long long>(entry, offsets::CHARA_ENTRY_CONTENT_ID);
+
+        return contentId != 0 &&
+               ReadAt<unsigned char>(entry, offsets::DC_CHARA_ENTRY_DELETED_FLAG) == 0 &&
+               ReadAt<unsigned long long>(entry, offsets::DC_CHARA_ENTRY_CONTENT_ID_MIRROR) == contentId;
+    }
+
+    bool RowMatches(const CharaRow* row, const char* name, unsigned long long contentId)
+    {
+        return contentId != 0 ? row->contentId == contentId : strcmp(row->name, name) == 0;
+    }
+
+    constexpr int FIND_OK        = 1;
+    constexpr int FIND_NONE      = 0;
+    constexpr int FIND_BAD_LIST  = -2; // 向量读歪
+    constexpr int FIND_BAD_ENTRY = -3; // 条目读歪
+    constexpr int FIND_AMBIGUOUS = -4; // 按名字找到不止一个
+
+    // 在整个大区的角色列表（CurrentDataCenterCharacters, 元素内联）里找角色
+    int FindDcCharacter(uint8_t* lobby, const char* name, unsigned long long contentId, CharaRow* out)
+    {
+        uint8_t*  first = nullptr;
+        const int count = VectorCount(lobby + offsets::AGENT_LOBBY_DC_CHARACTERS, offsets::DC_CHARA_ENTRY_SIZE,
+                                      offsets::LOBBY_MAX_CHARACTERS, &first);
+        if (count < 0)
+            return FIND_BAD_LIST;
+
+        int found = 0;
+
+        for (int i = 0; i < count; ++i)
+        {
+            const auto entry = first + static_cast<size_t>(i) * offsets::DC_CHARA_ENTRY_SIZE;
+
+            if (!DcEntryUsable(entry))
+                continue;
+
+            CharaRow row;
+            if (!ReadCharaRow(entry, &row))
+                return FIND_BAD_ENTRY;
+
+            if (!RowMatches(&row, name, contentId))
+                continue;
+
+            if (++found > 1)
+                return FIND_AMBIGUOUS;
+
+            *out = row;
+        }
+
+        return found;
+    }
+
+    // 在当前显示的角色列表（CharaSelectEntries, 元素是指针）里找角色; position = 它在向量里的位置
+    int FindListCharacter(uint8_t* lobby, const char* name, unsigned long long contentId, CharaRow* out, int* position)
+    {
+        uint8_t*  first = nullptr;
+        const int count = VectorCount(lobby + offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES, sizeof(void*),
+                                      offsets::LOBBY_MAX_CHARACTERS, &first);
+        if (count < 0)
+            return FIND_BAD_LIST;
+
+        int found = 0;
+
+        for (int i = 0; i < count; ++i)
+        {
+            const auto entry = ReadAt<uint8_t*>(first, static_cast<uintptr_t>(i) * sizeof(void*));
+
+            if (entry == nullptr)
+                continue;
+
+            CharaRow row;
+            if (!PlausiblePointer(entry) || !ReadCharaRow(entry, &row))
+                return FIND_BAD_ENTRY;
+
+            if (!RowMatches(&row, name, contentId))
+                continue;
+
+            if (++found > 1)
+                return FIND_AMBIGUOUS;
+
+            *out      = row;
+            *position = i;
+        }
+
+        return found;
+    }
+
+    void* FindAddon(const Pointers* p, const char* name)
+    {
+        if (p->unitManager == nullptr)
+            return nullptr;
+
+        const auto addon = reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(p->unitManager, name, 1);
+        return PlausiblePointer(addon) ? addon : nullptr;
+    }
 
     // AtkValue{ Int }: +0 Type(u32)=3, +8 值
     void SetIntValue(uint8_t* value, int number)
@@ -1105,49 +1345,426 @@ namespace
         *reinterpret_cast<int*>(value + 8)  = number;
     }
 
-    bool FireWorldServer(void* addon, int eventId, int slot)
+    // 对 addon 发一条全是整数的回调（最多 3 个值）
+    bool FireInts(void* addon, const int* numbers, unsigned int count)
     {
         uint8_t values[3 * offsets::ATK_VALUE_SIZE];
-        SetIntValue(values,                              eventId);
-        SetIntValue(values + offsets::ATK_VALUE_SIZE,     0);
-        SetIntValue(values + 2 * offsets::ATK_VALUE_SIZE, slot);
 
-        return reinterpret_cast<FireCallbackFn>(g_fireCallback)(addon, 3, values, true);
+        if (count > 3)
+            return false;
+
+        for (unsigned int i = 0; i < count; ++i)
+            SetIntValue(values + i * offsets::ATK_VALUE_SIZE, numbers[i]);
+
+        return reinterpret_cast<FireCallbackFn>(g_fireCallback)(addon, count, values, true);
     }
 
-    void OpFocusCharacter(const Pointers* p, const char* name, unsigned long long contentId, FocusResult* out)
+    // ---- 对话框 --------------------------------------------------------------
+
+    constexpr size_t DIALOG_TEXT_MAX = 600;
+
+    struct DialogInfo
     {
-        memset(out, 0, sizeof(FocusResult));
+        int      present;
+        unsigned id;
+        int      ready;
+        int      visible;
+        char     text[DIALOG_TEXT_MAX];
+    };
+
+    // 提示文字要进行式协议: 控制字符（含换行、制表符、文本宏的起止字节）换成空格, 不合法的 UTF-8 字节换成 '?'
+    void SanitizeText(char* text)
+    {
+        const size_t length = strlen(text);
+
+        for (size_t i = 0; i < length;)
+        {
+            const auto current = reinterpret_cast<uint8_t*>(text) + i;
+
+            if (*current < 0x20 || *current == 0x7F)
+            {
+                text[i++] = ' ';
+                continue;
+            }
+
+            const size_t step = Utf8SequenceLength(current, length - i);
+
+            if (step == 0)
+            {
+                text[i++] = '?';
+                continue;
+            }
+
+            i += step;
+        }
+    }
+
+    // addon 的 AtkValues 里第一个非空字符串（只看前 8 个）
+    void CopyFirstStringValue(void* addon, char* destination, size_t capacity)
+    {
+        const auto values = ReadAt<uint8_t*>(addon, offsets::ATK_UNIT_BASE_ATK_VALUES);
+        const auto count  = ReadAt<unsigned short>(addon, offsets::ATK_UNIT_BASE_ATK_VALUES_COUNT);
+
+        if (!PlausiblePointer(values))
+            return;
+
+        for (unsigned i = 0; i < count && i < 8; ++i)
+        {
+            const auto value = values + i * offsets::ATK_VALUE_SIZE;
+            const auto type  = ReadAt<unsigned>(value, 0) & offsets::ATK_VALUE_TYPE_MASK;
+
+            if (type != offsets::ATK_VALUE_TYPE_STRING && type != offsets::ATK_VALUE_TYPE_CONST_STRING)
+                continue;
+
+            const auto text = ReadAt<const char*>(value, 8);
+
+            if (reinterpret_cast<uintptr_t>(text) < 0x10000 || text[0] == '\0')
+                continue;
+
+            const size_t length = strnlen(text, capacity - 1);
+            memcpy(destination, text, length);
+            destination[length] = '\0';
+            return;
+        }
+    }
+
+    // 读对话框的提示文字。文字只是给启动器判断用的附加信息, 读不到或读歪了留空, 不让整条命令失败。
+    // SelectYesno / SelectOk 先取提示文字节点, 取不到再看 AtkValues; Dialogue 只看 AtkValues
+    void ReadDialogText(void* addon, bool hasPromptNode, char* destination, size_t capacity)
+    {
+        destination[0] = '\0';
+
+        __try
+        {
+            if (hasPromptNode)
+            {
+                const auto node = ReadAt<uint8_t*>(addon, offsets::ADDON_SELECT_PROMPT_TEXT);
+
+                if (PlausiblePointer(node))
+                    CopyUtf8String(node + offsets::ATK_TEXT_NODE_NODE_TEXT, destination, capacity);
+            }
+
+            if (destination[0] == '\0')
+                CopyFirstStringValue(addon, destination, capacity);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            destination[0] = '\0';
+        }
+
+        SanitizeText(destination);
+    }
+
+    void ReadDialog(const Pointers* p, const char* name, bool hasPromptNode, DialogInfo* out)
+    {
+        const auto addon = FindAddon(p, name);
+
+        if (addon == nullptr)
+            return;
+
+        out->present = 1;
+        out->id      = ReadAt<unsigned short>(addon, offsets::ATK_UNIT_BASE_ID);
+        out->ready   = (ReadAt<unsigned char>(addon, offsets::ATK_UNIT_BASE_FLAGS1A1) >> offsets::ATK_UNIT_BASE_READY_BIT) & 1;
+        out->visible = (ReadAt<unsigned>(addon, offsets::ATK_UNIT_BASE_FLAGS198) >> offsets::ATK_UNIT_BASE_VISIBLE_BIT) & 1;
+
+        ReadDialogText(addon, hasPromptNode, out->text, sizeof(out->text));
+    }
+
+    // ---- LOBBYSTATE ----------------------------------------------------------
+
+    struct LobbyStateData
+    {
+        int                where;
+        unsigned           world;
+        int                worldIndex;
+        int                selectedIndex;
+        unsigned long long hovered;
+        int                locked;
+        unsigned           updateStage;
+        unsigned           uiStage;
+        int                queue;
+        unsigned           dialogId;
+        int                loading;
+        DialogInfo         yesno;
+        DialogInfo         ok;
+        DialogInfo         dialogue;
+    };
+
+    bool OpLobbyState(const Pointers* p, LobbyStateData* out)
+    {
+        memset(out, 0, sizeof(LobbyStateData));
+        out->where = OpWhere(p);
 
         __try
         {
             const auto lobby = reinterpret_cast<uint8_t*>(p->agentLobby);
-            const auto first = ReadAt<uint8_t**>(lobby + offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES, offsets::STD_VECTOR_FIRST);
-            const auto last  = ReadAt<uint8_t**>(lobby + offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES, offsets::STD_VECTOR_LAST);
 
-            if (first == nullptr || last == nullptr || last <= first || last - first > 1000)
-                return; // status 0: 列表还没载入
+            out->world         = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_WORLD_ID);
+            out->worldIndex    = ReadAt<short>(lobby, offsets::AGENT_LOBBY_WORLD_INDEX);
+            out->selectedIndex = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_SELECTED_CHARA_INDEX);
+            out->hovered       = ReadAt<unsigned long long>(lobby, offsets::AGENT_LOBBY_HOVERED_CONTENT_ID);
+            out->locked        = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_TEMPORARY_LOCKED) != 0 ? 1 : 0;
+            out->updateStage   = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_UPDATE_STAGE);
+            out->uiStage       = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_UI_STAGE);
+            out->queue         = ReadAt<int>(lobby, offsets::AGENT_LOBBY_QUEUE_POSITION);
+            out->dialogId      = ReadAt<unsigned>(lobby, offsets::AGENT_LOBBY_DIALOG_ADDON_ID);
 
-            uint8_t* entry = nullptr;
+            ReadDialog(p, "SelectYesno", true,  &out->yesno);
+            ReadDialog(p, "SelectOk",    true,  &out->ok);
+            ReadDialog(p, "Dialogue",    false, &out->dialogue);
 
-            for (auto it = first; it < last && entry == nullptr; ++it)
+            // NowLoading 常驻, 读盘时才显示, 所以要看可见位而不是在不在
+            const auto loading = FindAddon(p, "NowLoading");
+
+            if (loading != nullptr)
+                out->loading = (ReadAt<unsigned>(loading, offsets::ATK_UNIT_BASE_FLAGS198) >> offsets::ATK_UNIT_BASE_VISIBLE_BIT) & 1;
+
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] LOBBYSTATE 异常 code=0x%08X", GetExceptionCode());
+            return false;
+        }
+    }
+
+    void AppendDialogLine(std::string& response, const char* name, const DialogInfo& dialog)
+    {
+        if (dialog.present == 0)
+            return;
+
+        char line[DIALOG_TEXT_MAX + 96];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "\nD\t%s\t%u\t%d\t%d\t%s", name, dialog.id, dialog.ready, dialog.visible,
+                    dialog.text);
+        response += line;
+    }
+
+    // ---- DIALOG --------------------------------------------------------------
+
+    constexpr int DIALOG_YES = 0;
+    constexpr int DIALOG_NO  = 1;
+    constexpr int DIALOG_OK  = 2;
+
+    // 节点事件链上的那条 ButtonClick
+    void* FindButtonClickEvent(void* node)
+    {
+        if (!PlausiblePointer(node))
+            return nullptr;
+
+        auto atkEvent = ReadAt<void*>(node, offsets::ATK_RES_NODE_EVENT_MANAGER);
+
+        for (int i = 0; i < 16 && PlausiblePointer(atkEvent); ++i)
+        {
+            if (ReadAt<unsigned char>(atkEvent, offsets::ATK_EVENT_TYPE) == offsets::ATK_EVENT_TYPE_BUTTON_CLICK)
+                return atkEvent;
+
+            atkEvent = ReadAt<void*>(atkEvent, offsets::ATK_EVENT_NEXT);
+        }
+
+        return nullptr;
+    }
+
+    // 返回: 1=点了 SelectYesno 2=点了 SelectOk 3=点了 Dialogue 0=没有对应的对话框
+    //       -1=异常 -2=那是排队提示, 不点 -3=在游戏里, 不点 -4=Dialogue 的确定按钮找不到
+    int OpDialog(const Pointers* p, int action)
+    {
+        const int where = OpWhere(p);
+
+        __try
+        {
+            // 游戏里的是/否框可能是任何东西（交易、丢弃物品…）, 这条命令只为登录流程服务
+            if (where == 3)
+                return -3;
+
+            const auto fireInt = reinterpret_cast<FireCallbackIntFn>(g_fireCallbackInt);
+
+            if (action == DIALOG_YES || action == DIALOG_NO)
             {
-                if (*it == nullptr)
-                    continue;
+                const auto yesno = FindAddon(p, "SelectYesno");
 
-                const bool match = contentId != 0
-                                       ? ReadAt<unsigned long long>(*it, offsets::CHARA_ENTRY_CONTENT_ID) == contentId
-                                       : strncmp(reinterpret_cast<const char*>(*it + offsets::CHARA_ENTRY_NAME), name,
-                                                 offsets::CHARA_ENTRY_NAME_LEN) == 0;
-                if (match)
-                    entry = *it;
+                if (yesno == nullptr)
+                    return 0;
+
+                fireInt(yesno, action == DIALOG_YES ? offsets::SELECT_YESNO_YES : offsets::SELECT_YESNO_NO);
+                return 1;
             }
 
-            if (entry == nullptr)
-                return;
+            const auto dialogue = FindAddon(p, "Dialogue");
 
-            out->targetWorld = ReadAt<unsigned short>(entry, offsets::CHARA_ENTRY_CURRENT_WORLD);
+            if (dialogue != nullptr)
+            {
+                const auto button = reinterpret_cast<GetComponentButtonFn>(g_getComponentButton)(
+                    dialogue, offsets::DIALOGUE_OK_BUTTON_ID);
+
+                if (!PlausiblePointer(button))
+                    return -4;
+
+                auto atkEvent = FindButtonClickEvent(ReadAt<void*>(button, offsets::ATK_COMPONENT_BASE_OWNER_NODE));
+
+                if (atkEvent == nullptr)
+                    atkEvent = FindButtonClickEvent(ReadAt<void*>(button, offsets::ATK_COMPONENT_BASE_RES_NODE));
+
+                if (atkEvent == nullptr)
+                    return -4;
+
+                // 事件数据给一块全 0 的缓冲, 处理函数要读它时不至于解空指针
+                unsigned char eventData[0x40]{};
+
+                const auto vtable       = ReadAt<void**>(dialogue, 0);
+                const auto receiveEvent = reinterpret_cast<ReceiveEventFn>(vtable[offsets::ATK_UNIT_BASE_RECEIVE_EVENT_VF]);
+
+                receiveEvent(dialogue, offsets::ATK_EVENT_TYPE_BUTTON_CLICK,
+                             static_cast<int>(ReadAt<unsigned>(atkEvent, offsets::ATK_EVENT_PARAM)), atkEvent, eventData);
+                return 3;
+            }
+
+            const auto ok = FindAddon(p, "SelectOk");
+
+            if (ok == nullptr)
+                return 0;
+
+            // 排队提示也是 SelectOk: 是大厅自己开的那个框（DialogAddonId 对得上）且有排队名次时, 点它等于取消排队
+            const auto lobby    = reinterpret_cast<uint8_t*>(p->agentLobby);
+            const auto dialogId = ReadAt<unsigned>(lobby, offsets::AGENT_LOBBY_DIALOG_ADDON_ID);
+            const auto queue    = ReadAt<int>(lobby, offsets::AGENT_LOBBY_QUEUE_POSITION);
+
+            if (dialogId != 0 && dialogId == ReadAt<unsigned short>(ok, offsets::ATK_UNIT_BASE_ID) && queue > 0)
+                return -2;
+
+            fireInt(ok, offsets::SELECT_OK_OK);
+            return 2;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] DIALOG 异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+
+    // ---- CHARAS --------------------------------------------------------------
+
+    struct CharaListData
+    {
+        int                where;
+        int                status;  // 1=正常 -1=异常 -2=向量读歪 -3=条目读歪（badIndex 是第几个）
+        int                badIndex;
+        int                total;   // 向量里一共几个
+        int                count;   // 拷出几个
+        int                skipped; // 客户端自己不认的条目（已删除 / ContentId 镜像对不上）
+        int                selectedIndex;
+        int                hoveredIndex;
+        unsigned long long selectedContentId;
+        unsigned long long hoveredContentId;
+        CharaRow           rows[offsets::LOBBY_MAX_CHARACTERS];
+    };
+
+    void OpCharas(const Pointers* p, CharaListData* out)
+    {
+        memset(out, 0, sizeof(CharaListData));
+        out->where  = OpWhere(p);
+        out->status = -1;
+
+        __try
+        {
+            const auto lobby = reinterpret_cast<uint8_t*>(p->agentLobby);
+
+            out->selectedIndex     = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_SELECTED_CHARA_INDEX);
+            out->hoveredIndex      = ReadAt<signed char>(lobby, offsets::AGENT_LOBBY_HOVERED_CHARA_INDEX);
+            out->selectedContentId = ReadAt<unsigned long long>(lobby, offsets::AGENT_LOBBY_SELECTED_CONTENT_ID);
+            out->hoveredContentId  = ReadAt<unsigned long long>(lobby, offsets::AGENT_LOBBY_HOVERED_CONTENT_ID);
+
+            uint8_t* first = nullptr;
+            out->total     = VectorCount(lobby + offsets::AGENT_LOBBY_DC_CHARACTERS, offsets::DC_CHARA_ENTRY_SIZE,
+                                         offsets::LOBBY_MAX_CHARACTERS, &first);
+            if (out->total < 0)
+            {
+                out->total  = 0;
+                out->status = -2;
+                return;
+            }
+
+            for (int i = 0; i < out->total; ++i)
+            {
+                const auto entry = first + static_cast<size_t>(i) * offsets::DC_CHARA_ENTRY_SIZE;
+
+                if (!DcEntryUsable(entry))
+                {
+                    ++out->skipped;
+                    continue;
+                }
+
+                if (!ReadCharaRow(entry, &out->rows[out->count]))
+                {
+                    out->badIndex = i;
+                    out->status   = -3;
+                    return;
+                }
+
+                ++out->count;
+            }
+
+            out->status = 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] CHARAS 异常 code=0x%08X", GetExceptionCode());
+            out->status = -1;
+        }
+    }
+
+    void AppendCharaLine(std::string& response, const CharaRow& row)
+    {
+        char line[256];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "\nC\t%llu\t%u\t%u\t%u\t%u\t%s\t%s\t%s",
+                    row.contentId, row.index, row.loginFlags, row.currentWorldId, row.homeWorldId,
+                    row.name, row.currentWorldName, row.homeWorldName);
+        response += line;
+    }
+
+    // ---- FOCUSCHARA ----------------------------------------------------------
+    // 选角界面切到「这个角色所在的服务器」。跨完大区点「开始游戏」进选角界面, 游戏显示的是它自己记住的服务器,
+    // 不一定是角色所在的那个, 角色列表里就看不到它。
+
+    struct FocusResult
+    {
+        int            status; // 2=已切换 1=本来就是 0=大区里没这个角色（或列表还没载入） -1=异常 -2=服务器列表不在
+                               // -3=目标服务器不在本大区 -4=不在选角界面 -5=列表读歪 -6=同名不止一个 -7=发了回调但没切过去
+        unsigned short targetWorld;
+        unsigned short beforeWorld;
+        unsigned short afterWorld;
+        int            slot;
+    };
+
+    void OpFocusCharacter(const Pointers* p, const char* name, unsigned long long contentId, FocusResult* out)
+    {
+        memset(out, 0, sizeof(FocusResult));
+        out->slot = -1;
+
+        const int where = OpWhere(p);
+
+        __try
+        {
+            if (where != 2)
+            {
+                out->status = -4;
+                return;
+            }
+
+            const auto lobby = reinterpret_cast<uint8_t*>(p->agentLobby);
+
+            CharaRow  row{};
+            const int found = FindDcCharacter(lobby, name, contentId, &row);
+
+            if (found != FIND_OK)
+            {
+                out->status = found == FIND_NONE ? 0 : found == FIND_AMBIGUOUS ? -6 : -5;
+                return;
+            }
+
+            // 超域中的角色列在它当前所在的服务器下, 其余（包括同大区跨服中的）列在原始服务器下
+            out->targetWorld = row.loginFlags == offsets::LOGIN_FLAG_DC_TRAVELING ? row.currentWorldId : row.homeWorldId;
             out->beforeWorld = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_WORLD_ID);
+            out->afterWorld  = out->beforeWorld;
 
             if (out->beforeWorld == out->targetWorld)
             {
@@ -1155,8 +1772,30 @@ namespace
                 return;
             }
 
-            const auto find  = reinterpret_cast<GetAddonByNameFn>(g_getAddonByName);
-            const auto addon = find(p->unitManager, "_CharaSelectWorldServer", 1);
+            uint8_t*  worlds     = nullptr;
+            const int worldCount = VectorCount(lobby + offsets::AGENT_LOBBY_DC_WORLDS, offsets::DC_WORLD_ENTRY_SIZE,
+                                               offsets::LOBBY_MAX_WORLDS, &worlds);
+            if (worldCount < 0)
+            {
+                out->status = -5;
+                return;
+            }
+
+            for (int i = 0; i < worldCount && out->slot < 0; ++i)
+            {
+                const auto world = worlds + static_cast<size_t>(i) * offsets::DC_WORLD_ENTRY_SIZE;
+
+                if (ReadAt<unsigned short>(world, offsets::DC_WORLD_ENTRY_ID) == out->targetWorld)
+                    out->slot = i;
+            }
+
+            if (out->slot < 0)
+            {
+                out->status = -3;
+                return;
+            }
+
+            const auto addon = FindAddon(p, "_CharaSelectWorldServer");
 
             if (addon == nullptr)
             {
@@ -1164,20 +1803,11 @@ namespace
                 return;
             }
 
-            for (int slot = 0; slot < offsets::WORLD_SERVER_MAX_ENTRIES; ++slot)
-            {
-                FireWorldServer(addon, offsets::WORLD_SERVER_EVENT_HOVER, slot);
+            const int values[3] = {offsets::LOBBY_EVENT_SELECT_WORLD, 0, out->slot};
+            FireInts(addon, values, 3);
 
-                if (ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_WORLD_ID) == out->targetWorld)
-                {
-                    FireWorldServer(addon, offsets::WORLD_SERVER_EVENT_CONFIRM, slot);
-                    out->slot   = slot;
-                    out->status = 2;
-                    return;
-                }
-            }
-
-            out->status = -3;
+            out->afterWorld = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_WORLD_ID);
+            out->status     = out->afterWorld == out->targetWorld ? 2 : -7;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -1185,31 +1815,441 @@ namespace
             out->status = -1;
         }
     }
+
+    // ---- SELECTCHARA / ENTERCHARA --------------------------------------------
+
+    struct CharaActionResult
+    {
+        int                status; // 1=成功 0=当前列表里没这个角色 -1=异常 -2=不在选角界面 -3=列表读歪 -4=同名不止一个
+                                   // -5=向量位置与条目序号不一致 -6=发了回调但没选中 -7=暂时锁定 -8=角色带不可登录标志
+                                   // -9=存着的角色列表不是当前服务器的
+        unsigned short     world;
+        unsigned short     listWorld;
+        int                position;
+        int                entryIndex;
+        unsigned           loginFlags;
+        unsigned long long contentId;
+        int                selectedIndex;
+        unsigned long long hovered;
+    };
+
+    // enter=false: 只高亮（21, 序号）并回读确认; enter=true: 左键点击（29, 0, 序号）, 之后客户端弹登录确认框
+    void OpCharaAction(const Pointers* p, const char* name, unsigned long long contentId, bool enter, CharaActionResult* out)
+    {
+        memset(out, 0, sizeof(CharaActionResult));
+        out->position = -1;
+
+        const int where = OpWhere(p);
+
+        __try
+        {
+            const auto addon = where == 2 ? FindAddon(p, "_CharaSelectListMenu") : nullptr;
+
+            if (addon == nullptr)
+            {
+                out->status = -2;
+                return;
+            }
+
+            const auto lobby = reinterpret_cast<uint8_t*>(p->agentLobby);
+
+            // 角色列表是按服务器现建现存的一份; 存着的不是当前服务器那份时, 里面的位置对回调没有意义
+            out->world     = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_WORLD_ID);
+            out->listWorld = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES_WORLD);
+
+            if (out->listWorld != out->world)
+            {
+                out->status = -9;
+                return;
+            }
+
+            CharaRow  row{};
+            const int found = FindListCharacter(lobby, name, contentId, &row, &out->position);
+
+            if (found != FIND_OK)
+            {
+                out->status = found == FIND_NONE ? 0 : found == FIND_AMBIGUOUS ? -4 : -3;
+                return;
+            }
+
+            out->contentId  = row.contentId;
+            out->entryIndex = row.index;
+            out->loginFlags = row.loginFlags;
+
+            // 回调里的序号是客户端按「当前服务器的角色表」取的; 向量位置与条目自己记的序号对不上就不敢发
+            if (out->position != out->entryIndex)
+            {
+                out->status = -5;
+                return;
+            }
+
+            if (enter)
+            {
+                if (ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_TEMPORARY_LOCKED) != 0)
+                {
+                    out->status = -7;
+                    return;
+                }
+
+                if ((row.loginFlags & offsets::LOGIN_FLAG_BLOCKING_MASK) != 0)
+                {
+                    out->status = -8;
+                    return;
+                }
+
+                const int values[3] = {offsets::LOBBY_EVENT_CLICK_CHARA, 0, out->position};
+                FireInts(addon, values, 3);
+
+                out->status = 1;
+                return;
+            }
+
+            const int values[2] = {offsets::LOBBY_EVENT_SELECT_CHARA, out->position};
+            FireInts(addon, values, 2);
+
+            out->selectedIndex = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_SELECTED_CHARA_INDEX);
+            out->hovered       = ReadAt<unsigned long long>(lobby, offsets::AGENT_LOBBY_HOVERED_CONTENT_ID);
+            out->status        = out->selectedIndex == out->position && out->hovered == row.contentId ? 1 : -6;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] %s 异常 code=0x%08X", enter ? "ENTERCHARA" : "SELECTCHARA", GetExceptionCode());
+            out->status = -1;
+        }
+    }
+
+    // ---- WHOAMI --------------------------------------------------------------
+
+    struct WhoAmIData
+    {
+        int                status; // 1=正常 -1=异常 -2=PlayerState 读歪 -3=角色名读歪
+        int                loaded;
+        int                loggedIn;
+        int                inZone;
+        unsigned long long contentId;
+        unsigned long long lobbyContentId;
+        unsigned short     currentWorldId;
+        unsigned short     homeWorldId;
+        char               name[offsets::PLAYER_STATE_NAME_LEN + 1];
+        char               currentWorldName[offsets::CHARA_ENTRY_NAME_LEN + 1];
+        char               homeWorldName[offsets::CHARA_ENTRY_NAME_LEN + 1];
+    };
+
+    // Utf8String 里的世界名 → 定长缓冲; 不是合法名字就留空
+    void CopyWorldName(uint8_t* utf8String, char* destination)
+    {
+        char raw[offsets::CHARA_ENTRY_NAME_LEN]{};
+        CopyUtf8String(utf8String, raw, sizeof(raw));
+
+        if (!CopyCheckedName(reinterpret_cast<const uint8_t*>(raw), sizeof(raw), destination, true))
+            destination[0] = '\0';
+    }
+
+    void OpWhoAmI(const Pointers* p, WhoAmIData* out)
+    {
+        memset(out, 0, sizeof(WhoAmIData));
+        out->status = -1;
+
+        __try
+        {
+            const auto lobby = reinterpret_cast<uint8_t*>(p->agentLobby);
+            const auto state = reinterpret_cast<uint8_t*>(g_playerState);
+
+            out->loggedIn = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_IS_LOGGED_IN) != 0 ? 1 : 0;
+            out->inZone   = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_IS_LOGGED_INTO_ZONE) != 0 ? 1 : 0;
+
+            const auto loaded = ReadAt<unsigned char>(state, offsets::PLAYER_STATE_IS_LOADED);
+
+            if (loaded > 1)
+            {
+                out->status = -2;
+                return;
+            }
+
+            if (loaded == 0)
+            {
+                out->status = 1;
+                return;
+            }
+
+            out->contentId = ReadAt<unsigned long long>(state, offsets::PLAYER_STATE_CONTENT_ID);
+
+            if (out->contentId == 0)
+            {
+                out->status = -2;
+                return;
+            }
+
+            if (!CopyCheckedName(state + offsets::PLAYER_STATE_NAME, offsets::PLAYER_STATE_NAME_LEN, out->name, false))
+            {
+                out->status = -3;
+                return;
+            }
+
+            out->loaded = 1;
+
+            // 世界信息在大厅数据里, 只有登录之后才是这个角色的
+            if (out->loggedIn != 0)
+            {
+                out->lobbyContentId = ReadAt<unsigned long long>(lobby, offsets::AGENT_LOBBY_LOGGED_CONTENT_ID);
+                out->currentWorldId = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_CURRENT_WORLD_ID);
+                out->homeWorldId    = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_HOME_WORLD_ID);
+
+                CopyWorldName(lobby + offsets::AGENT_LOBBY_CURRENT_WORLD_NAME, out->currentWorldName);
+                CopyWorldName(lobby + offsets::AGENT_LOBBY_HOME_WORLD_NAME,    out->homeWorldName);
+            }
+
+            out->status = 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] WHOAMI 异常 code=0x%08X", GetExceptionCode());
+            out->status = -1;
+        }
+    }
+
+    // 操作命令共用的前置; 失败时 failure 是要回给启动器的那一行
+    bool PrepareAction(CallStatePtr& state, std::string& failure)
+    {
+        if (!PrepareCall(state, failure))
+            return false;
+
+        if (!ResolveFireCallback())
+        {
+            failure = "FAIL sigscan-failed:FireCallback";
+            return false;
+        }
+
+        if (state->pointers.unitManager == nullptr)
+        {
+            failure = "FAIL no-unit-manager";
+            return false;
+        }
+
+        return true;
+    }
+
+    // 命令参数: 纯数字当 ContentId, 否则当角色名
+    unsigned long long ParseContentId(const std::string& who)
+    {
+        return who.find_first_not_of("0123456789") == std::string::npos ? _strtoui64(who.c_str(), nullptr, 10) : 0ULL;
+    }
+
+    std::string RunCharaAction(const std::string& who, bool enter)
+    {
+        const char* command = enter ? "ENTERCHARA" : "SELECTCHARA";
+
+        if (who.empty())
+            return std::string("FAIL usage: ") + command + " <角色名|contentId>";
+
+        CallStatePtr state;
+        std::string  failure;
+
+        if (!PrepareAction(state, failure))
+            return failure;
+
+        const auto contentId = ParseContentId(who);
+
+        auto result   = std::make_shared<CharaActionResult>();
+        auto name     = std::make_shared<std::string>(who);
+        auto captured = state;
+
+        if (!MainThreadRun([captured, result, name, contentId, enter]
+            {
+                OpCharaAction(&captured->pointers, name->c_str(), contentId, enter, result.get());
+            }, 3000))
+            return "FAIL mainthread-timeout";
+
+        LogF("[game] %s %s → status=%d position=%d entryIndex=%d cid=%llu flags=%u selectedIndex=%d hovered=%llu",
+             command, who.c_str(), result->status, result->position, result->entryIndex, result->contentId,
+             result->loginFlags, result->selectedIndex, result->hovered);
+
+        char response[160];
+
+        switch (result->status)
+        {
+            case 1:
+                _snprintf_s(response, sizeof(response), _TRUNCATE, "OK %s index=%d cid=%llu",
+                            enter ? "clicked" : "selected", result->position, result->contentId);
+                return response;
+            case 0:  return "FAIL not-in-list";     // 当前服务器的列表里没有, 先 FOCUSCHARA
+            case -9:
+                // 列表还没按当前服务器重建 —— 调用方可稍后重试
+                _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL not-in-list listWorld=%u world=%u",
+                            result->listWorld, result->world);
+                return response;
+            case -2: return "FAIL not-charaselect";
+            case -3: return "FAIL bad-list";
+            case -4: return "FAIL ambiguous";       // 同名不止一个, 改用 ContentId
+            case -5:
+                _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL index-mismatch position=%d index=%d",
+                            result->position, result->entryIndex);
+                return response;
+            case -6:
+                _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL not-applied selectedIndex=%d hovered=%llu",
+                            result->selectedIndex, result->hovered);
+                return response;
+            case -7: return "FAIL locked";
+            case -8:
+                _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL flags=%u", result->loginFlags);
+                return response;
+            default: return "FAIL exception";
+        }
+    }
 }
 
-// 参数: 角色名, 或纯数字的 ContentId
-std::string GameFocusCharacter(const std::string& who)
+// 响应: 第一行
+//   OK where=<ingame|charaselect|title|busy> world=<WorldId> worldIndex=<n> selectedIndex=<n> hovered=<cid> locked=<0|1>
+//      stage=<LobbyUpdateStage> uiStage=<LobbyUIStage> queue=<QueuePosition> dialogId=<DialogAddonId>
+//      yesno=<0|1> ok=<0|1> dialogue=<0|1> loading=<0|1>
+// 有对话框时, 每个在场的对话框一行（字段用 \t 分隔）:
+//   D  <SelectYesno|SelectOk|Dialogue>  <addon id>  <ready 0|1>  <visible 0|1>  <提示文字>
+// 最后一行 `T <提示文字>` 是其中最该看的那个: 是/否框优先, 其次错误框, 最后确定框。提示文字里的换行已换成空格。
+std::string GameLobbyState()
 {
-    if (who.empty())
-        return "FAIL usage: FOCUSCHARA <角色名|contentId>";
-
-    if (g_fireCallback == 0)
-        g_fireCallback = ScanText(offsets::FIRE_CALLBACK_SIG);
-
-    if (g_fireCallback == 0)
-        return "FAIL sigscan-failed";
-
     CallStatePtr state;
     std::string  failure;
 
     if (!PrepareCall(state, failure))
         return failure;
 
-    if (state->pointers.unitManager == nullptr)
-        return "FAIL no-unit-manager";
+    auto data     = std::make_shared<LobbyStateData>();
+    auto captured = state;
 
-    const bool numeric   = who.find_first_not_of("0123456789") == std::string::npos;
-    const auto contentId = numeric ? _strtoui64(who.c_str(), nullptr, 10) : 0ULL;
+    if (!MainThreadRun([captured, data] { captured->ok = OpLobbyState(&captured->pointers, data.get()); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    if (!state->ok)
+        return "FAIL exception";
+
+    if (data->where < 0)
+        return "FAIL unknown";
+
+    char header[400];
+    _snprintf_s(header, sizeof(header), _TRUNCATE,
+                "OK where=%s world=%u worldIndex=%d selectedIndex=%d hovered=%llu locked=%d stage=%u uiStage=%u "
+                "queue=%d dialogId=%u yesno=%d ok=%d dialogue=%d loading=%d",
+                WhereName(data->where), data->world, data->worldIndex, data->selectedIndex, data->hovered, data->locked,
+                data->updateStage, data->uiStage, data->queue, data->dialogId,
+                data->yesno.present, data->ok.present, data->dialogue.present, data->loading);
+
+    std::string response = header;
+
+    AppendDialogLine(response, "SelectYesno", data->yesno);
+    AppendDialogLine(response, "SelectOk",    data->ok);
+    AppendDialogLine(response, "Dialogue",    data->dialogue);
+
+    const DialogInfo* primary = data->yesno.present    ? &data->yesno
+                              : data->dialogue.present ? &data->dialogue
+                              : data->ok.present       ? &data->ok
+                                                       : nullptr;
+    if (primary != nullptr)
+    {
+        response += "\nT ";
+        response += primary->text;
+    }
+
+    return response;
+}
+
+// 整个大区的角色（CurrentDataCenterCharacters）。响应与 WHOLIST 同格式, 第一行多 source=dc 与 skipped:
+//   OK where=charaselect n=3 total=3 selected=<cid> selectedIndex=0 hovered=<cid> hoveredIndex=-1 source=dc skipped=0
+//   C  <contentId>  <index>  <loginFlags>  <curWorldId>  <homeWorldId>  <名字>  <当前世界名>  <原始世界名>
+// 与 WHOLIST 一样只在选角界面可信, 所以同时回 where。
+std::string GameCharas()
+{
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareCall(state, failure))
+        return failure;
+
+    auto data     = std::make_shared<CharaListData>();
+    auto captured = state;
+
+    if (!MainThreadRun([captured, data] { OpCharas(&captured->pointers, data.get()); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    if (data->status == -2)
+        return "FAIL bad-list";
+
+    if (data->status == -3)
+    {
+        char response[64];
+        _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL bad-entry index=%d", data->badIndex);
+        return response;
+    }
+
+    if (data->status != 1)
+        return "FAIL exception";
+
+    // 启动器一次读 8192 字节, 整条回应不能超
+    std::string body;
+    int         listed = 0;
+
+    for (; listed < data->count && body.size() < 7600; ++listed)
+        AppendCharaLine(body, data->rows[listed]);
+
+    char header[320];
+    _snprintf_s(header, sizeof(header), _TRUNCATE,
+                "OK where=%s n=%d total=%d selected=%llu selectedIndex=%d hovered=%llu hoveredIndex=%d source=dc skipped=%d",
+                WhereName(data->where), listed, data->total, data->selectedContentId, data->selectedIndex,
+                data->hoveredContentId, data->hoveredIndex, data->skipped);
+
+    LogF("[game] CHARAS where=%s n=%d/%d skipped=%d", WhereName(data->where), listed, data->total, data->skipped);
+    return header + body;
+}
+
+// 游戏内当前角色。响应只有一行, 角色名可能带空格所以放在行尾:
+//   OK loaded=<0|1> cid=<ContentId> world=<CurrentWorldId> home=<HomeWorldId> worldName=<当前世界名> homeName=<原始世界名>
+//      loggedIn=<0|1> inZone=<0|1> lobbyCid=<大厅数据里记的 ContentId> name=<名字>
+// loaded=0 时数字字段都是 0、名字为空。world / home / 世界名 / lobbyCid 只在 loggedIn=1 时有值。
+std::string GameWhoAmI()
+{
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareCall(state, failure))
+        return failure;
+
+    if (!ResolvePlayerState())
+        return "FAIL sigscan-failed:PlayerState";
+
+    auto data     = std::make_shared<WhoAmIData>();
+    auto captured = state;
+
+    if (!MainThreadRun([captured, data] { OpWhoAmI(&captured->pointers, data.get()); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    switch (data->status)
+    {
+        case 1:  break;
+        case -2: return "FAIL bad-state";
+        case -3: return "FAIL bad-name";
+        default: return "FAIL exception";
+    }
+
+    char response[512];
+    _snprintf_s(response, sizeof(response), _TRUNCATE,
+                "OK loaded=%d cid=%llu world=%u home=%u worldName=%s homeName=%s loggedIn=%d inZone=%d lobbyCid=%llu name=%s",
+                data->loaded, data->contentId, data->currentWorldId, data->homeWorldId, data->currentWorldName,
+                data->homeWorldName, data->loggedIn, data->inZone, data->lobbyContentId, data->name);
+    return response;
+}
+
+// 参数: 角色名, 或纯数字的 ContentId。角色在整个大区的列表里找。
+std::string GameFocusCharacter(const std::string& who)
+{
+    if (who.empty())
+        return "FAIL usage: FOCUSCHARA <角色名|contentId>";
+
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareAction(state, failure))
+        return failure;
+
+    const auto contentId = ParseContentId(who);
 
     auto result   = std::make_shared<FocusResult>();
     auto name     = std::make_shared<std::string>(who);
@@ -1221,8 +2261,8 @@ std::string GameFocusCharacter(const std::string& who)
         }, 3000))
         return "FAIL mainthread-timeout";
 
-    LogF("[game] FOCUSCHARA %s → status=%d world %u→%u slot=%d",
-         who.c_str(), result->status, result->beforeWorld, result->targetWorld, result->slot);
+    LogF("[game] FOCUSCHARA %s → status=%d world %u→%u (目标 %u) slot=%d",
+         who.c_str(), result->status, result->beforeWorld, result->afterWorld, result->targetWorld, result->slot);
 
     char response[128];
 
@@ -1234,9 +2274,65 @@ std::string GameFocusCharacter(const std::string& who)
         case 1:
             _snprintf_s(response, sizeof(response), _TRUNCATE, "OK already world=%u", result->targetWorld);
             return response;
-        case 0:  return "FAIL not-in-list";       // 列表还没载入 / 没这个角色 —— 调用方可稍后重试
-        case -2: return "FAIL no-world-list";     // 不在角色选择界面
-        case -3: return "FAIL world-not-listed";  // 目标服务器不在当前大区的服务器列表里
+        case 0:  return "FAIL not-in-list";       // 列表还没载入 / 这个大区没这个角色 —— 调用方可稍后重试
+        case -2: return "FAIL no-world-list";     // 服务器列表还没出来 —— 调用方可稍后重试
+        case -3:
+            // 目标服务器不在本大区（超域中的角色在原始大区的大厅里就是这样）
+            _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL world-not-listed world=%u", result->targetWorld);
+            return response;
+        case -4: return "FAIL not-charaselect";
+        case -5: return "FAIL bad-list";
+        case -6: return "FAIL ambiguous";         // 同名不止一个, 改用 ContentId
+        case -7:
+            _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL not-applied world=%u target=%u", result->afterWorld,
+                        result->targetWorld);
+            return response;
+        default: return "FAIL exception";
+    }
+}
+
+// 当前服务器的角色列表里选中（高亮）一个角色, 不进入
+std::string GameSelectCharacter(const std::string& who)
+{
+    return RunCharaAction(who, false);
+}
+
+// 左键点击一个角色: 客户端自己做检查并弹登录确认框, 之后由启动器看 LOBBYSTATE 再发 DIALOG YES
+std::string GameEnterCharacter(const std::string& who)
+{
+    return RunCharaAction(who, true);
+}
+
+// button: "YES" / "NO" 点是/否框; "OK" 点错误框或确定框（排队提示不点）
+std::string GameDialog(const std::string& button)
+{
+    const int action = button == "YES" ? DIALOG_YES : button == "NO" ? DIALOG_NO : button == "OK" ? DIALOG_OK : -1;
+
+    if (action < 0)
+        return "FAIL usage: DIALOG <YES|NO|OK>";
+
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareCall(state, failure))
+        return failure;
+
+    auto captured = state;
+
+    if (!MainThreadRun([captured, action] { captured->result = OpDialog(&captured->pointers, action); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    LogF("[game] DIALOG %s → %d", button.c_str(), state->result);
+
+    switch (state->result)
+    {
+        case 1:  return "OK clicked addon=SelectYesno";
+        case 2:  return "OK clicked addon=SelectOk";
+        case 3:  return "OK clicked addon=Dialogue";
+        case 0:  return "FAIL no-dialog";
+        case -2: return "FAIL queueing";
+        case -3: return "FAIL ingame";
+        case -4: return "FAIL no-button";
         default: return "FAIL exception";
     }
 }

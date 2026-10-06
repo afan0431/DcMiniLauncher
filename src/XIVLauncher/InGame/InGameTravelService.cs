@@ -64,6 +64,31 @@ public sealed class InGameTravelService(DCTravelClient client)
     /// </summary>
     private static readonly ConcurrentDictionary<int, SemaphoreSlim> TRAVEL_GATES = new();
 
+    /// <summary>
+    ///     占住这个客户端的闸（模块的管道只允许一个连接, 换服、自动进入角色、读选角列表要串行）。
+    ///     已被占着时返回 null, 不排队; 用完 Dispose 放开。
+    /// </summary>
+    public static IDisposable? TryEnterGate(int gameProcessId)
+    {
+        var gate = TRAVEL_GATES.GetOrAdd(gameProcessId, _ => new SemaphoreSlim(1, 1));
+        return gate.Wait(0) ? new GateLease(gate) : null;
+    }
+
+    /// <summary>这个客户端的闸是否正被占着</summary>
+    public static bool IsGateHeld(int gameProcessId) =>
+        TRAVEL_GATES.TryGetValue(gameProcessId, out var gate) && gate.CurrentCount == 0;
+
+    private sealed class GateLease(SemaphoreSlim gate) : IDisposable
+    {
+        private int released;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref released, 1) == 0)
+                gate.Release();
+        }
+    }
+
     public async Task<InGameTravelResult> TravelAsync
     (
         Process           gameProcess,
@@ -196,6 +221,29 @@ public sealed class InGameTravelService(DCTravelClient client)
         }
     }
 
+    /// <summary>
+    ///     换登录大区, 用调用方已经连好的模块通道（自动进入角色的编排用: 它自己占着闸和管道, 这里不再注入、不再连接、不再占闸）。
+    ///     步骤与 <see cref="SwitchLoginAreaAsync(Process, LoginArea, IProgress{string}?, CancellationToken)" /> 完全相同,
+    ///     发出「开始游戏」后即返回, 不等选角界面。
+    /// </summary>
+    public async Task<InGameTravelResult> SwitchLoginAreaAsync
+    (
+        IMiniModuleChannel module,
+        int                gameProcessId,
+        LoginArea          targetArea,
+        IProgress<string>? progress,
+        CancellationToken  cancellationToken
+    )
+    {
+        if (string.IsNullOrWhiteSpace(targetArea.AreaLobby) ||
+            string.IsNullOrWhiteSpace(targetArea.AreaConfigUpload) ||
+            string.IsNullOrWhiteSpace(targetArea.AreaGM))
+            return InGameTravelResult.Failed($"大区 {targetArea.AreaName} 缺少主机名信息");
+
+        return await TravelOnModuleAsync(module, gameProcessId, targetArea, _ => Task.FromResult<string?>(null), null, progress, cancellationToken)
+                   .ConfigureAwait(false);
+    }
+
     /// <summary>提交返回单并轮询到完成。返回 null 表示成功, 否则是失败原因。</summary>
     private async Task<string?> SubmitReturnAsync
     (
@@ -258,6 +306,23 @@ public sealed class InGameTravelService(DCTravelClient client)
             return InGameTravelResult.Failed($"连不上游戏内模块: {ex.Message}");
         }
 
+        return await TravelOnModuleAsync(module, gameProcess.Id, targetArea, submitAsync, focusCharacter, progress, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     在已经连好的模块通道上跑换服的进程内那半（回标题 → 在线那半 → 现取票据 → 改主机名 → 作废大厅上下文 → 写票据 → 点「开始游戏」）
+    /// </summary>
+    private async Task<InGameTravelResult> TravelOnModuleAsync
+    (
+        IMiniModuleChannel                     module,
+        int                                    gameProcessId,
+        LoginArea                              targetArea,
+        Func<CancellationToken, Task<string?>> submitAsync,
+        string?                                focusCharacter,
+        IProgress<string>?                     progress,
+        CancellationToken                      cancellationToken
+    )
+    {
         try
         {
             // 0. 先看角色在哪。
@@ -339,7 +404,7 @@ public sealed class InGameTravelService(DCTravelClient client)
             if (!string.IsNullOrWhiteSpace(focusCharacter))
                 await FocusCharacterAsync(module, focusCharacter, progress, cancellationToken).ConfigureAwait(false);
 
-            Log.Information("[InGameTravel] 完成: {Area} (PID={Pid} 全程未变)", targetArea.AreaName, gameProcess.Id);
+            Log.Information("[InGameTravel] 完成: {Area} (PID={Pid} 全程未变)", targetArea.AreaName, gameProcessId);
             return InGameTravelResult.Succeeded(targetArea.AreaName);
         }
         catch (OperationCanceledException)
@@ -582,7 +647,7 @@ public sealed class InGameTravelService(DCTravelClient client)
     ///     做法抄 DailyRoutines 的 AutoLogin.SelectWorld; DCTraveler 不做这一步。
     ///     整段都是锦上添花 —— 任何失败只记日志, 不影响跨区结果。
     /// </summary>
-    private static async Task FocusCharacterAsync(MiniModuleClient module, string character, IProgress<string>? progress, CancellationToken cancellationToken)
+    private static async Task FocusCharacterAsync(IMiniModuleChannel module, string character, IProgress<string>? progress, CancellationToken cancellationToken)
     {
         try
         {
@@ -644,7 +709,7 @@ public sealed class InGameTravelService(DCTravelClient client)
         }
     }
 
-    private static async Task<bool> WaitForTitleAsync(MiniModuleClient module, IProgress<string>? progress, CancellationToken cancellationToken)
+    private static async Task<bool> WaitForTitleAsync(IMiniModuleChannel module, IProgress<string>? progress, CancellationToken cancellationToken)
     {
         var deadline = DateTimeOffset.UtcNow + TITLE_TIMEOUT;
 
@@ -668,7 +733,7 @@ public sealed class InGameTravelService(DCTravelClient client)
     }
 
     /// <summary>发一条模块命令, 回应不是 OK 就抛 —— 换服这几步任何一步没成都不能继续往下走。</summary>
-    private static async Task CommandAsync(MiniModuleClient module, string command, CancellationToken cancellationToken)
+    private static async Task CommandAsync(IMiniModuleChannel module, string command, CancellationToken cancellationToken)
     {
         var response = await module.SendAsync(command, cancellationToken).ConfigureAwait(false);
 
@@ -680,7 +745,7 @@ public sealed class InGameTravelService(DCTravelClient client)
         }
     }
 
-    private static async Task TryCommandAsync(MiniModuleClient module, string command, CancellationToken cancellationToken)
+    private static async Task TryCommandAsync(IMiniModuleChannel module, string command, CancellationToken cancellationToken)
     {
         try
         {

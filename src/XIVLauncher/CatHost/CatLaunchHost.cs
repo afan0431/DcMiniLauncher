@@ -7,7 +7,8 @@ using XIVLauncher.Minion;
 namespace XIVLauncher.CatHost;
 
 /// <summary>
-///     一次 launch 的参数（已校验）; WeGameLogin = WeGame 号在本机没有可用的登录信息时拉起 WeGame 等员工登录, 为 false 时直接报 authorizationRequired
+///     一次 launch 的参数（已校验）; WeGameLogin = WeGame 号在本机没有可用的登录信息时拉起 WeGame 等员工登录, 为 false 时直接报 authorizationRequired;
+///     AutoEnter = 游戏起来后自动经标题、选角进入游戏; CharacterName / CharacterHomeWorld = 要登录的角色（可为空）
 /// </summary>
 public sealed record CatLaunchRequest
 (
@@ -22,7 +23,10 @@ public sealed record CatLaunchRequest
     bool           IsInternational           = false,
     CatSecret?     Password                  = null,
     bool           WeGameLogin               = false,
-    CatWeGameScan? WeGameScan                = null
+    CatWeGameScan? WeGameScan                = null,
+    bool           AutoEnter                 = false,
+    string?        CharacterName             = null,
+    string?        CharacterHomeWorld        = null
 )
 {
     /// <summary>是否为 WeGame 版国服的号</summary>
@@ -48,6 +52,24 @@ public interface ICatLaunchReporter
 {
     /// <summary>进入某个阶段</summary>
     void Stage(string stage);
+
+    /// <summary>进入排队阶段或排队名次变了; queuePosition = 排在第几位, 读不到时为 null</summary>
+    void Queueing(int? queuePosition) => Stage(CatStages.QUEUEING);
+
+    /// <summary>选角界面读到的角色列表; needsChoice = 定不了登录哪个, 在等人选（之后用 selectCharacter 回答）</summary>
+    void Characters(bool needsChoice, IReadOnlyList<CatCharacterInfo> characters)
+    {
+    }
+
+    /// <summary>已进入游戏的角色（之后人手动换了角色会再报一次）</summary>
+    void Character(CatCharacterInfo character)
+    {
+    }
+
+    /// <summary>自动进入角色没有做完, 游戏停在当前界面交给人; code 见 <see cref="CatAutoEnterStopCodes" /></summary>
+    void AutoEnterStopped(string code, string message)
+    {
+    }
 
     /// <summary>游戏进程已创建</summary>
     void Started(int pid, DateTimeOffset processStartedAt);
@@ -116,6 +138,13 @@ public interface ICatGameRunner
     /// </summary>
     CatAcceptResult ConfirmWeGameSms(string challengeId) =>
         CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证");
+
+    /// <summary>
+    ///     员工在工作台选了要登录的角色（contentId 来自 game.characters）。立即返回是否接受, 之后的进度照常走事件。
+    ///     不在等人选角色的启动器一律回 notRunning。
+    /// </summary>
+    CatAcceptResult SelectCharacter(string contentId) =>
+        CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等人选角色");
 }
 
 /// <summary>
@@ -126,6 +155,12 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 {
     /// <summary>launch 失败后的进程退出码</summary>
     public const int EXIT_LAUNCH_FAILED = 3;
+
+    /// <summary>launch 的 character.name 最长字符数</summary>
+    public const int MAX_CHARACTER_NAME_LENGTH = 100;
+
+    /// <summary>launch 的 character.homeWorld 最长字符数</summary>
+    public const int MAX_HOME_WORLD_LENGTH = 64;
 
     /// <summary>游戏起来后本进程内部出错, 已等游戏结束并发 game.exited{reason:"guardError"}</summary>
     public const int EXIT_GUARD_ERROR = 5;
@@ -223,6 +258,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             "status" => Task.FromResult<object?>(GetStatus()),
             "close"  => Task.FromResult<object?>(Close(Deserialize<CatCloseParams>(parameters))),
             "weGame.confirmSms" => Task.FromResult<object?>(ConfirmWeGameSms(Deserialize<CatWeGameConfirmSmsParams>(parameters))),
+            "selectCharacter" => Task.FromResult<object?>(SelectCharacter(Deserialize<CatSelectCharacterParams>(parameters))),
             _        => throw new CatRpcException(CatRpcException.METHOD_NOT_FOUND, $"未知方法: {method}")
         };
 
@@ -272,6 +308,18 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (weGameScan != null && !weGameLogin)
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "weGameScan 只能和 weGameLogin 一起用");
 
+        var characterName = string.IsNullOrWhiteSpace(parameters.Character?.Name) ? null : parameters.Character.Name.Trim();
+        var homeWorld     = string.IsNullOrWhiteSpace(parameters.Character?.HomeWorld) ? null : parameters.Character.HomeWorld.Trim();
+
+        if (characterName is { Length: > MAX_CHARACTER_NAME_LENGTH } || characterName?.Any(char.IsControl) == true)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"character.name 不能超过 {MAX_CHARACTER_NAME_LENGTH} 个字符, 也不能有控制字符");
+
+        if (homeWorld is { Length: > MAX_HOME_WORLD_LENGTH } || homeWorld?.Any(char.IsControl) == true)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"character.homeWorld 不能超过 {MAX_HOME_WORLD_LENGTH} 个字符, 也不能有控制字符");
+
+        // 游戏内模块是按国服客户端写的, 国际服带了 autoEnter 也不做
+        var autoEnter = parameters.AutoEnter == true && !isInternational;
+
         CatLaunchRequest accepted;
         ICatGameRunner   selected;
 
@@ -296,7 +344,10 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 isInternational,
                 isInternational ? new CatSecret(parameters.Password!) : null,
                 weGameLogin,
-                weGameScan
+                weGameScan,
+                autoEnter,
+                characterName,
+                homeWorld
             );
             selected = runnerFactory(accepted);
             runner   = selected;
@@ -305,7 +356,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         Serilog.Log.Information
         (
-            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s, 就地登录 WeGame={WeGameLogin}, 自动切扫码页={WeGameScan}",
+            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s, 就地登录 WeGame={WeGameLogin}, 自动切扫码页={WeGameScan}, 自动进入角色={AutoEnter}, 角色={Character}, 原始服务器={HomeWorld}",
             accepted.OperationId,
             CatPlatforms.DisplayName(accepted.Channel),
             accepted.AccountName,
@@ -313,7 +364,10 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             accepted.Minion ? $"{accepted.CardFingerprint}/{accepted.Variant}" : "否",
             accepted.CrashDialogTimeoutSeconds,
             accepted.WeGameLogin,
-            accepted.WeGameScan is { } scan ? CatWeGameScans.Name(scan) : "否"
+            accepted.WeGameScan is { } scan ? CatWeGameScans.Name(scan) : "否",
+            accepted.AutoEnter,
+            accepted.CharacterName ?? "(未指定)",
+            accepted.CharacterHomeWorld ?? "(未指定)"
         );
 
         _ = Task.Run(() => RunLifecycleAsync(selected, accepted));
@@ -336,7 +390,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         lock (stateLock)
         {
-            if (pid == null || stage != CatStages.RUNNING || closeRequested || runnerFaulted)
+            if (pid == null || !CatStages.IsGameRunning(stage) || closeRequested || runnerFaulted)
                 return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
 
             current = runner;
@@ -456,6 +510,31 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     }
 
     /// <summary>
+    ///     员工在工作台选了要登录的角色: 只在等人选角色（awaitingCharacterChoice）时交给启动器, 立即回是否接受
+    /// </summary>
+    public CatAcceptResult SelectCharacter(CatSelectCharacterParams? parameters)
+    {
+        var contentId = parameters?.ContentId?.Trim();
+
+        if (string.IsNullOrEmpty(contentId) || contentId.Length > 32 || !contentId.All(char.IsAsciiLetterOrDigit))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "contentId 不能为空, 且只能是字母和数字");
+
+        ICatGameRunner? current;
+
+        lock (stateLock)
+        {
+            if (closeRequested || runnerFaulted || stage != CatStages.AWAITING_CHARACTER_CHOICE)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等人选角色");
+
+            current = runner;
+        }
+
+        return current == null
+                   ? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等人选角色")
+                   : current.SelectCharacter(contentId);
+    }
+
+    /// <summary>
     ///     当前状态
     /// </summary>
     public CatStatusResult GetStatus()
@@ -491,6 +570,43 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             stage = newStage;
 
         Publish("game.stage", new { operationId = OperationId, stage = newStage });
+    }
+
+    /// <inheritdoc />
+    public void Queueing(int? queuePosition)
+    {
+        lock (stateLock)
+            stage = CatStages.QUEUEING;
+
+        Publish("game.stage", new { operationId = OperationId, stage = CatStages.QUEUEING, queuePosition });
+    }
+
+    /// <inheritdoc />
+    public void Characters(bool needsChoice, IReadOnlyList<CatCharacterInfo> characters) =>
+        Publish("game.characters", new { operationId = OperationId, needsChoice, characters });
+
+    /// <inheritdoc />
+    public void Character(CatCharacterInfo character) =>
+        Publish
+        (
+            "game.character",
+            new
+            {
+                operationId      = OperationId,
+                contentId        = character.ContentId,
+                name             = character.Name,
+                homeWorld        = character.HomeWorld,
+                currentWorld     = character.CurrentWorld,
+                homeWorldName    = character.HomeWorldName,
+                currentWorldName = character.CurrentWorldName
+            }
+        );
+
+    /// <inheritdoc />
+    public void AutoEnterStopped(string code, string message)
+    {
+        Serilog.Log.Warning("[CatHost] 自动进入角色停下: {Code} {Message}", code, message);
+        Publish("game.autoEnterStopped", new { operationId = OperationId, code, message = Redact(message) });
     }
 
     /// <inheritdoc />

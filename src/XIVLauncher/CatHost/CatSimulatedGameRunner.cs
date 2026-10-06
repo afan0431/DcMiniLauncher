@@ -19,6 +19,14 @@ namespace XIVLauncher.CatHost;
 ///             账号名以 <c>scanfail:</c> 开头: 不发二维码, 改发 weGame.scanSwitchFailed。
 ///             账号名以 <c>sms:</c> 开头: 二维码之后再发一条设备验证短信（kind=sms）, 一直等到收到 weGame.confirmSms 才发 weGame.challengeCleared 并继续
 ///         </item>
+///         <item>
+///             launch 带了 autoEnter（国际服除外）: running 之后按真实顺序发自动进入角色的事件, Minion 推迟到之后才挂。账号名前缀决定走哪种:
+///             其它任何账号名 = 单角色直进（enteringLobby → game.characters → enteringWorld → game.character → inWorld）;
+///             <c>chars:</c> = 三个角色等人选（awaitingCharacterChoice → game.characters{needsChoice} → 收到 selectCharacter 后继续进入）;
+///             <c>travel:</c> = 角色超域在别的大区（game.characters → switchingArea → game.characters → enteringWorld → game.character → inWorld）;
+///             <c>queue:</c> = 进入时排队（queueing 带 queuePosition 3 → 1, 再回到 enteringWorld）;
+///             <c>stop:&lt;停手码&gt;</c> = 停手（enteringLobby → game.autoEnterStopped → running; 不写停手码按 moduleUnavailable）
+///         </item>
 ///         <item>占位进程被结束时发 game.exited; close 时结束占位进程并发 game.exited{reason:"closed"}; 随后本进程退出</item>
 ///     </list>
 /// </summary>
@@ -48,6 +56,24 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     /// <summary>模拟扫码后还要设备验证短信的前缀</summary>
     public const string SMS_PREFIX = "sms:";
 
+    /// <summary>自动进入角色: 多个角色等人选的前缀</summary>
+    public const string CHARACTERS_PREFIX = "chars:";
+
+    /// <summary>自动进入角色: 角色超域在别的大区、要换大区的前缀</summary>
+    public const string TRAVEL_PREFIX = "travel:";
+
+    /// <summary>自动进入角色: 进入时排队的前缀</summary>
+    public const string QUEUE_PREFIX = "queue:";
+
+    /// <summary>自动进入角色: 停手的前缀, 后面跟停手码</summary>
+    public const string STOP_PREFIX = "stop:";
+
+    /// <summary>自动进入角色: 没指定角色名时模拟角色的名字</summary>
+    public const string SIMULATED_CHARACTER_NAME = "模拟角色";
+
+    /// <summary>自动进入角色: 模拟角色的 contentId 前缀, 后面是序号 1–3</summary>
+    public const string SIMULATED_CONTENT_ID_PREFIX = "400000000000000";
+
     /// <summary>模拟的二维码内容（占位链接, 扫了没有任何效果）</summary>
     public const string SIMULATED_QR_LINK = "https://example.invalid/wegame-simulated-qrcode";
 
@@ -64,6 +90,11 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     private bool     closeRequested;
 
     private TaskCompletionSource? smsConfirmed;
+
+    private TaskCompletionSource<string>?    characterChosen;
+    private IReadOnlyList<CatCharacterInfo>  characterChoices = [];
+    private Task                             autoEnterTask    = Task.CompletedTask;
+    private string?                          autoEnterStage;
 
     /// <summary>每个阶段之间的停顿</summary>
     public TimeSpan StepDelay { get; init; } = TimeSpan.FromMilliseconds(300);
@@ -116,7 +147,32 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         if (minion)
             reporter.Agent(CatAgentKinds.MINION, true);
 
-        reporter.Stage(CatStages.RUNNING);
+        reporter.Stage(LastAutoEnterStage ?? CatStages.RUNNING);
+    }
+
+    /// <inheritdoc />
+    public CatAcceptResult SelectCharacter(string contentId)
+    {
+        lock (stateLock)
+        {
+            if (characterChosen == null)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等人选角色（模拟）");
+
+            if (characterChoices.All(x => x.ContentId != contentId))
+                return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "角色列表里没有这个角色（模拟）");
+
+            characterChosen.TrySetResult(contentId);
+            return CatAcceptResult.Ok();
+        }
+    }
+
+    private string? LastAutoEnterStage
+    {
+        get
+        {
+            lock (stateLock)
+                return autoEnterStage;
+        }
     }
 
     /// <inheritdoc />
@@ -198,6 +254,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
             if (crashMode == CRASH_DIALOG)
             {
+                await autoEnterTask.ConfigureAwait(false);
                 reporter.Crashed(crashedPid);
 
                 var timeout = CrashDialogTimeout ?? request.CrashDialogTimeout;
@@ -232,6 +289,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         }
 
         await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+        await autoEnterTask.ConfigureAwait(false);
 
         int? exitCode;
 
@@ -338,6 +396,12 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
     private async Task<Process> StartGameAsync(CatLaunchRequest request, int? restartedFromPid, string? failAgent, ICatLaunchReporter reporter, CancellationToken token)
     {
+        // 上一个占位进程的自动进入角色随进程结束而结束, 等它收完尾再起新的
+        await autoEnterTask.ConfigureAwait(false);
+
+        lock (stateLock)
+            autoEnterStage = null;
+
         if (request.Dalamud)
         {
             reporter.Stage(CatStages.UPDATING_DALAMUD);
@@ -382,16 +446,9 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
                     reporter.Agent(CatAgentKinds.DALAMUD, true);
             }
 
-            if (request.Minion)
-            {
-                reporter.Stage(CatStages.ATTACHING_MINION);
-                await Task.Delay(StepDelay, token).ConfigureAwait(false);
-
-                if (failAgent == CatAgentKinds.MINION)
-                    reporter.Agent(CatAgentKinds.MINION, false, CatCodes.ATTACH_FAILED, "MinionLauncher 报错（模拟）");
-                else
-                    reporter.Agent(CatAgentKinds.MINION, true);
-            }
+            // 自动进入角色时 Minion 推迟到编排结束后再挂
+            if (request.Minion && !request.AutoEnter)
+                await AttachMinionAsync(failAgent, reporter, token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (closeCts.IsCancellationRequested)
         {
@@ -399,7 +456,171 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         }
 
         reporter.Stage(CatStages.RUNNING);
+
+        if (request.AutoEnter)
+            autoEnterTask = RunAutoEnterAsync(request, process, failAgent, reporter, token);
+
         return process;
+    }
+
+    private async Task AttachMinionAsync(string? failAgent, ICatLaunchReporter reporter, CancellationToken token)
+    {
+        reporter.Stage(CatStages.ATTACHING_MINION);
+        await Task.Delay(StepDelay, token).ConfigureAwait(false);
+
+        if (failAgent == CatAgentKinds.MINION)
+            reporter.Agent(CatAgentKinds.MINION, false, CatCodes.ATTACH_FAILED, "MinionLauncher 报错（模拟）");
+        else
+            reporter.Agent(CatAgentKinds.MINION, true);
+    }
+
+    /// <summary>
+    ///     模拟自动进入角色: 按账号名前缀发与真实编排同样顺序的事件; 占位进程一结束就停, 不再发任何事件
+    /// </summary>
+    private async Task RunAutoEnterAsync(CatLaunchRequest request, Process process, string? failAgent, ICatLaunchReporter reporter, CancellationToken token)
+    {
+        using var alive = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var exited = process.WaitForExitAsync(alive.Token);
+
+        void Stage(string stage)
+        {
+            lock (stateLock)
+                autoEnterStage = stage;
+
+            reporter.Stage(stage);
+        }
+
+        async Task StepAsync()
+        {
+            if (await Task.WhenAny(exited, Task.Delay(StepDelay, alive.Token)).ConfigureAwait(false) == exited || process.HasExited)
+                throw new OperationCanceledException();
+        }
+
+        try
+        {
+            var account = request.AccountName;
+
+            Stage(CatStages.ENTERING_LOBBY);
+            await StepAsync().ConfigureAwait(false);
+
+            if (account.StartsWith(STOP_PREFIX, StringComparison.Ordinal))
+            {
+                var code = account[STOP_PREFIX.Length..];
+                reporter.AutoEnterStopped(string.IsNullOrWhiteSpace(code) ? CatAutoEnterStopCodes.MODULE_UNAVAILABLE : code, "模拟的自动进入角色停手");
+                Stage(CatStages.RUNNING);
+            }
+            else
+            {
+                CatCharacterInfo entered;
+
+                if (account.StartsWith(CHARACTERS_PREFIX, StringComparison.Ordinal))
+                {
+                    var choices = new[]
+                    {
+                        SimulatedCharacter(1, SIMULATED_CHARACTER_NAME + "一", "LaNuoXiYa"),
+                        SimulatedCharacter(2, SIMULATED_CHARACTER_NAME + "二", "HongYuHai"),
+                        SimulatedCharacter(3, SIMULATED_CHARACTER_NAME + "三", "MengYaChi")
+                    };
+                    var chosen = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+                    lock (stateLock)
+                    {
+                        characterChoices = choices;
+                        characterChosen  = chosen;
+                    }
+
+                    try
+                    {
+                        Stage(CatStages.AWAITING_CHARACTER_CHOICE);
+                        reporter.Characters(true, choices);
+
+                        if (await Task.WhenAny(exited, chosen.Task).ConfigureAwait(false) == exited)
+                            throw new OperationCanceledException();
+
+                        var contentId = await chosen.Task.ConfigureAwait(false);
+                        entered = choices.First(x => x.ContentId == contentId);
+                    }
+                    finally
+                    {
+                        lock (stateLock)
+                            characterChosen = null;
+                    }
+                }
+                else if (account.StartsWith(TRAVEL_PREFIX, StringComparison.Ordinal))
+                {
+                    entered = SimulatedCharacter(1, request.CharacterName ?? SIMULATED_CHARACTER_NAME, request.CharacterHomeWorld ?? "LaNuoXiYa") with
+                    {
+                        CurrentWorld     = "BaiYinXiang",
+                        CurrentWorldName = "白银乡",
+                        Travelling       = true
+                    };
+
+                    reporter.Characters(false, [entered]);
+                    Stage(CatStages.SWITCHING_AREA);
+                    await StepAsync().ConfigureAwait(false);
+                    reporter.Characters(false, [entered]);
+                }
+                else
+                {
+                    entered = SimulatedCharacter(1, request.CharacterName ?? SIMULATED_CHARACTER_NAME, request.CharacterHomeWorld ?? "LaNuoXiYa");
+                    reporter.Characters(false, [entered]);
+                }
+
+                Stage(CatStages.ENTERING_WORLD);
+                await StepAsync().ConfigureAwait(false);
+
+                if (account.StartsWith(QUEUE_PREFIX, StringComparison.Ordinal))
+                {
+                    foreach (var position in new[] { 3, 1 })
+                    {
+                        lock (stateLock)
+                            autoEnterStage = CatStages.QUEUEING;
+
+                        reporter.Queueing(position);
+                        await StepAsync().ConfigureAwait(false);
+                    }
+
+                    Stage(CatStages.ENTERING_WORLD);
+                    await StepAsync().ConfigureAwait(false);
+                }
+
+                reporter.Character(entered);
+                Stage(CatStages.IN_WORLD);
+            }
+
+            if (request.Minion)
+            {
+                await StepAsync().ConfigureAwait(false);
+                await AttachMinionAsync(failAgent, reporter, alive.Token).ConfigureAwait(false);
+
+                if (!process.HasExited)
+                    reporter.Stage(LastAutoEnterStage ?? CatStages.RUNNING);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 占位进程结束或收到 close
+        }
+        finally
+        {
+            await alive.CancelAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    ///     模拟角色; 模拟模式没有服务器表, 只认得这里用到的三个服务器的中文名, 其它的不带中文名
+    /// </summary>
+    private static CatCharacterInfo SimulatedCharacter(int index, string name, string homeWorld)
+    {
+        var homeWorldName = homeWorld.ToUpperInvariant() switch
+        {
+            "LANUOXIYA" => "拉诺西亚",
+            "HONGYUHAI" => "红玉海",
+            "MENGYACHI" => "萌芽池",
+            _           => null
+        };
+
+        return new CatCharacterInfo(SIMULATED_CONTENT_ID_PREFIX + index, name, homeWorld, homeWorld, homeWorldName, homeWorldName, false, true);
     }
 
     /// <summary>

@@ -415,6 +415,179 @@ public sealed class CatSimulatedGameRunnerTests
         Assert.DoesNotContain("started", reporter.Entries);
     }
 
+    private static CatLaunchRequest AutoEnterRequest(string account, bool minion = false, string? character = null, string? homeWorld = null) =>
+        new("op", account, false, minion ? "0123456789abcdef" : null, minion ? "cn" : null, AutoEnter: true, CharacterName: character, CharacterHomeWorld: homeWorld);
+
+    private async Task<string[]> RunAutoEnterUntilAsync(CatLaunchRequest request, RecordingReporter reporter, string lastEntry, Func<Task>? midway = null)
+    {
+        var run = runner.RunAsync(request, reporter, CancellationToken.None);
+
+        if (midway != null)
+            await midway();
+
+        await WaitUntilAsync(() => reporter.Entries.Contains(lastEntry));
+
+        // 再等几个节拍, 确认后面没有多余的事件
+        await Task.Delay(100);
+
+        using (var placeholder = Process.GetProcessById(reporter.Pid!.Value))
+            placeholder.Kill();
+
+        Assert.Equal(0, await run.WaitAsync(Timeout));
+        return [.. reporter.Entries];
+    }
+
+    [Fact]
+    public async Task AutoEnter_SingleCharacter_GoesStraightIn()
+    {
+        var reporter = new RecordingReporter();
+        var entries  = await RunAutoEnterUntilAsync(AutoEnterRequest("acc", character: "小白", homeWorld: "HongYuHai"), reporter, "stage:inWorld");
+
+        Assert.Equal
+        (
+            [
+                "stage:preparing", "stage:starting", "started", "stage:running",
+                "stage:enteringLobby", "characters:auto:1", "stage:enteringWorld", "character:小白@HongYuHai", "stage:inWorld",
+                "exited"
+            ],
+            entries
+        );
+
+        var entered = Assert.Single(reporter.EnteredCharacters);
+        Assert.Equal(CatSimulatedGameRunner.SIMULATED_CONTENT_ID_PREFIX + "1", entered.ContentId);
+        Assert.Equal("红玉海", entered.HomeWorldName);
+    }
+
+    [Fact]
+    public async Task AutoEnter_WithMinion_AttachesMinionOnlyAfterEnteringTheWorld()
+    {
+        var reporter = new RecordingReporter();
+        var entries  = await RunAutoEnterUntilAsync(AutoEnterRequest("acc", true), reporter, "agent:minion:ok");
+
+        Assert.Equal
+        (
+            [
+                "stage:preparing", "stage:starting", "started", "stage:running",
+                "stage:enteringLobby", "characters:auto:1", "stage:enteringWorld", "character:模拟角色@LaNuoXiYa", "stage:inWorld",
+                "stage:attachingMinion", "agent:minion:ok", "stage:inWorld",
+                "exited"
+            ],
+            entries
+        );
+    }
+
+    [Fact]
+    public async Task AutoEnter_SeveralCharacters_WaitsForSelectCharacter()
+    {
+        var reporter = new RecordingReporter();
+
+        Assert.Equal(CatCodes.NOT_RUNNING, ((ICatGameRunner)runner).SelectCharacter(CatSimulatedGameRunner.SIMULATED_CONTENT_ID_PREFIX + "2").Code);
+
+        var entries = await RunAutoEnterUntilAsync
+                      (
+                          AutoEnterRequest(CatSimulatedGameRunner.CHARACTERS_PREFIX + "acc", true),
+                          reporter,
+                          "agent:minion:ok",
+                          async () =>
+                          {
+                              await WaitUntilAsync(() => reporter.Entries.Contains("characters:choose:3"));
+                              await Task.Delay(100);
+
+                              // 等人选的时候不往下走, 也不挂 Minion
+                              Assert.Equal("characters:choose:3", reporter.Entries.Last());
+
+                              Assert.Equal(CatCodes.INVALID_PARAMS, runner.SelectCharacter("999").Code);
+                              Assert.True(runner.SelectCharacter(CatSimulatedGameRunner.SIMULATED_CONTENT_ID_PREFIX + "2").Accepted);
+                          }
+                      );
+
+        Assert.Equal
+        (
+            [
+                "stage:preparing", "stage:starting", "started", "stage:running",
+                "stage:enteringLobby", "stage:awaitingCharacterChoice", "characters:choose:3",
+                "stage:enteringWorld", "character:模拟角色二@HongYuHai", "stage:inWorld",
+                "stage:attachingMinion", "agent:minion:ok", "stage:inWorld",
+                "exited"
+            ],
+            entries
+        );
+        Assert.Equal(CatCodes.NOT_RUNNING, runner.SelectCharacter(CatSimulatedGameRunner.SIMULATED_CONTENT_ID_PREFIX + "1").Code);
+    }
+
+    [Fact]
+    public async Task AutoEnter_Travelling_SwitchesAreaFirst()
+    {
+        var reporter = new RecordingReporter();
+        var entries  = await RunAutoEnterUntilAsync(AutoEnterRequest(CatSimulatedGameRunner.TRAVEL_PREFIX + "acc"), reporter, "stage:inWorld");
+
+        Assert.Equal
+        (
+            [
+                "stage:preparing", "stage:starting", "started", "stage:running",
+                "stage:enteringLobby", "characters:auto:1", "stage:switchingArea", "characters:auto:1",
+                "stage:enteringWorld", "character:模拟角色@LaNuoXiYa", "stage:inWorld",
+                "exited"
+            ],
+            entries
+        );
+        Assert.True(reporter.CharacterLists.First().Characters[0].Travelling);
+        Assert.Equal("BaiYinXiang", reporter.EnteredCharacters.Single().CurrentWorld);
+    }
+
+    [Fact]
+    public async Task AutoEnter_Queue_ReportsPositions()
+    {
+        var reporter = new RecordingReporter();
+        var entries  = await RunAutoEnterUntilAsync(AutoEnterRequest(CatSimulatedGameRunner.QUEUE_PREFIX + "acc"), reporter, "stage:inWorld");
+
+        Assert.Equal
+        (
+            [
+                "stage:preparing", "stage:starting", "started", "stage:running",
+                "stage:enteringLobby", "characters:auto:1", "stage:enteringWorld", "queue:3", "queue:1", "stage:enteringWorld",
+                "character:模拟角色@LaNuoXiYa", "stage:inWorld",
+                "exited"
+            ],
+            entries
+        );
+    }
+
+    [Theory]
+    [InlineData("stop:", "moduleUnavailable")]
+    [InlineData("stop:lobbyError", "lobbyError")]
+    public async Task AutoEnter_Stop_LeavesTheGameRunning_AndStillAttachesMinion(string account, string code)
+    {
+        var reporter = new RecordingReporter();
+        var entries  = await RunAutoEnterUntilAsync(AutoEnterRequest(account, true), reporter, "agent:minion:ok");
+
+        Assert.Equal
+        (
+            [
+                "stage:preparing", "stage:starting", "started", "stage:running",
+                "stage:enteringLobby", $"stopped:{code}", "stage:running",
+                "stage:attachingMinion", "agent:minion:ok", "stage:running",
+                "exited"
+            ],
+            entries
+        );
+    }
+
+    [Fact]
+    public async Task AutoEnter_PlaceholderKilledWhileWaitingForChoice_ExitsCleanly()
+    {
+        var reporter = new RecordingReporter();
+        var run      = runner.RunAsync(AutoEnterRequest(CatSimulatedGameRunner.CHARACTERS_PREFIX + "acc"), reporter, CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("characters:choose:3"));
+
+        using (var placeholder = Process.GetProcessById(reporter.Pid!.Value))
+            placeholder.Kill();
+
+        Assert.Equal(0, await run.WaitAsync(Timeout));
+        Assert.Equal("exited", reporter.Entries.Last());
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
         var deadline = DateTime.UtcNow + Timeout;

@@ -1,0 +1,906 @@
+using XIVLauncher.CatHost;
+using XIVLauncher.InGame;
+using Xunit;
+
+namespace XIVLauncher.Test.CatHost;
+
+/// <summary>
+///     自动进入角色的编排: 用假模块应答, 不起游戏
+/// </summary>
+public sealed class CatAutoEnterTests
+{
+    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(30);
+
+    private const string AREA_HOME  = "陆行鸟";
+    private const string AREA_OTHER = "莫古力";
+    private const string AREA_THIRD = "猫小胖";
+
+    private static CharaSelectReader.Entry Chara(string contentId, string name, string homeWorld = "LaNuoXiYa", string? currentWorld = null, byte flags = 0) =>
+        new(contentId, 0, flags, WorldId(currentWorld ?? homeWorld), WorldId(homeWorld), name, currentWorld ?? homeWorld, homeWorld);
+
+    private static int WorldId(string code) =>
+        code switch
+        {
+            "LaNuoXiYa"   => 1042,
+            "HongYuHai"   => 1167,
+            "BaiYinXiang" => 1172,
+            _             => 1999
+        };
+
+    private static (FakeAutoEnterGame Game, RecordingReporter Reporter) Setup(params CharaSelectReader.Entry[] homeCharacters)
+    {
+        var game = new FakeAutoEnterGame();
+        game.Characters[AREA_HOME] = [.. homeCharacters];
+        return (game, new RecordingReporter());
+    }
+
+    private static string[] Entries(RecordingReporter reporter) => [.. reporter.Entries];
+
+    [Fact]
+    public async Task NameMatchesOneCharacter_EntersWithoutAnyone()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"), Chara("12", "小黑", "HongYuHai"));
+        game.Where = "busy";
+
+        var flow    = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小黑", null));
+        var outcome = await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.Equal
+        (
+            ["stage:enteringLobby", "characters:auto:2", "stage:enteringWorld", "character:小黑@HongYuHai", "stage:inWorld"],
+            Entries(reporter)
+        );
+        Assert.Equal
+        (
+            ["VERSION", "SKIPMOVIE", "TITLEREADY", "LOGIN", "CHARAS", "FOCUSCHARA 12", "SELECTCHARA 12", "ENTERCHARA 12", "DIALOG YES", "WHOAMI"],
+            game.Commands.Where(x => x != "LOBBYSTATE")
+        );
+        Assert.Equal("12", flow.EnteredContentId);
+        Assert.Equal(CatStages.IN_WORLD, flow.CurrentStage);
+        Assert.Equal([AREA_HOME], game.EnteredAreas);
+        Assert.Empty(game.Switched);
+
+        var entered = Assert.Single(reporter.EnteredCharacters);
+        Assert.Equal("红玉海", entered.HomeWorldName);
+        Assert.Equal("HongYuHai", entered.CurrentWorld);
+    }
+
+    [Fact]
+    public async Task SameNameOnTwoWorlds_HomeWorldPicksTheRightOne()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"), Chara("12", "小白", "HongYuHai"), Chara("13", "别人"));
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", "hongYuHai")).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.Contains("ENTERCHARA 12", game.Commands);
+        Assert.Contains("character:小白@HongYuHai", reporter.Entries);
+    }
+
+    [Fact]
+    public async Task NoName_SingleCharacter_EntersIt()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.Equal(["stage:enteringLobby", "characters:auto:1", "stage:enteringWorld", "character:小白@LaNuoXiYa", "stage:inWorld"], Entries(reporter));
+    }
+
+    [Fact]
+    public async Task UnknownName_SingleCharacter_EntersIt()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget("写错的名字", "LaNuoXiYa")).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.Contains("character:小白@LaNuoXiYa", reporter.Entries);
+    }
+
+    [Fact]
+    public async Task NoName_SeveralCharacters_WaitsForChoice_ThenEntersTheChosenOne()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"), Chara("12", "小黑", "HongYuHai"));
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null));
+
+        Assert.Equal(CatCodes.NOT_RUNNING, flow.SelectCharacter("12").Code);
+
+        var run = flow.RunAsync(CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("characters:choose:2"));
+        Assert.False(run.IsCompleted);
+        Assert.Equal(CatStages.AWAITING_CHARACTER_CHOICE, flow.CurrentStage);
+
+        // 等人选的时候不占管道, 也没有去点任何角色
+        Assert.True(game.Releases > 0);
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("ENTERCHARA", StringComparison.Ordinal));
+
+        Assert.Equal(CatCodes.INVALID_PARAMS, flow.SelectCharacter("99").Code);
+        Assert.True(flow.SelectCharacter("12").Accepted);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await run.WaitAsync(Timeout));
+        Assert.Equal
+        (
+            ["stage:enteringLobby", "stage:awaitingCharacterChoice", "characters:choose:2", "stage:enteringWorld", "character:小黑@HongYuHai", "stage:inWorld"],
+            Entries(reporter)
+        );
+        Assert.Equal(CatCodes.NOT_RUNNING, flow.SelectCharacter("11").Code);
+    }
+
+    [Fact]
+    public async Task WhileWaitingForChoice_SomeoneEntersInGame_StillReportsTheCharacter()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"), Chara("12", "小黑", "HongYuHai"));
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("不存在", null));
+        var run  = flow.RunAsync(CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("characters:choose:2"));
+
+        // 人直接在游戏窗口里双击角色进去了
+        game.EnterWorld("11");
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await run.WaitAsync(Timeout));
+        Assert.Equal(["stage:enteringLobby", "stage:awaitingCharacterChoice", "characters:choose:2", "character:小白@LaNuoXiYa", "stage:inWorld"], Entries(reporter));
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("ENTERCHARA", StringComparison.Ordinal) || x.StartsWith("DIALOG", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task TargetTravellingInAnotherArea_SwitchesLobbyOnce_ThenEnters()
+    {
+        var travelling = Chara("11", "小白", "LaNuoXiYa", "BaiYinXiang", 16);
+        var (game, reporter) = Setup(travelling, Chara("12", "小黑"));
+        game.Characters[AREA_OTHER] = [travelling];
+
+        var flow    = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", "LaNuoXiYa"));
+        var outcome = await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.Equal([AREA_OTHER], game.Switched);
+        Assert.Equal([AREA_OTHER], game.EnteredAreas);
+        Assert.Equal
+        (
+            ["stage:enteringLobby", "characters:auto:2", "stage:switchingArea", "characters:auto:1", "stage:enteringWorld", "character:小白@LaNuoXiYa", "stage:inWorld"],
+            Entries(reporter)
+        );
+
+        var listed = reporter.CharacterLists.First().Characters.Single(x => x.ContentId == "11");
+        Assert.True(listed.Travelling);
+        Assert.Equal("白银乡", listed.CurrentWorldName);
+
+        var entered = Assert.Single(reporter.EnteredCharacters);
+        Assert.Equal("BaiYinXiang", entered.CurrentWorld);
+        Assert.Equal("LaNuoXiYa", entered.HomeWorld);
+    }
+
+    [Fact]
+    public async Task TargetStillElsewhereAfterOneSwitch_StopsInsteadOfSwitchingAgain()
+    {
+        var travelling = Chara("11", "小白", "LaNuoXiYa", "BaiYinXiang", 16);
+        var (game, reporter) = Setup(travelling);
+
+        // 换过去之后那边的列表里它仍显示在第三个大区
+        game.Characters[AREA_OTHER] = [Chara("11", "小白", "LaNuoXiYa", "ZiShuiZhanQiao", 16)];
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Equal([AREA_OTHER], game.Switched);
+        Assert.Contains("stopped:switchAreaFailed", reporter.Entries);
+        Assert.Equal("stage:running", reporter.Entries.Last());
+    }
+
+    [Fact]
+    public async Task SwitchingLobbyFails_StopsWithTheReason()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白", "LaNuoXiYa", "BaiYinXiang", 16));
+        game.SwitchError = "没能取到新的登录票据";
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:switchAreaFailed", reporter.Entries);
+        Assert.Contains(reporter.Messages, x => x.Contains("没能取到新的登录票据", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task EmptyList_LooksThroughOtherAreas_AndEntersWhereTheCharacterIs()
+    {
+        var (game, reporter) = Setup();
+        game.Characters[AREA_THIRD] = [Chara("21", "小白", "ZiShuiZhanQiao")];
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.Equal([AREA_OTHER, AREA_THIRD], game.Switched);
+        Assert.Equal([AREA_THIRD], game.EnteredAreas);
+    }
+
+    [Fact]
+    public async Task NoCharacterInAnyArea_StopsWithNoCharacter()
+    {
+        var (game, reporter) = Setup();
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Equal([AREA_OTHER, AREA_THIRD], game.Switched);
+        Assert.Equal(["stage:enteringLobby", "stage:switchingArea", "stopped:noCharacter", "stage:running"], Entries(reporter));
+    }
+
+    [Fact]
+    public async Task CancelLoginPrompt_IsNeverAnswered()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        // 点了「是」之后没有直接进游戏, 而是冒出「确定要取消登录吗」（人在排队时点了取消）, 过一会儿人自己关掉、进了游戏
+        var ticks = 0;
+        game.AfterConfirm = g =>
+        {
+            g.YesNo = true;
+            g.Text  = "确定要取消登录吗？";
+        };
+        game.OnDelay = g =>
+        {
+            if (g.YesNo && g.Text.Contains(CatAutoEnter.CANCEL_LOGIN_PROMPT, StringComparison.Ordinal) && ++ticks == 20)
+            {
+                g.YesNo = false;
+                g.Text  = string.Empty;
+                g.EnterWorld("11");
+            }
+        };
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.Equal(1, game.Commands.Count(x => x == "DIALOG YES"));
+        Assert.DoesNotContain("DIALOG NO", game.Commands);
+        Assert.DoesNotContain("DIALOG OK", game.Commands);
+    }
+
+    [Fact]
+    public async Task Queue_IsNeverClicked_AndIsWaitedOutWithoutATimeLimit()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        var timings = new CatAutoEnterTimings();
+
+        // 排队时间远超「确认登录到进入游戏」的上限
+        var queueTicks = (int)(timings.EnterTimeout * 4 / timings.QueuePoll);
+        var ticks      = 0;
+
+        game.AfterConfirm = g =>
+        {
+            g.Ok    = true;
+            g.Queue = 12;
+            g.Text  = "当前服务器繁忙，需要排队进行登录，请耐心等待。";
+        };
+        game.OnDelay = g =>
+        {
+            if (!g.Ok)
+                return;
+
+            ticks++;
+
+            if (ticks == queueTicks / 2)
+                g.Queue = 3;
+
+            if (ticks == queueTicks)
+            {
+                g.Ok   = false;
+                g.Text = string.Empty;
+                g.EnterWorld("11");
+            }
+        };
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null), timings).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.True(game.Elapsed > timings.EnterTimeout * 3);
+        Assert.DoesNotContain("DIALOG OK", game.Commands);
+        Assert.Equal(1, game.Commands.Count(x => x == "DIALOG YES"));
+        Assert.Equal
+        (
+            ["stage:enteringLobby", "characters:auto:1", "stage:enteringWorld", "queue:12", "queue:3", "character:小白@LaNuoXiYa", "stage:inWorld"],
+            Entries(reporter)
+        );
+    }
+
+    [Fact]
+    public async Task CancelPromptDuringQueue_IsNotAnswered_EvenWhenTheTextReadIsTheQueueOne()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        var ticks = 0;
+
+        game.AfterConfirm = g =>
+        {
+            g.Ok    = true;
+            g.Queue = 5;
+            g.Text  = "当前服务器繁忙，需要排队进行登录，请耐心等待。";
+        };
+        game.OnDelay = g =>
+        {
+            ticks++;
+
+            // 排队框还在, 上面又叠了一个是/否框; 模块读到的文字还是排队那句
+            if (ticks == 5)
+                g.YesNo = true;
+
+            if (ticks == 15)
+            {
+                g.YesNo = false;
+                g.Ok    = false;
+                g.Text  = string.Empty;
+                g.EnterWorld("11");
+            }
+        };
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.Equal(1, game.Commands.Count(x => x == "DIALOG YES"));
+    }
+
+    [Fact]
+    public async Task ErrorDialog_StopsAndLeavesTheGameAlone()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        game.AfterConfirm = g =>
+        {
+            g.Dialogue = true;
+            g.Text     = "与服务器的连接已断开。";
+        };
+
+        var flow    = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null));
+        var outcome = await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Equal(["stage:enteringLobby", "characters:auto:1", "stage:enteringWorld", "stopped:lobbyError", "stage:running"], Entries(reporter));
+        Assert.Contains(reporter.Messages, x => x.Contains("与服务器的连接已断开", StringComparison.Ordinal));
+        Assert.Equal(CatStages.RUNNING, flow.CurrentStage);
+
+        // 错误框不替人点, 也没有重新登录
+        Assert.DoesNotContain("DIALOG OK", game.Commands);
+        Assert.Equal(1, game.Commands.Count(x => x == "LOGIN"));
+        Assert.False(game.HasExited);
+    }
+
+    [Fact]
+    public async Task NonQueueNotice_Stops()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        game.AfterConfirm = g =>
+        {
+            g.Ok   = true;
+            g.Text = "该角色已在其他地方登录。";
+        };
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:lobbyError", reporter.Entries);
+        Assert.DoesNotContain("DIALOG OK", game.Commands);
+    }
+
+    [Theory]
+    [InlineData("0.5.0-focus")]
+    [InlineData("0.5.9")]
+    public async Task OldModule_StopsBeforeTouchingTheGame(string version)
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.Version = version;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Equal(["stage:enteringLobby", "stopped:moduleOutdated", "stage:running"], Entries(reporter));
+        Assert.Equal(["VERSION"], game.Commands);
+    }
+
+    [Fact]
+    public async Task ModuleCannotBeInjected_StopsWithModuleUnavailable()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.AttachError = "找不到模块";
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Equal(["stage:enteringLobby", "stopped:moduleUnavailable", "stage:running"], Entries(reporter));
+        Assert.Empty(game.Commands);
+    }
+
+    [Fact]
+    public async Task LobbyStateUnreadableWhileBooting_IsWaitedOut()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        var reads = 0;
+
+        // 游戏刚起来: 界面还没建好, 模块答不上在哪个界面
+        game.Intercept = command => command == "LOBBYSTATE" && ++reads <= 200 ? "FAIL unknown" : null;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+    }
+
+    [Fact]
+    public async Task LobbyStateUnreadableLater_StopsAfterAWhile()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        var clicked = false;
+
+        game.Intercept = command =>
+        {
+            if (command.StartsWith("ENTERCHARA", StringComparison.Ordinal))
+                clicked = true;
+
+            return clicked && command == "LOBBYSTATE" ? "FAIL exception" : null;
+        };
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:moduleUnavailable", reporter.Entries);
+    }
+
+    [Fact]
+    public async Task SignaturesBroken_StopsWithModuleUnavailable()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.Intercept = command => command == "LOBBYSTATE" ? "FAIL sigscan-failed" : null;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:moduleUnavailable", reporter.Entries);
+    }
+
+    [Fact]
+    public async Task NoConfirmDialogAfterClick_StopsWithTimeout_NamingTheStep()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.ShowConfirm = false;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:timeout", reporter.Entries);
+        Assert.Contains(reporter.Messages, x => x.Contains("没有出现登录确认框", StringComparison.Ordinal));
+        Assert.Equal(1, game.Commands.Count(x => x.StartsWith("ENTERCHARA", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task LockedCharacter_IsNotClicked()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白", flags: 1));
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:characterLocked", reporter.Entries);
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("ENTERCHARA", StringComparison.Ordinal));
+        Assert.False(Assert.Single(reporter.CharacterLists).Characters[0].Loginable);
+    }
+
+    [Fact]
+    public async Task GameExitsMidway_EndsQuietly()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.AfterConfirm = g => g.HasExited = true;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Cancelled, outcome);
+        Assert.DoesNotContain(reporter.Entries, x => x.StartsWith("stopped:", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Cancelled_WhileGameIsAlive_ReportsCancelled()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"), Chara("12", "小黑"));
+        using var cancellation = new CancellationTokenSource();
+
+        var run = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(cancellation.Token);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("characters:choose:2"));
+        await cancellation.CancelAsync();
+
+        Assert.Equal(CatAutoEnterOutcome.Cancelled, await run.WaitAsync(Timeout));
+        Assert.Equal("stopped:cancelled", reporter.Entries.Last());
+    }
+
+    [Fact]
+    public async Task Observe_ReportsAgainWhenTheCharacterChanges_AndSkipsWhileThePipeIsBusy()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"), Chara("12", "小黑", "HongYuHai"));
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null));
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+
+        using var cancellation = new CancellationTokenSource();
+        var whoAmIBefore = game.Commands.Count(x => x == "WHOAMI");
+        var ticks        = 0;
+
+        game.OnDelay = g =>
+        {
+            ticks++;
+
+            switch (ticks)
+            {
+                case 1:
+                    g.ModuleBusy = true;
+                    break;
+
+                case 3:
+                    g.ModuleBusy = false;
+                    break;
+
+                // 人退到选角界面换了个角色
+                case 5:
+                    g.EnterWorld("12");
+                    break;
+
+                case 8:
+                    g.HasExited = true;
+                    break;
+            }
+        };
+
+        await flow.ObserveAsync(cancellation.Token).WaitAsync(Timeout);
+
+        Assert.Equal(["character:小白@LaNuoXiYa", "character:小黑@HongYuHai"], reporter.Entries.Where(x => x.StartsWith("character:", StringComparison.Ordinal)));
+        Assert.Equal("12", flow.EnteredContentId);
+
+        // 第 1、2 次管道被占着没有去读; 之后每次读完都放开管道
+        Assert.Equal(5, game.Commands.Count(x => x == "WHOAMI") - whoAmIBefore);
+        Assert.True(game.Elapsed >= new CatAutoEnterTimings().ObserveInterval * 8);
+    }
+
+    [Fact]
+    public async Task Observe_AfterAStop_ReportsTheCharacterOnceSomeoneEntersByHand()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.ShowConfirm = false;
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null));
+        Assert.Equal(CatAutoEnterOutcome.Stopped, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+
+        var ticks = 0;
+        game.OnDelay = g =>
+        {
+            if (++ticks == 2)
+                g.EnterWorld("11");
+
+            if (ticks == 4)
+                g.HasExited = true;
+        };
+
+        await flow.ObserveAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(["stopped:timeout", "stage:running", "character:小白@LaNuoXiYa", "stage:inWorld"], Entries(reporter)[^4..]);
+    }
+
+    [Theory]
+    [InlineData("LaNuoXiYa", "LaNuoXiYa", null, true)]
+    [InlineData("lanuoxiya", "LaNuoXiYa", null, true)]
+    [InlineData("拉诺西亚", "LaNuoXiYa", "拉诺西亚", true)]
+    [InlineData("HongChaChuan", "HongChaChuan2", null, true)]
+    [InlineData("HongYuHai", "LaNuoXiYa", "拉诺西亚", false)]
+    public void WorldMatches_AcceptsEnumNameOrChineseName(string requested, string code, string? chineseName, bool expected) =>
+        Assert.Equal(expected, CatAutoEnter.WorldMatches(requested, code, chineseName));
+
+    [Fact]
+    public void Resolve_FollowsTheRules()
+    {
+        var one   = Chara("11", "小白");
+        var two   = Chara("12", "小白", "HongYuHai");
+        var three = Chara("13", "小黑");
+
+        Assert.Equal(((CharaSelectReader.Entry?)null, false), CatAutoEnter.Resolve([], new CatAutoEnterTarget("小白", null), []));
+        Assert.Equal(((CharaSelectReader.Entry?)one, false), CatAutoEnter.Resolve([one, three], new CatAutoEnterTarget(" 小白 ", null), []));
+        Assert.Equal(((CharaSelectReader.Entry?)null, true), CatAutoEnter.Resolve([one, two, three], new CatAutoEnterTarget("小白", null), []));
+        Assert.Equal(((CharaSelectReader.Entry?)null, true), CatAutoEnter.Resolve([one, two, three], new CatAutoEnterTarget("小白", "MengYaChi"), []));
+        Assert.Equal(((CharaSelectReader.Entry?)two, false), CatAutoEnter.Resolve([one, two, three], new CatAutoEnterTarget("小白", "HongYuHai"), []));
+        Assert.Equal(((CharaSelectReader.Entry?)null, true), CatAutoEnter.Resolve([one, three], new CatAutoEnterTarget(null, null), []));
+        Assert.Equal(((CharaSelectReader.Entry?)null, true), CatAutoEnter.Resolve([one, three], new CatAutoEnterTarget("不存在", null), []));
+        Assert.Equal(((CharaSelectReader.Entry?)three, false), CatAutoEnter.Resolve([one, three], new CatAutoEnterTarget("不存在", null, "13"), []));
+
+        // 名字唯一时不看原始服务器（资料里的服务器可能填错）
+        Assert.Equal(((CharaSelectReader.Entry?)three, false), CatAutoEnter.Resolve([one, three], new CatAutoEnterTarget("小黑", "HongYuHai"), []));
+    }
+
+    [Fact]
+    public void Replies_AreParsedTolerantly()
+    {
+        var lobby = CatModuleReplies.ParseLobbyState
+        (
+            "OK where=charaselect world=1042 worldIndex=2 selectedIndex=0 hovered=11 locked=1 stage=31 uiStage=6 queue=7 dialogId=55 yesno=0 ok=1 dialogue=0 loading=0\nT 当前服务器繁忙，\n需要排队进行登录。"
+        )!;
+
+        Assert.Equal("charaselect", lobby.Where);
+        Assert.True(lobby.Ok);
+        Assert.True(lobby.Locked);
+        Assert.False(lobby.YesNo);
+        Assert.Equal(7, lobby.Queue);
+        Assert.Equal("当前服务器繁忙， 需要排队进行登录。", lobby.OkText);
+        Assert.Equal(string.Empty, lobby.YesNoText);
+
+        // 模块给每个在场的对话框各一行: 排队框上叠着「取消登录」的是/否框时, 两句文字都分得清
+        var stacked = CatModuleReplies.ParseLobbyState
+        (
+            "OK where=charaselect world=1042 worldIndex=2 selectedIndex=0 hovered=11 locked=1 stage=31 uiStage=6 queue=0 dialogId=55 yesno=1 ok=1 dialogue=0 loading=0" +
+            "\nD\tSelectYesno\t60\t1\t1\t确定要取消登录吗？" +
+            "\nD\tSelectOk\t55\t1\t1\t当前服务器繁忙，需要排队进行登录，请耐心等待。" +
+            "\nT 确定要取消登录吗？"
+        )!;
+
+        Assert.Equal("确定要取消登录吗？", stacked.YesNoText);
+        Assert.Contains(CatAutoEnter.QUEUE_PROMPT, stacked.OkText);
+        Assert.Equal(string.Empty, stacked.DialogueText);
+
+        // 没有逐框的行时, 那一句归给优先级最高的框
+        var plain = CatModuleReplies.ParseLobbyState("OK where=charaselect queue=0 yesno=1 ok=1 dialogue=0 loading=0\nT 确定要取消登录吗？")!;
+        Assert.Equal("确定要取消登录吗？", plain.YesNoText);
+        Assert.Equal(string.Empty, plain.OkText);
+
+        Assert.Null(CatModuleReplies.ParseLobbyState("FAIL unknown"));
+
+        Assert.Null(CatModuleReplies.ParseLobbyState("FAIL mainthread-timeout"));
+        Assert.True(CatModuleReplies.IsTransient("FAIL mainthread-timeout"));
+        Assert.False(CatModuleReplies.IsTransient("FAIL exception"));
+
+        // 名字带空格（空格分隔）, 以及制表符分隔的写法
+        var spaced = CatModuleReplies.ParseWhoAmI("OK loaded=1 name=Xiao Bai cid=4611686018427387905 world=1172 home=1042 worldName=BaiYinXiang homeName=LaNuoXiYa loggedIn=1 inZone=1")!;
+        Assert.True(spaced.Loaded);
+        Assert.Equal("Xiao Bai", spaced.Name);
+        Assert.Equal("4611686018427387905", spaced.ContentId);
+        Assert.Equal(1172, spaced.WorldId);
+        Assert.Equal("LaNuoXiYa", spaced.HomeWorldCode);
+
+        var tabbed = CatModuleReplies.ParseWhoAmI("OK loaded=1\tcid=11\tworld=1042\thome=1042\tworldName=\thomeName=\tloggedIn=1\tinZone=1\tname=小白")!;
+        Assert.Equal("小白", tabbed.Name);
+        Assert.Equal(string.Empty, tabbed.WorldCode);
+
+        Assert.False(CatModuleReplies.ParseWhoAmI("OK loaded=0 name= cid= world= home= worldName= homeName= loggedIn=0 inZone=0")!.Loaded);
+        Assert.Null(CatModuleReplies.ParseWhoAmI("FAIL exception"));
+
+        Assert.True(MiniModuleClient.TryParseVersion("OK version=0.6.0 pid=1 log=C:\\x.log", out var version));
+        Assert.Equal(new Version(0, 6, 0), version);
+        Assert.True(MiniModuleClient.TryParseVersion("OK version=0.5.0-focus pid=1 log=x", out var old));
+        Assert.True(old < MiniModuleClient.AutoEnterMinimumVersion);
+        Assert.False(MiniModuleClient.TryParseVersion("FAIL unknown-command", out _));
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + Timeout;
+
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+                throw new TimeoutException("没有等到预期的状态");
+
+            await Task.Delay(5);
+        }
+    }
+
+    /// <summary>
+    ///     假的游戏一侧: 按模块约定的格式应答, 界面状态由测试改; 等待不真等, 只把假时钟往前拨
+    /// </summary>
+    private sealed class FakeAutoEnterGame : ICatAutoEnterGame
+    {
+        private readonly object sync = new();
+        private TimeSpan elapsed;
+        private CharaSelectReader.Entry? inWorld;
+
+        public string Version { get; set; } = "0.6.0";
+
+        public volatile string Where = "title";
+
+        public Dictionary<string, List<CharaSelectReader.Entry>> Characters { get; } = new()
+        {
+            [AREA_HOME]  = [],
+            [AREA_OTHER] = [],
+            [AREA_THIRD] = []
+        };
+
+        public List<string> Commands { get; } = [];
+
+        public List<string> Switched { get; } = [];
+
+        public List<string> EnteredAreas { get; } = [];
+
+        public string? AttachError { get; set; }
+
+        public string? SwitchError { get; set; }
+
+        public bool ShowConfirm { get; set; } = true;
+
+        public volatile bool YesNo;
+
+        public volatile bool Ok;
+
+        public volatile bool Dialogue;
+
+        public volatile int Queue;
+
+        public volatile string Text = string.Empty;
+
+        public int Releases;
+
+        /// <summary>点了登录确认框的「是」之后发生什么; 不设就是直接进游戏</summary>
+        public Action<FakeAutoEnterGame>? AfterConfirm { get; set; }
+
+        /// <summary>每等一次调一次</summary>
+        public Action<FakeAutoEnterGame>? OnDelay { get; set; }
+
+        /// <summary>改写某条命令的回应; 返回 null 用默认回应</summary>
+        public Func<string, string?>? Intercept { get; set; }
+
+        public bool ModuleBusy { get; set; }
+
+        public bool HasExited { get; set; }
+
+        public string CurrentAreaName { get; private set; } = AREA_HOME;
+
+        public IReadOnlyList<string> AreaNames => [AREA_HOME, AREA_OTHER, AREA_THIRD];
+
+        public TimeSpan Elapsed
+        {
+            get
+            {
+                lock (sync)
+                    return elapsed;
+            }
+        }
+
+        public void EnterWorld(string contentId)
+        {
+            lock (sync)
+                inWorld = Characters.Values.SelectMany(x => x).First(x => x.ContentId == contentId);
+
+            Where = "ingame";
+        }
+
+        public Task<string?> AttachAsync(CancellationToken cancellationToken) => Task.FromResult(AttachError);
+
+        public void Release() => Interlocked.Increment(ref Releases);
+
+        public Task<IReadOnlyList<CatAutoEnterWorld>> LoadWorldsAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<CatAutoEnterWorld>>
+            (
+                [
+                    new CatAutoEnterWorld("LaNuoXiYa", "拉诺西亚", AREA_HOME),
+                    new CatAutoEnterWorld("HongYuHai", "红玉海", AREA_HOME),
+                    new CatAutoEnterWorld("BaiYinXiang", "白银乡", AREA_OTHER),
+                    new CatAutoEnterWorld("ZiShuiZhanQiao", "紫水栈桥", AREA_THIRD)
+                ]
+            );
+
+        public Task<string?> SwitchAreaAsync(string areaName, CancellationToken cancellationToken)
+        {
+            Switched.Add(areaName);
+
+            if (SwitchError != null)
+                return Task.FromResult<string?>(SwitchError);
+
+            CurrentAreaName = areaName;
+            Where           = "charaselect";
+            return Task.FromResult<string?>(null);
+        }
+
+        public void AreaEntered(string areaName) => EnteredAreas.Add(areaName);
+
+        public async Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
+        {
+            lock (sync)
+                elapsed += delay;
+
+            OnDelay?.Invoke(this);
+            await Task.Delay(1, cancellationToken);
+        }
+
+        public Task<string> SendAsync(string command, CancellationToken cancellationToken)
+        {
+            if (HasExited)
+                throw new System.IO.IOException("管道已断开");
+
+            lock (Commands)
+                Commands.Add(command);
+
+            return Task.FromResult(Intercept?.Invoke(command) ?? Reply(command));
+        }
+
+        private string Reply(string command)
+        {
+            var list = Characters[CurrentAreaName];
+
+            switch (command)
+            {
+                case "VERSION":
+                    return $"OK version={Version} pid=1 log=C:\\Temp\\module.log";
+
+                case "LOBBYSTATE":
+                    return $"OK where={Where} world=1042 worldIndex=0 selectedIndex=-1 hovered=0 locked=0 stage=0 uiStage=0 queue={Queue} dialogId=0 " +
+                           $"yesno={(YesNo ? 1 : 0)} ok={(Ok ? 1 : 0)} dialogue={(Dialogue ? 1 : 0)} loading=0" +
+                           (Text.Length > 0 ? $"\nT {Text}" : string.Empty);
+
+                case "SKIPMOVIE":
+                    Where = "title";
+                    return "OK where=title";
+
+                case "TITLEREADY":
+                    return Where == "title" ? "OK ready=1" : "OK ready=0";
+
+                case "LOGIN":
+                    Where = "charaselect";
+                    return "OK";
+
+                case "CHARAS":
+                    return $"OK where={Where} source=dc n={list.Count} total={list.Count} selected=0 selectedIndex=-1 hovered=0 hoveredIndex=-1" +
+                           string.Concat(list.Select(x => $"\nC\t{x.ContentId}\t{x.Index}\t{x.LoginFlags}\t{x.CurrentWorldId}\t{x.HomeWorldId}\t{x.Name}\t{x.CurrentWorldCode}\t{x.HomeWorldCode}"));
+
+                case "DIALOG YES":
+                    if (!YesNo)
+                        return "FAIL no-dialog";
+
+                    YesNo = false;
+                    Text  = string.Empty;
+
+                    if (AfterConfirm != null)
+                        AfterConfirm(this);
+                    else
+                        EnterWorld(pending!);
+
+                    return "OK clicked addon=SelectYesno";
+
+                case "WHOAMI":
+                    CharaSelectReader.Entry? current;
+
+                    lock (sync)
+                        current = inWorld;
+
+                    return Where == "ingame" && current != null
+                               ? $"OK loaded=1 name={current.Name} cid={current.ContentId} world={current.CurrentWorldId} home={current.HomeWorldId} " +
+                                 $"worldName={current.CurrentWorldCode} homeName={current.HomeWorldCode} loggedIn=1 inZone=1"
+                               : "OK loaded=0 name= cid= world= home= worldName= homeName= loggedIn=0 inZone=0";
+            }
+
+            var parts = command.Split(' ', 2);
+            var entry = parts.Length == 2 ? list.FirstOrDefault(x => x.ContentId == parts[1]) : null;
+
+            switch (parts[0])
+            {
+                case "FOCUSCHARA":
+                    return entry == null ? "FAIL not-in-list" : $"OK world={entry.CurrentWorldId}";
+
+                case "SELECTCHARA":
+                    return entry == null ? "FAIL not-in-list" : $"OK selected index=0 cid={entry.ContentId}";
+
+                case "ENTERCHARA":
+                    if (entry == null)
+                        return "FAIL not-in-list";
+
+                    pending = entry.ContentId;
+
+                    if (ShowConfirm)
+                    {
+                        Text  = "要以该角色登录吗？";
+                        YesNo = true;
+                    }
+
+                    return $"OK clicked index=0 cid={entry.ContentId}";
+            }
+
+            return "FAIL unknown-command";
+        }
+
+        private string? pending;
+    }
+}

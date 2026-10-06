@@ -91,6 +91,58 @@ public static class CatStages
 
     /// <summary>启动失败</summary>
     public const string FAILED = "failed";
+
+    /// <summary>自动进入角色: 正在从标题进入选角界面（在 <see cref="RUNNING" /> 之后）</summary>
+    public const string ENTERING_LOBBY = "enteringLobby";
+
+    /// <summary>自动进入角色: 角色在别的大区, 正在换大厅</summary>
+    public const string SWITCHING_AREA = "switchingArea";
+
+    /// <summary>自动进入角色: 停在选角界面等人选角色（game.characters 带 needsChoice）</summary>
+    public const string AWAITING_CHARACTER_CHOICE = "awaitingCharacterChoice";
+
+    /// <summary>自动进入角色: 已点角色, 正在进入游戏</summary>
+    public const string ENTERING_WORLD = "enteringWorld";
+
+    /// <summary>自动进入角色: 登录排队中（game.stage 带 queuePosition）</summary>
+    public const string QUEUEING = "queueing";
+
+    /// <summary>角色已进入游戏</summary>
+    public const string IN_WORLD = "inWorld";
+
+    /// <summary>
+    ///     游戏进程是否在运行: <see cref="RUNNING" /> 以及它之后的自动进入角色各阶段
+    /// </summary>
+    public static bool IsGameRunning(string stage) =>
+        stage is RUNNING or ENTERING_LOBBY or SWITCHING_AREA or AWAITING_CHARACTER_CHOICE or ENTERING_WORLD or QUEUEING or IN_WORLD;
+}
+
+/// <summary>game.autoEnterStopped 的 code: 自动进入角色停在了哪一类问题上（游戏不关, 交给人手动操作）</summary>
+public static class CatAutoEnterStopCodes
+{
+    /// <summary>游戏内模块注入不了、连不上或命令失效（多半是游戏更新后模块要跟着更新）</summary>
+    public const string MODULE_UNAVAILABLE = "moduleUnavailable";
+
+    /// <summary>游戏里注着的是旧版模块, 不支持自动进入</summary>
+    public const string MODULE_OUTDATED = "moduleOutdated";
+
+    /// <summary>这个号在各大区都没有角色</summary>
+    public const string NO_CHARACTER = "noCharacter";
+
+    /// <summary>角色暂时不能登录（被锁定、要改名、缺资料片, 或客户端提示稍后再试）</summary>
+    public const string CHARACTER_LOCKED = "characterLocked";
+
+    /// <summary>大厅弹出了错误或提示框</summary>
+    public const string LOBBY_ERROR = "lobbyError";
+
+    /// <summary>某一步等够时间没有结果（message 里写明卡在哪一步）</summary>
+    public const string TIMEOUT = "timeout";
+
+    /// <summary>换到角色所在大区没有成功</summary>
+    public const string SWITCH_AREA_FAILED = "switchAreaFailed";
+
+    /// <summary>收到关闭请求, 没有做完</summary>
+    public const string CANCELLED = "cancelled";
 }
 
 /// <summary>失败码</summary>
@@ -294,11 +346,37 @@ public sealed record CatHelloResult(string ProtocolVersion, string LauncherVersi
 public sealed record CatMinionParams(string? CardFingerprint, string? Variant);
 
 /// <summary>
+///     launch 里的目标角色: name = 角色名, homeWorld = 原始服务器（Cat 的服务器枚举名, 如 LaNuoXiYa; 也认中文名）; 都可以不带
+/// </summary>
+public sealed record CatCharacterParams(string? Name, string? HomeWorld);
+
+/// <summary>selectCharacter 参数: contentId = game.characters 里那个角色的 contentId（字符串）</summary>
+public sealed record CatSelectCharacterParams(string? ContentId);
+
+/// <summary>
+///     选角列表里的一个角色（game.characters / game.character 的载荷）。
+///     homeWorld / currentWorld 是游戏内部的服务器代号（如 LaNuoXiYa）, homeWorldName / currentWorldName 是中文名（查不到时不带）;
+///     travelling = 超域中（人在别的大区）; loginable = 没有被锁定、要改名、缺资料片这类不能登录的标记
+/// </summary>
+public sealed record CatCharacterInfo
+(
+    string  ContentId,
+    string  Name,
+    string  HomeWorld,
+    string  CurrentWorld,
+    string? HomeWorldName,
+    string? CurrentWorldName,
+    bool    Travelling,
+    bool    Loginable
+);
+
+/// <summary>
 ///     launch 参数; areaName = 资料里的大区名（如 豆豆柴）, 账号库没记这个号的大区时用它;
 ///     platform = 渠道, 见 <see cref="CatPlatforms" />, 不带按盛趣;
 ///     password = 国际服的 Square Enix 账号密码（国际服必填, 其它渠道带了也不用）;
 ///     weGameLogin = WeGame 号在本机没有可用的登录信息时, 拉起 WeGame 等员工在窗口里登录（只能用于 weGame 渠道, 不带按 false）;
-///     weGameScan = 等 WeGame 登录时自动把登录窗口切到哪种扫码页, 见 <see cref="CatWeGameScans" />（只能和 weGameLogin 一起用, 不带 = 不切换）
+///     weGameScan = 等 WeGame 登录时自动把登录窗口切到哪种扫码页, 见 <see cref="CatWeGameScans" />（只能和 weGameLogin 一起用, 不带 = 不切换）;
+///     character = 要登录的角色（可不带）; autoEnter = 游戏起来后自动经标题、选角进入游戏（不带按 false, 国际服忽略）
 /// </summary>
 public sealed record CatLaunchParams
 (
@@ -311,7 +389,9 @@ public sealed record CatLaunchParams
     string?          Platform                  = null,
     string?          Password                  = null,
     bool?            WeGameLogin               = null,
-    string?          WeGameScan                = null
+    string?          WeGameScan                = null,
+    CatCharacterParams? Character              = null,
+    bool?            AutoEnter                 = null
 )
 {
     /// <summary>
@@ -320,7 +400,7 @@ public sealed record CatLaunchParams
     public override string ToString() =>
         $"CatLaunchParams {{ OperationId = {OperationId}, AccountName = {AccountName}, Dalamud = {Dalamud}, Minion = {Minion}, " +
         $"CrashDialogTimeoutSeconds = {CrashDialogTimeoutSeconds}, AreaName = {AreaName}, Platform = {Platform}, Password = {(Password == null ? "(无)" : "***")}, " +
-        $"WeGameLogin = {WeGameLogin}, WeGameScan = {WeGameScan} }}";
+        $"WeGameLogin = {WeGameLogin}, WeGameScan = {WeGameScan}, Character = {Character}, AutoEnter = {AutoEnter} }}";
 }
 
 /// <summary>
