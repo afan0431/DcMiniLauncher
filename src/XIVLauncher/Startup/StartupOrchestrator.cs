@@ -173,10 +173,10 @@ public class StartupOrchestrator
         context.Settings.Save();
     }
 
-    // 有游戏在由 Cat 运行时不自动应用已下载的更新, 免得把守护游戏的无界面进程一起结束
+    // 有启动器（无界面的或界面版的）正守着游戏时不自动应用已下载的更新, 免得把守护进程一起结束
     private static void InitializeVelopack() =>
         VelopackApp.Build()
-                   .SetAutoApplyOnStartup(!UpdateOrchestrator.IsCatHostRunning())
+                   .SetAutoApplyOnStartup(!UpdateOrchestrator.WouldKillGameGuard())
                    .Run();
 
     private async Task CheckUpdatesAsync()

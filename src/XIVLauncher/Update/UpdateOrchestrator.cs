@@ -28,6 +28,19 @@ internal class UpdateOrchestrator
     /// </summary>
     internal static Func<bool> IsCatHostRunning { get; set; } = CatHostPresence.IsAnyRunning;
 
+    /// <summary>界面版启动器正守着游戏时给用户看的提示</summary>
+    internal const string GAME_GUARDED_MESSAGE = "有启动器正守着运行中的游戏, 本次先不更新启动器, 稍后再更新";
+
+    /// <summary>
+    ///     有界面版启动器正守着游戏时同样不应用更新: 守护进程被结束后, 游戏退出时没人给 MINIONAPP 报「停机」
+    /// </summary>
+    internal static Func<bool> IsGameGuarded { get; set; } = GameGuardPresence.IsAnyRunning;
+
+    /// <summary>
+    ///     现在应用更新会不会结束正守着游戏的启动器进程（无界面的或界面版的）
+    /// </summary>
+    internal static bool WouldKillGameGuard() => IsCatHostRunning() || IsGameGuarded();
+
     public async Task<bool> Run
     (
         bool             downloadPrerelease,
@@ -137,11 +150,19 @@ internal class UpdateOrchestrator
 
     private static async Task<bool> SkipBecauseCatIsRunningAsync(LoadingDialog? loadingDialog, string step)
     {
-        if (!IsCatHostRunning())
+        if (IsCatHostRunning())
+        {
+            Log.Information("有游戏正在由 Cat 运行, 跳过启动器更新{Step}", step);
+            loadingDialog?.SetMessage(CAT_RUNNING_MESSAGE);
+        }
+        else if (IsGameGuarded())
+        {
+            Log.Information("有启动器正守着运行中的游戏, 跳过启动器更新{Step}", step);
+            loadingDialog?.SetMessage(GAME_GUARDED_MESSAGE);
+        }
+        else
             return false;
 
-        Log.Information("有游戏正在由 Cat 运行, 跳过启动器更新{Step}", step);
-        loadingDialog?.SetMessage(CAT_RUNNING_MESSAGE);
         await Task.Delay(CatRunningMessageDelay).ConfigureAwait(false);
         return true;
     }
