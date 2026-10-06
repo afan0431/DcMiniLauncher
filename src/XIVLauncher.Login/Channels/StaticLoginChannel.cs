@@ -11,18 +11,20 @@ public sealed class StaticLoginChannel
     LoginChannelContext context
 ) : ILoginChannel
 {
-    public LoginType Type => LoginType.Static;
+    public        LoginType Type => LoginType.Static;
+    private const int       AUTO_LOGIN_KEEP_DAYS = 30;
 
     public async Task<LoginResult> LoginAsync(LoginRequest request, CancellationToken cancellationToken = default)
     {
         var guid       = await context.GetGuidAsync(cancellationToken).ConfigureAwait(false);
         var macAddress = request.DeviceProfile.MacHash;
+        var autoLogin  = request.QuickLoginEnabled ? $"autoLoginFlag=1&autoLoginKeepTime={AUTO_LOGIN_KEEP_DAYS}" : "autoLoginFlag=0&autoLoginKeepTime=0";
         var result = await context.GetJsonAsync
                      (
                          "staticLogin.json",
                          [
                             "checkCodeFlag=1", "encryptFlag=0", $"inputUserId={Uri.EscapeDataString(request.Account)}", $"password={Uri.EscapeDataString(request.Secret)}", $"mac={macAddress}", $"guid={guid}",
-                             "inputUserType=0&accountDomain=1&autoLoginFlag=0&autoLoginKeepTime=0&supportPic=2"
+                             $"inputUserType=0&accountDomain=1&{autoLogin}&supportPic=2"
                          ],
                          cancellationToken: cancellationToken
                      ).ConfigureAwait(false);
@@ -47,8 +49,17 @@ public sealed class StaticLoginChannel
         var sndaId = result.Data.SndaID;
         var tgt    = result.Data.Tgt;
 
+        // 开了快速登录时保留快速登录凭证: 盛趣随登录结果返回的优先, 没返回时用账号组登录再申请一个
+        string? autoLoginSessionKey = null;
+        if (request.QuickLoginEnabled)
+        {
+            autoLoginSessionKey = result.Data.QuickLoginSecret;
+            if (string.IsNullOrEmpty(autoLoginSessionKey))
+                (tgt, autoLoginSessionKey) = await context.AccountGroupLoginAsync(tgt, sndaId, AUTO_LOGIN_KEEP_DAYS, cancellationToken).ConfigureAwait(false);
+        }
+
         context.BindLoginSessionRefresh(request.LoginSessionRefreshSink, tgt, guid);
-        return LoginChannelContext.BuildOkLoginResult(request.Account, sndaId, null, null, LoginType.Static, tgt, guid, request.DeviceProfile);
+        return LoginChannelContext.BuildOkLoginResult(request.Account, sndaId, null, autoLoginSessionKey, LoginType.Static, tgt, guid, request.DeviceProfile);
     }
 
     private async Task<LoginResponse> LoginByStaticCaptchaAsync(LoginRequest request, string guid, LoginResponse result, CancellationToken cancellationToken)
