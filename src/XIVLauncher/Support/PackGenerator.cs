@@ -111,8 +111,7 @@ public static class PackGenerator
                      "dalamud.log",
                      "dalamud.injector.log",
                      "dalamud.boot.log",
-                     "aria.log",
-                     "argReader.log"
+                     "aria.log"
                  }) AddIfAvailable(new FileInfo(Path.Combine(Paths.RoamingPath, logFileName)), archive, collectedLogs, skippedLogs);
 
         return (outFile.FullName, [.. collectedLogs], [.. skippedLogs]);
