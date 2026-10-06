@@ -51,6 +51,28 @@ public static class Links
     #endregion
 
     
+    #region 国际服 Dalamud（goatcorp 原版）
+
+    // 取自 goatcorp/FFXIVQuickLauncher（GPL-3.0）提交 a6f33a9。与上面国服那套源互不相干, 文件格式也完全不同
+
+    /// <remarks>版本信息, {0} = 分桶（Canary / Control）。出处: XIVLauncher.Common/Dalamud/DalamudLauncher.cs:48; DalamudUpdater.cs:176</remarks>
+    public const string GOATCORP_DALAMUD_VERSION_INFO_URL_FORMAT = "https://kamori.goats.dev/Dalamud/Release/VersionInfo?track=release&bucket={0}";
+
+    /// <remarks>.NET 运行时哈希清单, {0} = 运行时版本。出处: DalamudUpdater.cs:501</remarks>
+    public const string GOATCORP_DALAMUD_RUNTIME_HASHES_URL_FORMAT = "https://kamori.goats.dev/Dalamud/Release/Runtime/Hashes/{0}";
+
+    /// <remarks>.NET 运行时, {0} = 运行时版本。出处: DalamudUpdater.cs:535</remarks>
+    public const string GOATCORP_DALAMUD_RUNTIME_DOTNET_URL_FORMAT = "https://kamori.goats.dev/Dalamud/Release/Runtime/DotNet/{0}";
+
+    /// <remarks>.NET 桌面运行时, {0} = 运行时版本。出处: DalamudUpdater.cs:536</remarks>
+    public const string GOATCORP_DALAMUD_RUNTIME_DESKTOP_URL_FORMAT = "https://kamori.goats.dev/Dalamud/Release/Runtime/WindowsDesktop/{0}";
+
+    /// <remarks>资源清单。出处: XIVLauncher.Common/Dalamud/AssetManager.cs:19</remarks>
+    public const string GOATCORP_DALAMUD_ASSET_META_URL = "https://kamori.goats.dev/Dalamud/Asset/Meta";
+
+    #endregion
+
+
     #region Dalamud 资源
 
     /// <remarks>资源 (Cloudflare R2)</remarks>
