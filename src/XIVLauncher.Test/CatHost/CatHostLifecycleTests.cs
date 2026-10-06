@@ -30,6 +30,29 @@ public sealed class CatHostLifecycleTests
     }
 
     [Fact]
+    public void GameGuardPresence_IsVisibleUntilTheLastHolderLetsGo()
+    {
+        var first  = XIVLauncher.Update.GameGuardPresence.Hold();
+        var second = XIVLauncher.Update.GameGuardPresence.Hold();
+
+        try
+        {
+            Assert.True(XIVLauncher.Update.GameGuardPresence.IsAnyRunning());
+
+            first.Dispose();
+            first.Dispose();
+            Assert.True(XIVLauncher.Update.GameGuardPresence.IsAnyRunning());
+        }
+        finally
+        {
+            first.Dispose();
+            second.Dispose();
+        }
+
+        Assert.False(XIVLauncher.Update.GameGuardPresence.IsAnyRunning());
+    }
+
+    [Fact]
     public async Task RestartMonitor_CrashHandlerOutlivesGame_ReportsCrash_ThenGivesUpAfterTimeout()
     {
         var directory = Path.Combine(Path.GetTempPath(), "cat-crash-handler-" + Guid.NewGuid().ToString("N"));

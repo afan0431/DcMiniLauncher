@@ -20,6 +20,7 @@ using XIVLauncher.Login.Client;
 using XIVLauncher.Login.Models;
 using XIVLauncher.Minion;
 using XIVLauncher.Support;
+using XIVLauncher.Update;
 using XIVLauncher.Windows.GameClientFiles;
 using XIVLauncher.Windows.ViewModel.Main.Models;
 using XIVLauncher.Windows.ViewModel.Main.Services;
@@ -180,6 +181,9 @@ internal sealed class GameLaunchFlow
             vm.IsLoggingIn = false;
             return null;
         }
+
+        // 守着这个游戏直到它退出; 期间别的启动器不应用更新（更新会把本进程结束）
+        using var gameGuard = GameGuardPresence.Hold();
 
         CompanionAppManager? companionAppManager = null;
 

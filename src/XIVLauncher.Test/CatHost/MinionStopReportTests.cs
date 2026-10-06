@@ -156,6 +156,52 @@ public sealed class MinionStopReportTests : IDisposable
     }
 
     [Fact]
+    public async Task ReportStopped_SendsTheStopPacketTwice()
+    {
+        var originalDelay = MinionAppStatusReporter.StopResendDelay;
+        MinionAppStatusReporter.StopResendDelay = TimeSpan.FromMilliseconds(100);
+
+        try
+        {
+            MinionAppStatusReporter.ReportStopped(FindUnusedPid(), UID);
+
+            var first  = await ReceiveAsync();
+            var second = await ReceiveAsync();
+
+            Assert.Equal(first, second);
+            Assert.Equal(0, second[36]);
+        }
+        finally
+        {
+            MinionAppStatusReporter.StopResendDelay = originalDelay;
+        }
+    }
+
+    [Fact]
+    public async Task ReportStopped_DoesNotRepeat_WhenRowIsAttachedToAnotherGameMeanwhile()
+    {
+        var originalDelay = MinionAppStatusReporter.StopResendDelay;
+        MinionAppStatusReporter.StopResendDelay = TimeSpan.FromMilliseconds(400);
+
+        using var live = StartSleeper();
+
+        try
+        {
+            MinionAppStatusReporter.ReportStopped(FindUnusedPid(), UID);
+            await ReceiveAsync();
+
+            MinionOccupancy.Write(NewRecord(live.Id, MinionOccupancy.GetProcessStartedAt(live), UID));
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => ReceiveAsync(TimeSpan.FromMilliseconds(1200)));
+        }
+        finally
+        {
+            MinionAppStatusReporter.StopResendDelay = originalDelay;
+            live.Kill();
+        }
+    }
+
+    [Fact]
     public void ReadAllLive_SkipsDeadRecords()
     {
         using var live = StartSleeper();

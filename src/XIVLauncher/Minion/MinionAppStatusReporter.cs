@@ -53,6 +53,9 @@ internal static class MinionAppStatusReporter
     /// <summary>补报「运行中」前等多久（UDP 不保证送达）</summary>
     private static readonly TimeSpan ResendDelay = TimeSpan.FromSeconds(20);
 
+    /// <summary>补报「停机」前等多久（UDP 不保证送达; 漏掉这一包 MINIONAPP 就会自己重开客户端）</summary>
+    internal static TimeSpan StopResendDelay { get; set; } = TimeSpan.FromSeconds(1);
+
     /// <summary>同一进程的「停机」在这段时间内只报一次</summary>
     private static readonly TimeSpan StopDedupWindow = TimeSpan.FromMinutes(1);
 
@@ -171,12 +174,45 @@ internal static class MinionAppStatusReporter
             return;
 
         RecentlyStopped[gamePid] = now;
-        Send(packet, label, gamePid, "停机");
+
+        var port       = PortOverride ?? UDP_PORT;
+        var stoppedUid = uid;
+        Send(packet, label, gamePid, "停机", port);
+
+        _ = Task.Run
+        (async () =>
+            {
+                await Task.Delay(StopResendDelay).ConfigureAwait(false);
+
+                // 这一行在这期间又被挂到别的游戏上了就不补: 晚到的「停机」会盖掉那边刚报的「运行中」
+                if (IsUidInUse(stoppedUid, gamePid))
+                    return;
+
+                Send(packet, label, gamePid, "停机", port);
+            }
+        );
     }
 
-    private static void Send(byte[] packet, string label, int gamePid, string what)
+    /// <summary>
+    ///     这个 Minion 行是否正挂在除 <paramref name="exceptPid" /> 以外的游戏上（本进程报过「运行中」的, 或占用记录里活着的）
+    /// </summary>
+    private static bool IsUidInUse(string uid, int exceptPid)
     {
-        var port = PortOverride ?? UDP_PORT;
+        try
+        {
+            return ReportedAccounts.Any(x => x.Key != exceptPid && string.Equals(x.Value.Uid?.Trim(), uid.Trim(), StringComparison.OrdinalIgnoreCase)) ||
+                   MinionOccupancy.IsUidAttachedElsewhere(uid, exceptPid);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[Minion] 检查 Minion 行占用失败, 不补报「停机」");
+            return true;
+        }
+    }
+
+    private static void Send(byte[] packet, string label, int gamePid, string what, int? targetPort = null)
+    {
+        var port = targetPort ?? PortOverride ?? UDP_PORT;
 
         try
         {
