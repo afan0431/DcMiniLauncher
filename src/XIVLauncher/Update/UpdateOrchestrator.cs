@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.IO;
 using System.Windows;
 using Serilog;
 using Velopack;
@@ -146,6 +148,102 @@ internal class UpdateOrchestrator
             Log.Warning(ex, "启动器更新检查失败, 继续使用当前版本: {Error}", GetUpdateFailureMessage(ex));
             return true;
         }
+    }
+
+    /// <summary>无界面更新的结果: 有启动器正守着游戏, 没有更新</summary>
+    internal const string SILENT_GUARDED = "guarded";
+
+    /// <summary>无界面更新的结果: 安装目录下还有别的启动器开着, 没有更新</summary>
+    internal const string SILENT_IN_USE = "inUse";
+
+    /// <summary>无界面更新的结果: 本进程不在 Velopack 安装目录里, 无从更新</summary>
+    internal const string SILENT_NOT_INSTALLED = "notInstalled";
+
+    /// <summary>无界面更新的结果: 已是最新</summary>
+    internal const string SILENT_UP_TO_DATE = "upToDate";
+
+    /// <summary>无界面更新的结果: 新版本已下载, 本进程退出后安装</summary>
+    internal const string SILENT_APPLYING = "applying";
+
+    /// <summary>
+    ///     安装目录下除本进程外是否还有启动器在运行。测试时可替换
+    /// </summary>
+    internal static Func<bool> IsInstallInUse { get; set; } = IsInstallInUseByOthers;
+
+    /// <summary>
+    ///     不显示任何窗口地检查、下载并安装启动器更新, 装完不重启启动器。
+    ///     安装会结束安装目录下的所有启动器进程, 所以有启动器正守着游戏、或安装目录下还有别的启动器开着时都不装
+    ///     （已下载的留到下次）; 从安装目录之外的副本运行的无界面进程不受影响。返回结果代码。
+    /// </summary>
+    internal static async Task<string> RunSilentAsync()
+    {
+        if (WouldKillGameGuard())
+            return SILENT_GUARDED;
+
+        if (IsInstallInUse())
+            return SILENT_IN_USE;
+
+        var updateManager = new UpdateManager
+        (
+            new SimpleWebSource(Links.LAUNCHER_DISTRIBUTE_BASE_URL, new XLHttpClientFileDownloader()),
+            new UpdateOptions
+            {
+                ExplicitChannel       = "win",
+                AllowVersionDowngrade = false
+            }
+        );
+
+        if (!updateManager.IsInstalled)
+            return SILENT_NOT_INSTALLED;
+
+        var newRelease = await updateManager.CheckForUpdatesAsync().ConfigureAwait(false);
+
+        if (newRelease == null)
+            return SILENT_UP_TO_DATE;
+
+        Log.Information("[CatUpdate] 发现新版本 {Version}, 开始下载", newRelease.TargetFullRelease.Version);
+        await updateManager.DownloadUpdatesAsync(newRelease).ConfigureAwait(false);
+
+        // 下载期间可能有游戏刚起来、或有人打开了启动器
+        if (WouldKillGameGuard())
+            return SILENT_GUARDED;
+
+        if (IsInstallInUse())
+            return SILENT_IN_USE;
+
+        updateManager.WaitExitThenApplyUpdates(newRelease, true, false);
+        return SILENT_APPLYING;
+    }
+
+    /// <summary>
+    ///     安装目录（本进程所在目录的上一级）下是否有除本进程外的启动器进程; 读不到某个进程的路径时按有算
+    /// </summary>
+    private static bool IsInstallInUseByOthers()
+    {
+        var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..")).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var name = Path.GetFileNameWithoutExtension(Environment.ProcessPath ?? "XIVLauncherCN.exe");
+
+        foreach (var process in Process.GetProcessesByName(name))
+        {
+            using (process)
+            {
+                if (process.Id == Environment.ProcessId)
+                    continue;
+
+                try
+                {
+                    if (process.MainModule?.FileName is not { } image || image.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                catch (Exception ex)
+                {
+                    Log.Debug(ex, "[CatUpdate] 读不到启动器进程 {Pid} 的路径, 按安装目录在用处理", process.Id);
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private static async Task<bool> SkipBecauseCatIsRunningAsync(LoadingDialog? loadingDialog, string step)

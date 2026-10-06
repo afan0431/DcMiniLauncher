@@ -1,5 +1,6 @@
 using System.IO;
 using Serilog;
+using Velopack;
 using XIVLauncher.Account;
 using XIVLauncher.CatHost;
 using XIVLauncher.Common.Constant;
@@ -7,6 +8,7 @@ using XIVLauncher.Dalamud;
 using XIVLauncher.Settings;
 using XIVLauncher.Startup;
 using XIVLauncher.Support;
+using XIVLauncher.Update;
 
 namespace XIVLauncher;
 
@@ -53,6 +55,41 @@ public partial class App
         Environment.Exit(exitCode);
     }
 
+    /// <summary>
+    ///     无界面更新入口（<c>--cat-self-update</c>）: 检查、下载并安装启动器更新后退出, 不显示窗口、不重启启动器。
+    ///     由 Cat 工作台在后台调用 —— 自动上号的电脑上没人打开启动器窗口, 界面版启动时的更新检查轮不到。
+    /// </summary>
+    private static async Task RunCatSelfUpdateAsync()
+    {
+        var exitCode = 0;
+
+        try
+        {
+            var args = CatHostMode.CommandLineArgs;
+
+            if (CatHostMode.GetOption(args, "--roamingPath") is { Length: > 0 } roamingPath)
+                Paths.OverrideRoamingPath(roamingPath);
+
+            LogInit.Setup(Path.Combine(Paths.RoamingPath, "output.log"), [.. args]);
+            Log.Information("========================================================");
+            Log.Information("[CatUpdate] 无界面检查启动器更新 (v{Version} - {Hash})", AppUtil.GetAssemblyVersion(), AppUtil.GetGitHash());
+
+            // 更新管理器要靠它认出安装目录; 已下载的更新不在这里自动应用（那会绕过下面的检查并重启出界面）
+            VelopackApp.Build().SetAutoApplyOnStartup(false).Run();
+
+            var outcome = await UpdateOrchestrator.RunSilentAsync().ConfigureAwait(false);
+            Log.Information("[CatUpdate] 结果: {Outcome}", outcome);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[CatUpdate] 无界面更新失败");
+            exitCode = 1;
+        }
+
+        await Log.CloseAndFlushAsync().ConfigureAwait(false);
+        Environment.Exit(exitCode);
+    }
+
     private async Task<int> RunCatHostCoreAsync()
     {
         var args = CatHostMode.CommandLineArgs;
@@ -70,8 +107,12 @@ public partial class App
             CatHostMode.IsSimulate ? " 模拟模式" : string.Empty
         );
 
-        // 运行期间让界面版知道有游戏在由 Cat 运行, 不要应用启动器更新
-        CatHostPresence.Hold();
+        // 运行期间让界面版知道有游戏在由 Cat 运行, 不要应用启动器更新;
+        // 从安装目录之外的副本运行时更新结束不到本进程, 不拦
+        if (CatHostMode.IsDetached)
+            Log.Information("[CatHost] 从安装目录之外的副本运行, 不拦启动器更新: {Directory}", AppContext.BaseDirectory);
+        else
+            CatHostPresence.Hold();
 
         var bootstrapLine = await ReadBootstrapLineAsync().ConfigureAwait(false);
 
