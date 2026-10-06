@@ -53,7 +53,7 @@ public sealed class CatAutoEnterTests
         );
         Assert.Equal
         (
-            ["VERSION", "SKIPMOVIE", "TITLEREADY", "LOGIN", "CHARAS", "FOCUSCHARA 12", "SELECTCHARA 12", "ENTERCHARA 12", "DIALOG YES", "WHOAMI"],
+            ["VERSION", "SKIPMOVIE", "TITLEREADY", "LOGIN", "CHARAS", "FOCUSCHARA 12", "SELECTCHARA 12", "ENTERCHARA 12", "DIALOG YES 12", "WHOAMI"],
             game.Commands.Where(x => x != "LOBBYSTATE")
         );
         Assert.Equal("12", flow.EnteredContentId);
@@ -257,9 +257,155 @@ public sealed class CatAutoEnterTests
         var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
 
         Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
-        Assert.Equal(1, game.Commands.Count(x => x == "DIALOG YES"));
+        Assert.Equal(1, game.Commands.Count(x => x == "DIALOG YES 11"));
         Assert.DoesNotContain("DIALOG NO", game.Commands);
         Assert.DoesNotContain("DIALOG OK", game.Commands);
+    }
+
+    [Fact]
+    public async Task SomeoneClicksAnotherCharacterBeforeTheConfirm_IsNotAnswered_AndStops()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"), Chara("12", "小黑"));
+
+        // 编排点了 11, 确认框出来之前有人在游戏里双击了 12: 现在这个确认框问的是 12
+        game.Intercept = command =>
+        {
+            if (command.StartsWith("ENTERCHARA", StringComparison.Ordinal))
+                game.Hovered = "12";
+
+            return null;
+        };
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:lobbyError", reporter.Entries);
+        Assert.Equal(1, game.Commands.Count(x => x.StartsWith("DIALOG", StringComparison.Ordinal)));
+        Assert.True(game.YesNo);
+        Assert.DoesNotContain(reporter.Entries, x => x.StartsWith("character:", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task SecondPromptAfterTheConfirm_IsNotAnswered_AndStops()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        var ticks       = 0;
+        var confirmedAt = -1;
+
+        // 点了「是」, 确认框关掉, 过一会儿游戏又弹出一个不认识的是/否框
+        game.AfterConfirm = _ => confirmedAt = ticks;
+        game.OnDelay = g =>
+        {
+            if (++ticks == confirmedAt + 2 && confirmedAt >= 0)
+            {
+                g.Text  = "该角色正在其他服务器, 要返回原始服务器吗？";
+                g.YesNo = true;
+            }
+        };
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:lobbyError", reporter.Entries);
+        Assert.Contains(reporter.Messages, x => x.Contains("要返回原始服务器吗", StringComparison.Ordinal));
+        Assert.Equal(1, game.Commands.Count(x => x.StartsWith("DIALOG", StringComparison.Ordinal)));
+        Assert.True(game.YesNo);
+    }
+
+    [Fact]
+    public async Task ConfirmWhoseTextCannotBeRead_IsNeverAnswered()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.ConfirmText = string.Empty;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:timeout", reporter.Entries);
+        Assert.Contains(reporter.Messages, x => x.Contains("读不到确认框的文字", StringComparison.Ordinal));
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("DIALOG", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("FOCUSCHARA")]
+    [InlineData("SELECTCHARA")]
+    [InlineData("ENTERCHARA")]
+    public async Task CallbackThatDidNotTakeEffect_IsNotSentAgain(string step)
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.Intercept = command => command.StartsWith(step, StringComparison.Ordinal) ? "FAIL not-applied" : null;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:moduleUnavailable", reporter.Entries);
+        Assert.Equal(1, game.Commands.Count(x => x.StartsWith(step, StringComparison.Ordinal)));
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("DIALOG", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ClickLandedOnAnotherCharacter_StopsWithoutConfirming()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.Intercept = command => command.StartsWith("ENTERCHARA", StringComparison.Ordinal) ? "FAIL clicked-other selectedIndex=1 hovered=99" : null;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Equal(1, game.Commands.Count(x => x.StartsWith("ENTERCHARA", StringComparison.Ordinal)));
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("DIALOG", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ListWithUnreadableEntries_SingleCharacterIsNotAssumed()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.InvalidEntries = 1;
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("写错的名字", null));
+        var run  = flow.RunAsync(CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("characters:choose:1"));
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("ENTERCHARA", StringComparison.Ordinal));
+
+        Assert.True(flow.SelectCharacter("11").Accepted);
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await run.WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task ListWithOnlyUnreadableEntries_StopsInsteadOfSearchingOtherAreas()
+    {
+        var (game, reporter) = Setup();
+        game.InvalidEntries = 2;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:moduleUnavailable", reporter.Entries);
+        Assert.Empty(game.Switched);
+    }
+
+    [Fact]
+    public async Task SomeoneEntersInGameBeforeTheLobbySwitch_IsNotLoggedOut()
+    {
+        var travelling = Chara("11", "小白", "LaNuoXiYa", "BaiYinXiang", 16);
+        var (game, reporter) = Setup(travelling, Chara("12", "小黑"));
+
+        // 读完角色列表之后、换大厅之前, 有人自己双击 12 进了游戏
+        game.Intercept = command =>
+        {
+            if (command == "CHARAS")
+                game.EnterAfterNextReply = "12";
+
+            return null;
+        };
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.Empty(game.Switched);
+        Assert.DoesNotContain("stage:switchingArea", reporter.Entries);
+        Assert.Contains("character:小黑@LaNuoXiYa", reporter.Entries);
     }
 
     [Fact]
@@ -301,7 +447,7 @@ public sealed class CatAutoEnterTests
         Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
         Assert.True(game.Elapsed > timings.EnterTimeout * 3);
         Assert.DoesNotContain("DIALOG OK", game.Commands);
-        Assert.Equal(1, game.Commands.Count(x => x == "DIALOG YES"));
+        Assert.Equal(1, game.Commands.Count(x => x == "DIALOG YES 11"));
         Assert.Equal
         (
             ["stage:enteringLobby", "characters:auto:1", "stage:enteringWorld", "queue:12", "queue:3", "character:小白@LaNuoXiYa", "stage:inWorld"],
@@ -341,7 +487,7 @@ public sealed class CatAutoEnterTests
         var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
 
         Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
-        Assert.Equal(1, game.Commands.Count(x => x == "DIALOG YES"));
+        Assert.Equal(1, game.Commands.Count(x => x == "DIALOG YES 11"));
     }
 
     [Fact]
@@ -611,6 +757,16 @@ public sealed class CatAutoEnterTests
         Assert.Equal(((CharaSelectReader.Entry?)null, true), CatAutoEnter.Resolve([one, three], new CatAutoEnterTarget("不存在", null), []));
         Assert.Equal(((CharaSelectReader.Entry?)three, false), CatAutoEnter.Resolve([one, three], new CatAutoEnterTarget("不存在", null, "13"), []));
 
+        // 接着上一次进的角色（带 contentId）时它不在列表里: 名字对得上的照登, 但不因为「只剩一个」就登别的角色
+        Assert.Equal(((CharaSelectReader.Entry?)null, true), CatAutoEnter.Resolve([one], new CatAutoEnterTarget("不存在", null, "13"), []));
+        Assert.Equal(((CharaSelectReader.Entry?)null, true), CatAutoEnter.Resolve([one], new CatAutoEnterTarget(null, null, "13"), []));
+        Assert.Equal(((CharaSelectReader.Entry?)one, false), CatAutoEnter.Resolve([one], new CatAutoEnterTarget("小白", null, "13"), []));
+
+        // 列表不完整时不按「只有一个」自动选; 名字对得上的照登
+        Assert.Equal(((CharaSelectReader.Entry?)one, false), CatAutoEnter.Resolve([one], new CatAutoEnterTarget(null, null), []));
+        Assert.Equal(((CharaSelectReader.Entry?)null, true), CatAutoEnter.Resolve([one], new CatAutoEnterTarget(null, null), [], false));
+        Assert.Equal(((CharaSelectReader.Entry?)one, false), CatAutoEnter.Resolve([one], new CatAutoEnterTarget("小白", null), [], false));
+
         // 名字唯一时不看原始服务器（资料里的服务器可能填错）
         Assert.Equal(((CharaSelectReader.Entry?)three, false), CatAutoEnter.Resolve([one, three], new CatAutoEnterTarget("小黑", "HongYuHai"), []));
     }
@@ -653,6 +809,10 @@ public sealed class CatAutoEnterTests
 
         Assert.Null(CatModuleReplies.ParseLobbyState("FAIL mainthread-timeout"));
         Assert.True(CatModuleReplies.IsTransient("FAIL mainthread-timeout"));
+        Assert.True(CatModuleReplies.IsTransient("FAIL not-in-list listWorld=0 world=1042"));
+        Assert.False(CatModuleReplies.IsTransient("FAIL not-applied selectedIndex=0 hovered=0"));
+        Assert.False(CatModuleReplies.IsTransient("FAIL clicked-other selectedIndex=1 hovered=99"));
+        Assert.False(CatModuleReplies.IsTransient("FAIL dialog-open"));
         Assert.False(CatModuleReplies.IsTransient("FAIL exception"));
 
         // 名字带空格（空格分隔）, 以及制表符分隔的写法
@@ -737,6 +897,15 @@ public sealed class CatAutoEnterTests
         /// <summary>点了登录确认框的「是」之后发生什么; 不设就是直接进游戏</summary>
         public Action<FakeAutoEnterGame>? AfterConfirm { get; set; }
 
+        /// <summary>客户端现在选中的角色; 不设就是编排点的那个（设了表示有人在游戏里点了别的角色）</summary>
+        public string? Hovered { get; set; }
+
+        /// <summary>点角色后弹出的确认框文字</summary>
+        public string ConfirmText { get; set; } = "要以该角色登录吗？";
+
+        /// <summary>CHARAS 首行报的读不准的条目数</summary>
+        public int InvalidEntries { get; set; }
+
         /// <summary>每等一次调一次</summary>
         public Action<FakeAutoEnterGame>? OnDelay { get; set; }
 
@@ -806,6 +975,9 @@ public sealed class CatAutoEnterTests
             await Task.Delay(1, cancellationToken);
         }
 
+        /// <summary>下一条命令答完之后, 这个角色（contentId）被人手动登进了游戏</summary>
+        public string? EnterAfterNextReply { get; set; }
+
         public Task<string> SendAsync(string command, CancellationToken cancellationToken)
         {
             if (HasExited)
@@ -814,7 +986,15 @@ public sealed class CatAutoEnterTests
             lock (Commands)
                 Commands.Add(command);
 
-            return Task.FromResult(Intercept?.Invoke(command) ?? Reply(command));
+            var reply = Intercept?.Invoke(command) ?? Reply(command);
+
+            if (EnterAfterNextReply is { } entering)
+            {
+                EnterAfterNextReply = null;
+                EnterWorld(entering);
+            }
+
+            return Task.FromResult(reply);
         }
 
         private string Reply(string command)
@@ -843,22 +1023,8 @@ public sealed class CatAutoEnterTests
                     return "OK";
 
                 case "CHARAS":
-                    return $"OK where={Where} source=dc n={list.Count} total={list.Count} selected=0 selectedIndex=-1 hovered=0 hoveredIndex=-1" +
+                    return $"OK where={Where} source=dc n={list.Count} total={list.Count} selected=0 selectedIndex=-1 hovered=0 hoveredIndex=-1 skipped={InvalidEntries} invalid={InvalidEntries}" +
                            string.Concat(list.Select(x => $"\nC\t{x.ContentId}\t{x.Index}\t{x.LoginFlags}\t{x.CurrentWorldId}\t{x.HomeWorldId}\t{x.Name}\t{x.CurrentWorldCode}\t{x.HomeWorldCode}"));
-
-                case "DIALOG YES":
-                    if (!YesNo)
-                        return "FAIL no-dialog";
-
-                    YesNo = false;
-                    Text  = string.Empty;
-
-                    if (AfterConfirm != null)
-                        AfterConfirm(this);
-                    else
-                        EnterWorld(pending!);
-
-                    return "OK clicked addon=SelectYesno";
 
                 case "WHOAMI":
                     CharaSelectReader.Entry? current;
@@ -877,6 +1043,24 @@ public sealed class CatAutoEnterTests
 
             switch (parts[0])
             {
+                case "DIALOG" when parts.Length == 2 && parts[1].StartsWith("YES ", StringComparison.Ordinal):
+                    if (!YesNo)
+                        return "FAIL no-dialog";
+
+                    // 模块在点的那一刻自己核对: 客户端选中的不是指定的角色就不点
+                    if (parts[1][4..] != (Hovered ?? pending))
+                        return "FAIL other-character";
+
+                    YesNo = false;
+                    Text  = string.Empty;
+
+                    if (AfterConfirm != null)
+                        AfterConfirm(this);
+                    else
+                        EnterWorld(pending!);
+
+                    return "OK clicked addon=SelectYesno";
+
                 case "FOCUSCHARA":
                     return entry == null ? "FAIL not-in-list" : $"OK world={entry.CurrentWorldId}";
 
@@ -891,7 +1075,7 @@ public sealed class CatAutoEnterTests
 
                     if (ShowConfirm)
                     {
-                        Text  = "要以该角色登录吗？";
+                        Text  = ConfirmText;
                         YesNo = true;
                     }
 

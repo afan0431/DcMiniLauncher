@@ -975,6 +975,7 @@ namespace
         char               name[offsets::CHARA_ENTRY_NAME_LEN + 1];
         char               currentWorldName[offsets::CHARA_ENTRY_NAME_LEN + 1];
         char               homeWorldName[offsets::CHARA_ENTRY_NAME_LEN + 1];
+        unsigned           clickFlags; // 只有自动选角的命令填（大区角色条目 +0x74C）
     };
 
     struct WhoListData
@@ -1219,7 +1220,8 @@ namespace
         return true;
     }
 
-    // 把一个角色条目读成一行。CharaSelectCharacterEntry 与 LobbyUIClientCharacterEntry 前部字段偏移相同, 共用
+    // 把一个大区角色条目（LobbyUIClientCharacterEntry, 0x758 字节）读成一行。
+    // 当前服务器列表里的指针指向的也是这种条目（见 FindListCharacter）, 调用方已核对过指针落在大区角色列表里
     bool ReadCharaRow(uint8_t* entry, CharaRow* row)
     {
         row->contentId      = ReadAt<unsigned long long>(entry, offsets::CHARA_ENTRY_CONTENT_ID);
@@ -1227,6 +1229,7 @@ namespace
         row->loginFlags     = ReadAt<unsigned char>(entry, offsets::CHARA_ENTRY_LOGIN_FLAGS);
         row->currentWorldId = ReadAt<unsigned short>(entry, offsets::CHARA_ENTRY_CURRENT_WORLD);
         row->homeWorldId    = ReadAt<unsigned short>(entry, offsets::CHARA_ENTRY_HOME_WORLD);
+        row->clickFlags     = ReadAt<unsigned>(entry, offsets::DC_CHARA_ENTRY_CLICK_FLAGS);
 
         if (row->contentId == 0)
             return false;
@@ -1293,13 +1296,33 @@ namespace
         return found;
     }
 
-    // 在当前显示的角色列表（CharaSelectEntries, 元素是指针）里找角色; position = 它在向量里的位置
+    // 指针是不是正好指着大区角色列表里的某个条目
+    bool PointsIntoDcCharacters(const uint8_t* entry, const uint8_t* dcFirst, int dcCount)
+    {
+        if (dcFirst == nullptr || entry < dcFirst)
+            return false;
+
+        const auto offset = static_cast<size_t>(entry - dcFirst);
+
+        return offset < static_cast<size_t>(dcCount) * offsets::DC_CHARA_ENTRY_SIZE && offset % offsets::DC_CHARA_ENTRY_SIZE == 0;
+    }
+
+    // 在当前显示的角色列表（CharaSelectEntries, 元素是指针）里找角色; position = 它在向量里的位置。
+    // 客户端按回调里的序号取角色时用的就是这个位置（本机 exe RVA 0x4AF110: 列表[序号], 不看条目自己的 Index 字段）。
+    // 列表里放的是大区角色列表（CurrentDataCenterCharacters）里条目的地址（RVA 0x4AE770）:
+    // 指针不落在那个向量的元素边界上, 说明这份列表是旧的或者读歪了, 一律不用。
     int FindListCharacter(uint8_t* lobby, const char* name, unsigned long long contentId, CharaRow* out, int* position)
     {
         uint8_t*  first = nullptr;
         const int count = VectorCount(lobby + offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES, sizeof(void*),
                                       offsets::LOBBY_MAX_CHARACTERS, &first);
         if (count < 0)
+            return FIND_BAD_LIST;
+
+        uint8_t*  dcFirst = nullptr;
+        const int dcCount = VectorCount(lobby + offsets::AGENT_LOBBY_DC_CHARACTERS, offsets::DC_CHARA_ENTRY_SIZE,
+                                        offsets::LOBBY_MAX_CHARACTERS, &dcFirst);
+        if (dcCount < 0)
             return FIND_BAD_LIST;
 
         int found = 0;
@@ -1311,8 +1334,11 @@ namespace
             if (entry == nullptr)
                 continue;
 
+            if (!PointsIntoDcCharacters(entry, dcFirst, dcCount))
+                return FIND_BAD_ENTRY;
+
             CharaRow row;
-            if (!PlausiblePointer(entry) || !ReadCharaRow(entry, &row))
+            if (!ReadCharaRow(entry, &row))
                 return FIND_BAD_ENTRY;
 
             if (!RowMatches(&row, name, contentId))
@@ -1321,11 +1347,69 @@ namespace
             if (++found > 1)
                 return FIND_AMBIGUOUS;
 
+            // 客户端自己不认的条目（已删除 / ContentId 镜像对不上）按序号取不出来, 发了回调也选不中
+            if (!DcEntryUsable(entry))
+                return FIND_BAD_ENTRY;
+
             *out      = row;
             *position = i;
         }
 
         return found;
+    }
+
+    // 客户端处理选角回调时, 先按 WorldIndex 在大区服务器表里取服务器, 再取那个服务器的角色列表。
+    // 这里要求三处记的是同一个服务器: 服务器表[WorldIndex]、WorldId、存着的角色列表所属的服务器 ——
+    // 对不上时列表里的位置对回调没有意义（客户端会当场重建列表）。
+    bool ListBelongsToCurrentWorld(uint8_t* lobby, unsigned short* world, unsigned short* listWorld)
+    {
+        *world     = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_WORLD_ID);
+        *listWorld = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES_WORLD);
+
+        if (*world == 0 || *listWorld != *world)
+            return false;
+
+        uint8_t*  worlds     = nullptr;
+        const int worldCount = VectorCount(lobby + offsets::AGENT_LOBBY_DC_WORLDS, offsets::DC_WORLD_ENTRY_SIZE,
+                                           offsets::LOBBY_MAX_WORLDS, &worlds);
+        const int worldIndex = ReadAt<short>(lobby, offsets::AGENT_LOBBY_WORLD_INDEX);
+
+        if (worldCount <= 0 || worldIndex < 0 || worldIndex >= worldCount)
+            return false;
+
+        return ReadAt<unsigned short>(worlds + static_cast<size_t>(worldIndex) * offsets::DC_WORLD_ENTRY_SIZE,
+                                      offsets::DC_WORLD_ENTRY_ID) == *world;
+    }
+
+    // 登录确认框答「是」时（回调类别 3, 本机 exe RVA 0x4E2D11）客户端登录的是「当前服务器角色列表[SelectedCharacterIndex]」——
+    // 答的那一刻按 WorldIndex 和序号现取, 不是点角色时记下来的。这里按同样的办法取一遍, 返回它的 ContentId; 取不出来返回 0。
+    unsigned long long ContentIdAboutToLogin(uint8_t* lobby)
+    {
+        unsigned short world     = 0;
+        unsigned short listWorld = 0;
+
+        if (!ListBelongsToCurrentWorld(lobby, &world, &listWorld))
+            return 0;
+
+        uint8_t*  first = nullptr;
+        const int count = VectorCount(lobby + offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES, sizeof(void*),
+                                      offsets::LOBBY_MAX_CHARACTERS, &first);
+
+        uint8_t*  dcFirst = nullptr;
+        const int dcCount = VectorCount(lobby + offsets::AGENT_LOBBY_DC_CHARACTERS, offsets::DC_CHARA_ENTRY_SIZE,
+                                        offsets::LOBBY_MAX_CHARACTERS, &dcFirst);
+
+        const int index = ReadAt<signed char>(lobby, offsets::AGENT_LOBBY_SELECTED_CHARA_INDEX);
+
+        if (count <= 0 || dcCount <= 0 || index < 0 || index >= count)
+            return 0;
+
+        const auto entry = ReadAt<uint8_t*>(first, static_cast<uintptr_t>(index) * sizeof(void*));
+
+        if (!PointsIntoDcCharacters(entry, dcFirst, dcCount) || !DcEntryUsable(entry))
+            return 0;
+
+        return ReadAt<unsigned long long>(entry, offsets::CHARA_ENTRY_CONTENT_ID);
     }
 
     void* FindAddon(const Pointers* p, const char* name)
@@ -1335,6 +1419,13 @@ namespace
 
         const auto addon = reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(p->unitManager, name, 1);
         return PlausiblePointer(addon) ? addon : nullptr;
+    }
+
+    // 选角界面上开着是/否框、确定框或错误框: 有人（或客户端自己）正在处理别的事, 切服务器、选角色、点角色都不该插进去
+    bool AnyLobbyDialog(const Pointers* p)
+    {
+        return FindAddon(p, "SelectYesno") != nullptr || FindAddon(p, "SelectOk") != nullptr ||
+               FindAddon(p, "Dialogue") != nullptr;
     }
 
     // AtkValue{ Int }: +0 Type(u32)=3, +8 值
@@ -1484,6 +1575,7 @@ namespace
         unsigned           uiStage;
         int                queue;
         unsigned           dialogId;
+        unsigned           listWorld;
         int                loading;
         DialogInfo         yesno;
         DialogInfo         ok;
@@ -1508,6 +1600,7 @@ namespace
             out->uiStage       = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_UI_STAGE);
             out->queue         = ReadAt<int>(lobby, offsets::AGENT_LOBBY_QUEUE_POSITION);
             out->dialogId      = ReadAt<unsigned>(lobby, offsets::AGENT_LOBBY_DIALOG_ADDON_ID);
+            out->listWorld     = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES_WORLD);
 
             ReadDialog(p, "SelectYesno", true,  &out->yesno);
             ReadDialog(p, "SelectOk",    true,  &out->ok);
@@ -1565,8 +1658,15 @@ namespace
     }
 
     // 返回: 1=点了 SelectYesno 2=点了 SelectOk 3=点了 Dialogue 0=没有对应的对话框
-    //       -1=异常 -2=那是排队提示, 不点 -3=在游戏里, 不点 -4=Dialogue 的确定按钮找不到
-    int OpDialog(const Pointers* p, int action)
+    //       -1=异常 -2=那是大厅自己开的确定框（排队提示）, 不点 -3=在游戏里, 不点 -4=Dialogue 的确定按钮找不到
+    //       -5=不在选角界面（是/否框只在那里点） -6=是/否框不是大厅为登录开的那个 -7=登录请求已经发出（这时的是/否框是在问要不要取消登录）
+    //       -8=答「是」会登录的不是指定的角色 -9=是/否框还没就绪
+    //
+    // 「是」等于替人确认登录, 所以它的全部前提在这同一次主线程执行里现查, 不信启动器上一次读到的状态:
+    //   在选角界面; 是/否框是大厅自己开的那个（AgentLobby.DialogAddonId, 点角色的处理函数 RVA 0x4D4C80 把登录确认框的 id 写在那里）;
+    //   登录请求还没发出（TemporaryLocked 为 0; 确认登录时客户端把它置 1, 之后出现的是/否框是取消登录的确认）;
+    //   客户端这时会登录的角色（当前服务器角色列表[SelectedCharacterIndex], 见 ContentIdAboutToLogin）就是启动器要登录的那个。
+    int OpDialog(const Pointers* p, int action, unsigned long long expectedContentId)
     {
         const int where = OpWhere(p);
 
@@ -1577,13 +1677,34 @@ namespace
                 return -3;
 
             const auto fireInt = reinterpret_cast<FireCallbackIntFn>(g_fireCallbackInt);
+            const auto lobby   = reinterpret_cast<uint8_t*>(p->agentLobby);
 
             if (action == DIALOG_YES || action == DIALOG_NO)
             {
+                if (where != 2)
+                    return -5;
+
                 const auto yesno = FindAddon(p, "SelectYesno");
 
                 if (yesno == nullptr)
                     return 0;
+
+                if (((ReadAt<unsigned char>(yesno, offsets::ATK_UNIT_BASE_FLAGS1A1) >> offsets::ATK_UNIT_BASE_READY_BIT) & 1) == 0)
+                    return -9;
+
+                if (action == DIALOG_YES)
+                {
+                    const auto dialogId = ReadAt<unsigned>(lobby, offsets::AGENT_LOBBY_DIALOG_ADDON_ID);
+
+                    if (dialogId == 0 || dialogId != ReadAt<unsigned short>(yesno, offsets::ATK_UNIT_BASE_ID))
+                        return -6;
+
+                    if (ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_TEMPORARY_LOCKED) != 0)
+                        return -7;
+
+                    if (ContentIdAboutToLogin(lobby) != expectedContentId)
+                        return -8;
+                }
 
                 fireInt(yesno, action == DIALOG_YES ? offsets::SELECT_YESNO_YES : offsets::SELECT_YESNO_NO);
                 return 1;
@@ -1623,12 +1744,12 @@ namespace
             if (ok == nullptr)
                 return 0;
 
-            // 排队提示也是 SelectOk: 是大厅自己开的那个框（DialogAddonId 对得上）且有排队名次时, 点它等于取消排队
-            const auto lobby    = reinterpret_cast<uint8_t*>(p->agentLobby);
+            // 排队提示也是 SelectOk, 点它等于取消排队。大厅自己开的那个框（DialogAddonId 对得上）一律不点 ——
+            // 名次读不到（还没下发、或偏移不对）时它照样是排队框; 有排队名次时不管是哪个框也不点
             const auto dialogId = ReadAt<unsigned>(lobby, offsets::AGENT_LOBBY_DIALOG_ADDON_ID);
             const auto queue    = ReadAt<int>(lobby, offsets::AGENT_LOBBY_QUEUE_POSITION);
 
-            if (dialogId != 0 && dialogId == ReadAt<unsigned short>(ok, offsets::ATK_UNIT_BASE_ID) && queue > 0)
+            if ((dialogId != 0 && dialogId == ReadAt<unsigned short>(ok, offsets::ATK_UNIT_BASE_ID)) || queue > 0)
                 return -2;
 
             fireInt(ok, offsets::SELECT_OK_OK);
@@ -1650,7 +1771,8 @@ namespace
         int                badIndex;
         int                total;   // 向量里一共几个
         int                count;   // 拷出几个
-        int                skipped; // 客户端自己不认的条目（已删除 / ContentId 镜像对不上）
+        int                skipped; // 客户端自己不认的条目（空位 / 已删除 / ContentId 镜像对不上）
+        int                invalid; // skipped 里 ContentId 不为 0 的那些: 不是空位, 是已删除或读歪了
         int                selectedIndex;
         int                hoveredIndex;
         unsigned long long selectedContentId;
@@ -1690,6 +1812,10 @@ namespace
                 if (!DcEntryUsable(entry))
                 {
                     ++out->skipped;
+
+                    if (ReadAt<unsigned long long>(entry, offsets::CHARA_ENTRY_CONTENT_ID) != 0)
+                        ++out->invalid;
+
                     continue;
                 }
 
@@ -1715,9 +1841,9 @@ namespace
     void AppendCharaLine(std::string& response, const CharaRow& row)
     {
         char line[256];
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "\nC\t%llu\t%u\t%u\t%u\t%u\t%s\t%s\t%s",
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "\nC\t%llu\t%u\t%u\t%u\t%u\t%s\t%s\t%s\t%u",
                     row.contentId, row.index, row.loginFlags, row.currentWorldId, row.homeWorldId,
-                    row.name, row.currentWorldName, row.homeWorldName);
+                    row.name, row.currentWorldName, row.homeWorldName, row.clickFlags);
         response += line;
     }
 
@@ -1729,6 +1855,7 @@ namespace
     {
         int            status; // 2=已切换 1=本来就是 0=大区里没这个角色（或列表还没载入） -1=异常 -2=服务器列表不在
                                // -3=目标服务器不在本大区 -4=不在选角界面 -5=列表读歪 -6=同名不止一个 -7=发了回调但没切过去
+                               // -8=界面上开着对话框
         unsigned short targetWorld;
         unsigned short beforeWorld;
         unsigned short afterWorld;
@@ -1803,6 +1930,12 @@ namespace
                 return;
             }
 
+            if (AnyLobbyDialog(p))
+            {
+                out->status = -8;
+                return;
+            }
+
             const int values[3] = {offsets::LOBBY_EVENT_SELECT_WORLD, 0, out->slot};
             FireInts(addon, values, 3);
 
@@ -1821,8 +1954,10 @@ namespace
     struct CharaActionResult
     {
         int                status; // 1=成功 0=当前列表里没这个角色 -1=异常 -2=不在选角界面 -3=列表读歪 -4=同名不止一个
-                                   // -5=向量位置与条目序号不一致 -6=发了回调但没选中 -7=暂时锁定 -8=角色带不可登录标志
-                                   // -9=存着的角色列表不是当前服务器的
+                                   // -6=发了选中回调但客户端选中的不是它 -7=暂时锁定 -8=角色带不可登录标志
+                                   // -9=存着的角色列表不是当前服务器的 -10=点击之后客户端选中的不是它 -11=界面上开着对话框
+                                   // -12=点这个角色会先弹别的是/否框（不是登录确认框）
+        unsigned           clickFlags;
         unsigned short     world;
         unsigned short     listWorld;
         int                position;
@@ -1833,7 +1968,15 @@ namespace
         unsigned long long hovered;
     };
 
-    // enter=false: 只高亮（21, 序号）并回读确认; enter=true: 左键点击（29, 0, 序号）, 之后客户端弹登录确认框
+    // enter=false: 只高亮（21, 序号）并回读确认;
+    // enter=true:  先高亮并回读确认, 再左键点击（29, 0, 序号）并再回读一次, 之后客户端弹登录确认框。
+    // 全部检查、两条回调、两次回读都在这同一次主线程执行里, 中间没有别的帧, 列表不会在检查和点击之间变掉。
+    //
+    // 序号口径（本机 exe 静态核对）: 回调 21 / 29 里的序号是「当前服务器角色列表」这个向量里的位置 ——
+    //   客户端按 WorldIndex 取服务器、取它的列表、直接取 列表[序号]（RVA 0x4E19B2 / 0x4DFD40 / 0x4D4C80 / 0x4AF110）,
+    //   条目自己的 Index 字段（+0x10）不参与, 所以这里也不拿它做判断, 只带回去记日志。
+    // 回读: 客户端取到 列表[序号] 后把它的 ContentId 写进 HoveredCharacterContentId（21 与 29 都写）,
+    //   读回来等于要找的角色, 就证明客户端选中的确实是它; 不等就绝不往下点。
     void OpCharaAction(const Pointers* p, const char* name, unsigned long long contentId, bool enter, CharaActionResult* out)
     {
         memset(out, 0, sizeof(CharaActionResult));
@@ -1851,13 +1994,16 @@ namespace
                 return;
             }
 
+            if (AnyLobbyDialog(p))
+            {
+                out->status = -11;
+                return;
+            }
+
             const auto lobby = reinterpret_cast<uint8_t*>(p->agentLobby);
 
             // 角色列表是按服务器现建现存的一份; 存着的不是当前服务器那份时, 里面的位置对回调没有意义
-            out->world     = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_WORLD_ID);
-            out->listWorld = ReadAt<unsigned short>(lobby, offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES_WORLD);
-
-            if (out->listWorld != out->world)
+            if (!ListBelongsToCurrentWorld(lobby, &out->world, &out->listWorld))
             {
                 out->status = -9;
                 return;
@@ -1875,13 +2021,7 @@ namespace
             out->contentId  = row.contentId;
             out->entryIndex = row.index;
             out->loginFlags = row.loginFlags;
-
-            // 回调里的序号是客户端按「当前服务器的角色表」取的; 向量位置与条目自己记的序号对不上就不敢发
-            if (out->position != out->entryIndex)
-            {
-                out->status = -5;
-                return;
-            }
+            out->clickFlags = row.clickFlags;
 
             if (enter)
             {
@@ -1897,19 +2037,37 @@ namespace
                     return;
                 }
 
-                const int values[3] = {offsets::LOBBY_EVENT_CLICK_CHARA, 0, out->position};
-                FireInts(addon, values, 3);
+                if ((row.clickFlags & offsets::DC_CHARA_ENTRY_CLICK_PROMPT_MASK) != 0)
+                {
+                    out->status = -12;
+                    return;
+                }
+            }
 
+            const int select[2] = {offsets::LOBBY_EVENT_SELECT_CHARA, out->position};
+            FireInts(addon, select, 2);
+
+            out->selectedIndex = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_SELECTED_CHARA_INDEX);
+            out->hovered       = ReadAt<unsigned long long>(lobby, offsets::AGENT_LOBBY_HOVERED_CONTENT_ID);
+
+            if (out->selectedIndex != out->position || out->hovered != row.contentId)
+            {
+                out->status = -6;
+                return;
+            }
+
+            if (!enter)
+            {
                 out->status = 1;
                 return;
             }
 
-            const int values[2] = {offsets::LOBBY_EVENT_SELECT_CHARA, out->position};
-            FireInts(addon, values, 2);
+            const int click[3] = {offsets::LOBBY_EVENT_CLICK_CHARA, 0, out->position};
+            FireInts(addon, click, 3);
 
             out->selectedIndex = ReadAt<unsigned char>(lobby, offsets::AGENT_LOBBY_SELECTED_CHARA_INDEX);
             out->hovered       = ReadAt<unsigned long long>(lobby, offsets::AGENT_LOBBY_HOVERED_CONTENT_ID);
-            out->status        = out->selectedIndex == out->position && out->hovered == row.contentId ? 1 : -6;
+            out->status        = out->selectedIndex == out->position && out->hovered == row.contentId ? 1 : -10;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -2081,10 +2239,6 @@ namespace
             case -2: return "FAIL not-charaselect";
             case -3: return "FAIL bad-list";
             case -4: return "FAIL ambiguous";       // 同名不止一个, 改用 ContentId
-            case -5:
-                _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL index-mismatch position=%d index=%d",
-                            result->position, result->entryIndex);
-                return response;
             case -6:
                 _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL not-applied selectedIndex=%d hovered=%llu",
                             result->selectedIndex, result->hovered);
@@ -2092,6 +2246,15 @@ namespace
             case -7: return "FAIL locked";
             case -8:
                 _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL flags=%u", result->loginFlags);
+                return response;
+            case -10:
+                // 已经点了, 但客户端选中的不是要找的角色: 调用方绝不能再去点登录确认框
+                _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL clicked-other selectedIndex=%d hovered=%llu",
+                            result->selectedIndex, result->hovered);
+                return response;
+            case -11: return "FAIL dialog-open";    // 有人（或客户端）正在处理对话框, 不插手
+            case -12:
+                _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL special-prompt flags74c=%u", result->clickFlags);
                 return response;
             default: return "FAIL exception";
         }
@@ -2101,7 +2264,7 @@ namespace
 // 响应: 第一行
 //   OK where=<ingame|charaselect|title|busy> world=<WorldId> worldIndex=<n> selectedIndex=<n> hovered=<cid> locked=<0|1>
 //      stage=<LobbyUpdateStage> uiStage=<LobbyUIStage> queue=<QueuePosition> dialogId=<DialogAddonId>
-//      yesno=<0|1> ok=<0|1> dialogue=<0|1> loading=<0|1>
+//      yesno=<0|1> ok=<0|1> dialogue=<0|1> loading=<0|1> listWorld=<存着的角色列表属于哪个服务器>
 // 有对话框时, 每个在场的对话框一行（字段用 \t 分隔）:
 //   D  <SelectYesno|SelectOk|Dialogue>  <addon id>  <ready 0|1>  <visible 0|1>  <提示文字>
 // 最后一行 `T <提示文字>` 是其中最该看的那个: 是/否框优先, 其次错误框, 最后确定框。提示文字里的换行已换成空格。
@@ -2128,10 +2291,10 @@ std::string GameLobbyState()
     char header[400];
     _snprintf_s(header, sizeof(header), _TRUNCATE,
                 "OK where=%s world=%u worldIndex=%d selectedIndex=%d hovered=%llu locked=%d stage=%u uiStage=%u "
-                "queue=%d dialogId=%u yesno=%d ok=%d dialogue=%d loading=%d",
+                "queue=%d dialogId=%u yesno=%d ok=%d dialogue=%d loading=%d listWorld=%u",
                 WhereName(data->where), data->world, data->worldIndex, data->selectedIndex, data->hovered, data->locked,
                 data->updateStage, data->uiStage, data->queue, data->dialogId,
-                data->yesno.present, data->ok.present, data->dialogue.present, data->loading);
+                data->yesno.present, data->ok.present, data->dialogue.present, data->loading, data->listWorld);
 
     std::string response = header;
 
@@ -2152,9 +2315,11 @@ std::string GameLobbyState()
     return response;
 }
 
-// 整个大区的角色（CurrentDataCenterCharacters）。响应与 WHOLIST 同格式, 第一行多 source=dc 与 skipped:
-//   OK where=charaselect n=3 total=3 selected=<cid> selectedIndex=0 hovered=<cid> hoveredIndex=-1 source=dc skipped=0
-//   C  <contentId>  <index>  <loginFlags>  <curWorldId>  <homeWorldId>  <名字>  <当前世界名>  <原始世界名>
+// 整个大区的角色（CurrentDataCenterCharacters）。响应与 WHOLIST 同格式, 第一行多 source=dc、skipped、invalid:
+//   OK where=charaselect n=3 total=3 selected=<cid> selectedIndex=0 hovered=<cid> hoveredIndex=-1 source=dc skipped=0 invalid=0
+// skipped = 没列出来的条目数（空位、已删除、ContentId 镜像对不上）; invalid = 其中 ContentId 不为 0 的 ——
+// invalid 不为 0 时这份列表不能当作「这个号的全部角色」来用。列不全（回应放不下）时整条回 FAIL too-large, 不给半张表。
+//   C  <contentId>  <index>  <loginFlags>  <curWorldId>  <homeWorldId>  <名字>  <当前世界名>  <原始世界名>  <条目 +0x74C 的标志>
 // 与 WHOLIST 一样只在选角界面可信, 所以同时回 where。
 std::string GameCharas()
 {
@@ -2190,13 +2355,18 @@ std::string GameCharas()
     for (; listed < data->count && body.size() < 7600; ++listed)
         AppendCharaLine(body, data->rows[listed]);
 
+    // 半张表会让启动器把「号里有好几个角色」看成「只有一个」, 宁可整条失败
+    if (listed < data->count)
+        return "FAIL too-large";
+
     char header[320];
     _snprintf_s(header, sizeof(header), _TRUNCATE,
-                "OK where=%s n=%d total=%d selected=%llu selectedIndex=%d hovered=%llu hoveredIndex=%d source=dc skipped=%d",
+                "OK where=%s n=%d total=%d selected=%llu selectedIndex=%d hovered=%llu hoveredIndex=%d source=dc skipped=%d invalid=%d",
                 WhereName(data->where), listed, data->total, data->selectedContentId, data->selectedIndex,
-                data->hoveredContentId, data->hoveredIndex, data->skipped);
+                data->hoveredContentId, data->hoveredIndex, data->skipped, data->invalid);
 
-    LogF("[game] CHARAS where=%s n=%d/%d skipped=%d", WhereName(data->where), listed, data->total, data->skipped);
+    LogF("[game] CHARAS where=%s n=%d/%d skipped=%d invalid=%d", WhereName(data->where), listed, data->total, data->skipped,
+         data->invalid);
     return header + body;
 }
 
@@ -2287,6 +2457,7 @@ std::string GameFocusCharacter(const std::string& who)
             _snprintf_s(response, sizeof(response), _TRUNCATE, "FAIL not-applied world=%u target=%u", result->afterWorld,
                         result->targetWorld);
             return response;
+        case -8: return "FAIL dialog-open";       // 有人（或客户端）正在处理对话框, 不插手
         default: return "FAIL exception";
     }
 }
@@ -2303,13 +2474,21 @@ std::string GameEnterCharacter(const std::string& who)
     return RunCharaAction(who, true);
 }
 
-// button: "YES" / "NO" 点是/否框; "OK" 点错误框或确定框（排队提示不点）
-std::string GameDialog(const std::string& button)
+// arguments: "YES <contentId>" 点登录确认框的「是」（contentId = 要登录的角色, 客户端选中的不是它就不点）;
+//            "NO" 点是/否框的「否」; "OK" 点错误框或确定框（大厅自己开的确定框即排队提示不点）
+std::string GameDialog(const std::string& arguments)
 {
+    const auto space  = arguments.find(' ');
+    const auto button = arguments.substr(0, space);
+    const auto extra  = space == std::string::npos ? std::string() : arguments.substr(space + 1);
+
     const int action = button == "YES" ? DIALOG_YES : button == "NO" ? DIALOG_NO : button == "OK" ? DIALOG_OK : -1;
 
-    if (action < 0)
-        return "FAIL usage: DIALOG <YES|NO|OK>";
+    // 「是」必须说明是替哪个角色确认; 其余两个不带参数
+    const auto expected = action == DIALOG_YES && !extra.empty() ? ParseContentId(extra) : 0ULL;
+
+    if (action < 0 || (action == DIALOG_YES ? expected == 0 : !extra.empty()))
+        return "FAIL usage: DIALOG <YES <contentId>|NO|OK>";
 
     CallStatePtr state;
     std::string  failure;
@@ -2319,10 +2498,10 @@ std::string GameDialog(const std::string& button)
 
     auto captured = state;
 
-    if (!MainThreadRun([captured, action] { captured->result = OpDialog(&captured->pointers, action); }, 3000))
+    if (!MainThreadRun([captured, action, expected] { captured->result = OpDialog(&captured->pointers, action, expected); }, 3000))
         return "FAIL mainthread-timeout";
 
-    LogF("[game] DIALOG %s → %d", button.c_str(), state->result);
+    LogF("[game] DIALOG %s → %d", arguments.c_str(), state->result);
 
     switch (state->result)
     {
@@ -2333,6 +2512,11 @@ std::string GameDialog(const std::string& button)
         case -2: return "FAIL queueing";
         case -3: return "FAIL ingame";
         case -4: return "FAIL no-button";
+        case -5: return "FAIL not-charaselect";
+        case -6: return "FAIL not-login-confirm";   // 是/否框不是大厅为登录开的那个
+        case -7: return "FAIL login-requested";     // 登录请求已发出, 这时的是/否框是在问要不要取消登录
+        case -8: return "FAIL other-character";     // 客户端选中的不是指定的角色（有人点了别的角色）
+        case -9: return "FAIL not-ready";           // 框还在打开, 稍后再试
         default: return "FAIL exception";
     }
 }

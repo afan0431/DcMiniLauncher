@@ -151,9 +151,20 @@ namespace offsets
     inline constexpr int LOBBY_EVENT_SELECT_WORLD = 25;  // _CharaSelectWorldServer ← (25, 0, 服务器下标)
     inline constexpr int LOBBY_EVENT_CLICK_CHARA  = 29;  // _CharaSelectListMenu ← (29, 0, 序号): 左键点击, 弹登录确认框
 
-    // LoginFlags (AgentLobby.cs:156): Locked=1 / NameChangeRequired=2 / MissingExVersionForLogin=4,
-    // 带其中任何一位的角色点了也进不去, ENTERCHARA 直接拒绝
-    inline constexpr unsigned char LOGIN_FLAG_BLOCKING_MASK = 7;
+    // LoginFlags (AgentLobby.cs:156): Locked=1 / NameChangeRequired=2 / MissingExVersionForLogin=4 / (8 未命名) / DCTraveling=16 / Unk32=32。
+    // 静态（本机 exe, 点角色的处理函数 RVA 0x4D4C80 按这几位分流, 掩码取自 .rdata）:
+    //   1 → 什么都不做; 8 → RVA 0x4DDB50; 32 → RVA 0x4DEA50; 2 → 改名相关的提示; 只有这些位都没有时才走到登录确认框。
+    //   16（超域中, 人就在这个大区）照常走登录确认框。
+    // 所以除 16 之外带任何一位的角色, ENTERCHARA 一律拒绝 —— 点下去弹出来的不是登录确认框。实机核对: 否
+    inline constexpr unsigned char LOGIN_FLAG_BLOCKING_MASK = 0xFF & ~LOGIN_FLAG_DC_TRAVELING;
+
+    // 大区角色条目 +0x74C 的一组标志（CS 没有这个字段, 含义不明）。
+    // 静态（RVA 0x4D4F22 / 0x4D5015）: bit0 置位时点角色先弹 Lobby 表第 76 行的是/否框（回调类别 16）;
+    //   bit2 置位时先弹第 629 行的是/否框（回调类别 2, 答「是」之后才轮到登录确认框）;
+    //   都没有才直接弹登录确认框（Lobby 表第 25 / 95 / 96 行, 回调类别 3, RVA 0x4DD870）。
+    // 那两种是/否框在问什么不知道, 所以带这两位的角色 ENTERCHARA 也拒绝, 交给人点。实机核对: 否
+    inline constexpr uintptr_t DC_CHARA_ENTRY_CLICK_FLAGS       = 0x74C;  // uint
+    inline constexpr unsigned  DC_CHARA_ENTRY_CLICK_PROMPT_MASK = 0x5;
 
     // ---- PlayerState（Client/Game/UI/PlayerState.cs）-----------------------
     // [StaticAddress(..., 3)] 直接是结构体地址（不是指针）。

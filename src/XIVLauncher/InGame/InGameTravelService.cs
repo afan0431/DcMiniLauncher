@@ -240,7 +240,8 @@ public sealed class InGameTravelService(DCTravelClient client)
             string.IsNullOrWhiteSpace(targetArea.AreaGM))
             return InGameTravelResult.Failed($"大区 {targetArea.AreaName} 缺少主机名信息");
 
-        return await TravelOnModuleAsync(module, gameProcessId, targetArea, _ => Task.FromResult<string?>(null), null, progress, cancellationToken)
+        // 编排只在选角界面换大厅; 角色已经在游戏里说明有人自己进去了, 这时不替他登出
+        return await TravelOnModuleAsync(module, gameProcessId, targetArea, _ => Task.FromResult<string?>(null), null, progress, cancellationToken, false)
                    .ConfigureAwait(false);
     }
 
@@ -320,7 +321,8 @@ public sealed class InGameTravelService(DCTravelClient client)
         Func<CancellationToken, Task<string?>> submitAsync,
         string?                                focusCharacter,
         IProgress<string>?                     progress,
-        CancellationToken                      cancellationToken
+        CancellationToken                      cancellationToken,
+        bool                                   logoutIfInGame = true
     )
     {
         try
@@ -342,6 +344,9 @@ public sealed class InGameTravelService(DCTravelClient client)
 
             if (where.Contains("where=ingame", StringComparison.Ordinal))
             {
+                if (!logoutIfInGame)
+                    return InGameTravelResult.Failed("角色已经在游戏里, 没有换大区");
+
                 // 角色还在世界里: 走游戏自己的登出流程回到角色选择界面, 再往下走。
                 // 绝不能在这里直接 RETURNTITLE —— 那个在世界里调必崩。
                 Report(progress, "角色在游戏内, 正在登出…");

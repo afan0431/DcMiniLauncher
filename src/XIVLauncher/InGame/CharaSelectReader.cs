@@ -37,7 +37,10 @@ public static class CharaSelectReader
         public bool DcTraveling => LoginFlags is LOGIN_FLAG_DC_TRAVELING or LOGIN_FLAG_UNK32;
     }
 
-    public sealed record Snapshot(string Where, string SelectedContentId, IReadOnlyList<Entry> Entries)
+    /// <summary>
+    ///     一次读到的列表。Invalid = 模块没列出来、又不是空位的条目数（只有 <c>CHARAS</c> 报; 不为 0 时这份列表不是全部角色）
+    /// </summary>
+    public sealed record Snapshot(string Where, string SelectedContentId, IReadOnlyList<Entry> Entries, int Invalid = 0)
     {
         /// <summary>
         ///     挑一个角色: 指定的 contentId &gt; 指定的名字 &gt; 当前选中的那个 &gt; 列表里只有一个。
@@ -148,7 +151,8 @@ public static class CharaSelectReader
 
         return new Snapshot(header.GetValueOrDefault("where", "unknown"),
                             header.GetValueOrDefault("selected", "0"),
-                            entries);
+                            entries,
+                            ParseInt(header.GetValueOrDefault("invalid", "0")));
     }
 
     private static int ParseInt(string value) =>

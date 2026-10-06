@@ -112,6 +112,9 @@ public sealed class CatAutoEnterTimings
 
     /// <summary>进入游戏后到读得到当前角色最多等多久（读盘）</summary>
     public TimeSpan WorldLoadTimeout { get; init; } = TimeSpan.FromMinutes(3);
+
+    /// <summary>和模块通话失败后等多久再看游戏进程还在不在（游戏崩溃时管道比进程先断）</summary>
+    public TimeSpan ExitGrace { get; init; } = TimeSpan.FromSeconds(2);
 }
 
 /// <summary>
@@ -280,18 +283,23 @@ public sealed class CatAutoEnter
     ///     按规则定要登录的角色:
     ///     ① 指定了 contentId 且在列表里; ② 名字唯一匹配（同名多个时按原始服务器再筛）; ③ 没给名字或匹配不到, 列表里只有一个角色;
     ///     其余（多个角色定不了）要人选。列表为空时两个返回值都是空。
+    ///     ③ 是猜的, 所以只在列表完整（<paramref name="listComplete" />）、且不是在找上一次进的那个角色（target 带 contentId）时才用:
+    ///     否则宁可让人选, 也不登录一个没人指定过的角色。
     /// </summary>
     internal static (CharaSelectReader.Entry? Entry, bool NeedsChoice) Resolve
     (
         IReadOnlyList<CharaSelectReader.Entry> entries,
         CatAutoEnterTarget                     target,
-        IReadOnlyList<CatAutoEnterWorld>       worlds
+        IReadOnlyList<CatAutoEnterWorld>       worlds,
+        bool                                   listComplete = true
     )
     {
         if (entries.Count == 0)
             return (null, false);
 
-        if (!string.IsNullOrEmpty(target.ContentId) && entries.FirstOrDefault(x => x.ContentId == target.ContentId) is { } byId)
+        var resuming = !string.IsNullOrEmpty(target.ContentId);
+
+        if (resuming && entries.FirstOrDefault(x => x.ContentId == target.ContentId) is { } byId)
             return (byId, false);
 
         if (!string.IsNullOrWhiteSpace(target.Name))
@@ -312,7 +320,7 @@ public sealed class CatAutoEnter
             }
         }
 
-        return entries.Count == 1 ? (entries[0], false) : (null, true);
+        return entries.Count == 1 && listComplete && !resuming ? (entries[0], false) : (null, true);
     }
 
     /// <summary>
@@ -369,7 +377,7 @@ public sealed class CatAutoEnter
         while (true)
         {
             // 3. 读整个大区的角色
-            var entries = await ReadCharactersAsync(cancellationToken).ConfigureAwait(false);
+            var (entries, listComplete) = await ReadCharactersAsync(cancellationToken).ConfigureAwait(false);
 
             if (entries.Count == 0)
             {
@@ -389,7 +397,7 @@ public sealed class CatAutoEnter
             }
 
             // 4. 定目标
-            var (entry, needsChoice) = Resolve(entries, wanted, worlds);
+            var (entry, needsChoice) = Resolve(entries, wanted, worlds, listComplete);
 
             if (followedTarget && (entry == null || entry.ContentId != wanted.ContentId))
                 throw new StopException(CatAutoEnterStopCodes.SWITCH_AREA_FAILED, $"换到 {game.CurrentAreaName} 后选角列表里没有要登录的角色");
@@ -447,6 +455,13 @@ public sealed class CatAutoEnter
 
         while (true)
         {
+            // 排队期间管道是放开的, 别的操作（读选角列表等）正用着时等下一轮, 不把「管道被占」当成模块失效
+            if (queueing && game.ModuleBusy)
+            {
+                await DelayAsync(timings.QueuePoll, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
             // 游戏刚起来时界面还没建好, 读不出状态是正常的, 由「到标题界面」的时限兜着
             var lobby = await ReadLobbyAsync("等选角界面", cancellationToken, !clicked).ConfigureAwait(false);
 
@@ -528,7 +543,10 @@ public sealed class CatAutoEnter
         }
     }
 
-    private async Task<IReadOnlyList<CharaSelectReader.Entry>> ReadCharactersAsync(CancellationToken cancellationToken)
+    /// <summary>
+    ///     读整个大区的角色。Complete 为假表示列表里有模块读不准的条目（不是空位）, 这份列表不能当作「这个号的全部角色」
+    /// </summary>
+    private async Task<(IReadOnlyList<CharaSelectReader.Entry> Entries, bool Complete)> ReadCharactersAsync(CancellationToken cancellationToken)
     {
         var deadline = game.Elapsed + timings.CharaListSettle;
 
@@ -546,7 +564,11 @@ public sealed class CatAutoEnter
                     game.CurrentAreaName,
                     string.Join(" | ", snapshot.Entries.Select(x => $"{x.Name}@{x.HomeWorldCode} cid={x.ContentId} 现在={x.CurrentWorldCode} 标记={x.LoginFlags}"))
                 );
-                return snapshot.Entries;
+
+                if (snapshot.Invalid > 0)
+                    Log.Warning("[CatAutoEnter] 选角列表里有 {Invalid} 个条目读不准, 不按「只有一个角色」自动选", snapshot.Invalid);
+
+                return (snapshot.Entries, snapshot.Invalid == 0);
             }
 
             if (game.Elapsed > deadline)
@@ -557,8 +579,12 @@ public sealed class CatAutoEnter
                 if (snapshot.Where != CatModuleReplies.WHERE_CHARA_SELECT)
                     throw new StopException(CatAutoEnterStopCodes.TIMEOUT, $"读选角列表时游戏已经不在选角界面（{snapshot.Where}）");
 
+                // 有条目但一个都读不准: 不是「这个大区没有角色」, 别据此去别的大区找
+                if (snapshot.Invalid > 0)
+                    throw new StopException(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, $"选角列表里的 {snapshot.Invalid} 个角色都读不准: {CatModuleReplies.FirstLine(response)}");
+
                 Log.Information("[CatAutoEnter] {Area} 的选角界面没有角色", game.CurrentAreaName);
-                return [];
+                return ([], true);
             }
 
             await DelayAsync(timings.Poll, cancellationToken).ConfigureAwait(false);
@@ -570,6 +596,10 @@ public sealed class CatAutoEnter
     /// </summary>
     private async Task<bool> SwitchAreaAsync(string areaName, CancellationToken cancellationToken)
     {
+        // 这期间有人自己进了游戏: 不换（换大厅要先回标题, 那会把他登出去）
+        if (await ReadLobbyAsync("换大区前看界面", cancellationToken).ConfigureAwait(false) is { Where: CatModuleReplies.WHERE_IN_GAME })
+            return false;
+
         SetStage(CatStages.SWITCHING_AREA);
         Log.Information("[CatAutoEnter] 换到 {Area} 的大厅", areaName);
 
@@ -694,7 +724,10 @@ public sealed class CatAutoEnter
                 break;
 
             if (response.Contains("flags=", StringComparison.Ordinal))
-                throw new StopException(CatAutoEnterStopCodes.CHARACTER_LOCKED, $"角色 {entry.Name} 现在不能登录（被锁定、要改名或缺资料片）: {CatModuleReplies.FirstLine(response)}");
+                throw new StopException(CatAutoEnterStopCodes.CHARACTER_LOCKED, $"角色 {entry.Name} 带着不能直接登录的标记（被锁定、要改名、缺资料片等）: {CatModuleReplies.FirstLine(response)}");
+
+            if (response.Contains("special-prompt", StringComparison.Ordinal))
+                throw new StopException(CatAutoEnterStopCodes.CHARACTER_LOCKED, $"点角色 {entry.Name} 会先弹出别的提示而不是登录确认框, 没有替人处理: {CatModuleReplies.FirstLine(response)}");
 
             if (response.Contains("locked", StringComparison.Ordinal))
             {
@@ -710,11 +743,20 @@ public sealed class CatAutoEnter
         var confirmDeadline = game.Elapsed + timings.ConfirmTimeout;
         var enterDeadline   = game.Elapsed + timings.EnterTimeout;
         var confirmed       = false;
-        var answered        = false;
+        var clickedYes      = false;
+        var confirmClosed   = false;
         var queueing        = false;
+        string? refusal     = null;
 
         while (true)
         {
+            // 排队期间管道是放开的, 别的操作正用着时等下一轮, 不把「管道被占」当成模块失效
+            if (queueing && game.ModuleBusy)
+            {
+                await DelayAsync(timings.QueuePoll, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
             var lobby = await ReadLobbyAsync("等进入游戏", cancellationToken).ConfigureAwait(false);
 
             // 这一次没读出来: 不拿它去判超时（读不出来另有时限）
@@ -759,20 +801,47 @@ public sealed class CatAutoEnter
                 SetStage(CatStages.ENTERING_WORLD);
             }
 
+            // 「是」只替人点一次, 而且只点这一次点击带出来的登录确认框:
+            // 「取消登录」那句不点; 文字读不到的不点; 点过之后那个框关了又出来别的是/否框, 不知道在问什么, 停手交给人。
+            // 是不是登录确认框、对应的是不是这个角色, 由模块在点的那一刻自己再核对一遍（见模块的 DIALOG YES）。
             if (!lobby.YesNo)
-                answered = false;
-            else if (!answered && !lobby.YesNoText.Contains(CANCEL_LOGIN_PROMPT, StringComparison.Ordinal))
+                confirmClosed = clickedYes;
+            else if (!lobby.YesNoText.Contains(CANCEL_LOGIN_PROMPT, StringComparison.Ordinal))
             {
-                if (CatModuleReplies.IsOk(await SendAsync("DIALOG YES", "点登录确认框的「是」", cancellationToken).ConfigureAwait(false)))
+                if (clickedYes)
                 {
-                    answered      = true;
-                    confirmed     = true;
-                    enterDeadline = game.Elapsed + timings.EnterTimeout;
+                    if (confirmClosed)
+                        throw new StopException(CatAutoEnterStopCodes.LOBBY_ERROR, $"确认登录 {entry.Name} 后游戏又弹出了确认框, 没有替人回答: {Describe(lobby.YesNoText)}");
+                }
+                else if (lobby.YesNoText.Length == 0)
+                    refusal = "读不到确认框的文字";
+                else
+                {
+                    var reply = await SendAsync($"DIALOG YES {entry.ContentId}", "点登录确认框的「是」", cancellationToken).ConfigureAwait(false);
+
+                    if (CatModuleReplies.IsOk(reply))
+                    {
+                        clickedYes    = true;
+                        confirmed     = true;
+                        enterDeadline = game.Elapsed + timings.EnterTimeout;
+                    }
+                    else if (reply.Contains("other-character", StringComparison.Ordinal))
+                        throw new StopException(CatAutoEnterStopCodes.LOBBY_ERROR, $"游戏里选中的已经不是 {entry.Name}（有人点了别的角色）, 确认框没有替人回答: {Describe(lobby.YesNoText)}");
+                    else
+                        refusal = CatModuleReplies.FirstLine(reply);
                 }
             }
 
             if (!confirmed && game.Elapsed > confirmDeadline)
-                throw new StopException(CatAutoEnterStopCodes.TIMEOUT, $"点了角色 {entry.Name} 后 {timings.ConfirmTimeout.TotalSeconds:F0} 秒没有出现登录确认框");
+            {
+                throw new StopException
+                (
+                    CatAutoEnterStopCodes.TIMEOUT,
+                    refusal == null
+                        ? $"点了角色 {entry.Name} 后 {timings.ConfirmTimeout.TotalSeconds:F0} 秒没有出现登录确认框"
+                        : $"点了角色 {entry.Name} 后出现了确认框, 但 {timings.ConfirmTimeout.TotalSeconds:F0} 秒内没能确认它是登录确认框（{refusal}）, 没有替人回答"
+                );
+            }
 
             if (confirmed && game.Elapsed > enterDeadline)
                 throw new StopException(CatAutoEnterStopCodes.TIMEOUT, $"确认登录 {entry.Name} 后 {timings.EnterTimeout.TotalSeconds:F0} 秒没有进入游戏");
@@ -1025,6 +1094,10 @@ public sealed class CatAutoEnter
         {
             game.Release();
 
+            // 游戏崩溃或被关掉时管道比进程先断: 等一下再看进程还在不在, 别把「游戏没了」报成模块失效（那样还会接着去挂 Minion）
+            if (!game.HasExited)
+                await game.DelayAsync(timings.ExitGrace, cancellationToken).ConfigureAwait(false);
+
             if (game.HasExited)
                 throw new OperationCanceledException("游戏进程已经退出");
 
@@ -1113,14 +1186,15 @@ internal static partial class CatModuleReplies
         response.StartsWith("OK", StringComparison.Ordinal);
 
     /// <summary>
-    ///     模块暂时答不上、稍后重试可能就好的失败: 主线程忙、指针还没就绪、列表还没载入、选中还没生效
+    ///     模块暂时答不上、稍后重试可能就好的失败: 主线程忙、指针还没就绪、列表还没载入。这些情况模块都还没有动游戏。
+    ///     「发了回调但没生效」（not-applied）不在此列: 客户端处理回调是当场完成的, 没生效说明回调编号或结构对不上这个版本的游戏,
+    ///     再发只会把一条含义不明的回调重复发几十遍。
     /// </summary>
     public static bool IsTransient(string response) =>
         response.Contains("mainthread-timeout", StringComparison.Ordinal) ||
         response.Contains("pointers-unavailable", StringComparison.Ordinal) ||
         response.Contains("not-in-list", StringComparison.Ordinal) ||
         response.Contains("no-world-list", StringComparison.Ordinal) ||
-        response.Contains("not-applied", StringComparison.Ordinal) ||
         response.Contains("bad-list", StringComparison.Ordinal);
 
     public static string FirstLine(string response)

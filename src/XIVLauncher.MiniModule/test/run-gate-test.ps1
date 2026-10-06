@@ -150,10 +150,13 @@ try
             'SELECTCHARA 123456'    = 'FAIL sigscan-failed'
             'ENTERCHARA 测试角色'   = 'FAIL sigscan-failed'
             'ENTERCHARA DIRECT 测试角色' = 'FAIL not-implemented'
-            'DIALOG YES'            = 'FAIL sigscan-failed'
+            'DIALOG YES 123456'     = 'FAIL sigscan-failed'
             'DIALOG NO'             = 'FAIL sigscan-failed'
             'DIALOG OK'             = 'FAIL sigscan-failed'
-            'DIALOG MAYBE'          = 'FAIL usage: DIALOG <YES|NO|OK>'
+            'DIALOG YES'            = 'FAIL usage: DIALOG <YES <contentId>|NO|OK>'
+            'DIALOG YES 测试角色'   = 'FAIL usage: DIALOG <YES <contentId>|NO|OK>'
+            'DIALOG NO 123456'      = 'FAIL usage: DIALOG <YES <contentId>|NO|OK>'
+            'DIALOG MAYBE'          = 'FAIL usage: DIALOG <YES <contentId>|NO|OK>'
         }
 
         foreach ($command in $expected.Keys)
