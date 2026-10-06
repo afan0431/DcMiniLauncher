@@ -25,25 +25,7 @@ public class DalamudInjector : IDalamudRunner
         bool                        elevate        = false
     )
     {
-        var launchArguments = new List<string>
-        {
-            "inject -v",
-            $"{gamePid}",
-            DalamudInjectorArgs.WorkingDirectory(startInfo.WorkingDirectory),
-            DalamudInjectorArgs.ConfigurationPath(startInfo.ConfigurationPath),
-            DalamudInjectorArgs.LoggingPath(startInfo.LoggingPath),
-            DalamudInjectorArgs.PluginDirectory(startInfo.PluginDirectory),
-            DalamudInjectorArgs.AssetDirectory(startInfo.AssetDirectory),
-            DalamudInjectorArgs.ClientLanguage(4),
-            DalamudInjectorArgs.DelayInitialize(startInfo.DelayInitializeMs),
-            DalamudInjectorArgs.TsPackB64(Convert.ToBase64String(Encoding.UTF8.GetBytes(startInfo.TroubleshootingPackData))),
-            DalamudInjectorArgs.LauncherDirectory(startInfo.LauncherDirectory)
-        };
-
-        if (safeMode) launchArguments.Add("--no-plugin");
-        if (noThirdPlugins) launchArguments.Add(DalamudInjectorArgs.NO_THIRD_PARTY);
-
-        launchArguments.Add(DalamudInjectorArgs.MANAGED_RESTART);
+        var launchArguments = BuildInjectArguments(gamePid, startInfo, safeMode, noThirdPlugins);
 
         var shouldElevate = elevate && !PlatformHelpers.IsElevated();
         var psi = new ProcessStartInfo(runner.FullName)
@@ -133,6 +115,98 @@ public class DalamudInjector : IDalamudRunner
         }
     }
 
+    /// <summary>
+    ///     对运行中的游戏补注入时注入器的参数表。语言、<c>--launcher-directory</c>、<c>--managed-restart</c> 取自
+    ///     <paramref name="startInfo" />, 它们的缺省值（4 / 传 / 传）下结果与参数化之前逐字相同。
+    /// </summary>
+    public static List<string> BuildInjectArguments(int gamePid, DalamudStartInfo startInfo, bool safeMode, bool noThirdPlugins)
+    {
+        var launchArguments = new List<string>
+        {
+            "inject -v",
+            $"{gamePid}",
+            DalamudInjectorArgs.WorkingDirectory(startInfo.WorkingDirectory),
+            DalamudInjectorArgs.ConfigurationPath(startInfo.ConfigurationPath),
+            DalamudInjectorArgs.LoggingPath(startInfo.LoggingPath),
+            DalamudInjectorArgs.PluginDirectory(startInfo.PluginDirectory),
+            DalamudInjectorArgs.AssetDirectory(startInfo.AssetDirectory),
+            DalamudInjectorArgs.ClientLanguage(startInfo.ClientLanguage),
+            DalamudInjectorArgs.DelayInitialize(startInfo.DelayInitializeMs),
+            DalamudInjectorArgs.TsPackB64(Convert.ToBase64String(Encoding.UTF8.GetBytes(startInfo.TroubleshootingPackData)))
+        };
+
+        if (startInfo.PassLauncherDirectory)
+            launchArguments.Add(DalamudInjectorArgs.LauncherDirectory(startInfo.LauncherDirectory));
+
+        if (safeMode) launchArguments.Add("--no-plugin");
+        if (noThirdPlugins) launchArguments.Add(DalamudInjectorArgs.NO_THIRD_PARTY);
+
+        if (startInfo.ManagedRestart)
+            launchArguments.Add(DalamudInjectorArgs.MANAGED_RESTART);
+
+        return launchArguments;
+    }
+
+    /// <summary>
+    ///     经注入器启动游戏时的参数表（不含注入器自身路径）。语言、<c>--launcher-directory</c>、<c>--managed-restart</c> 取自
+    ///     <paramref name="dalamudStartInfo" />, 它们的缺省值（4 / 传 / 传）下结果与参数化之前逐字相同。
+    /// </summary>
+    /// <param name="handleOwner">可继承的本进程句柄; 取不到时为 null, 不传 <c>--handle-owner</c></param>
+    public static List<string> BuildLaunchArguments
+    (
+        DalamudLoadMethod loadMethod,
+        FileInfo          gameExe,
+        DalamudStartInfo  dalamudStartInfo,
+        long?             handleOwner,
+        bool              fakeLogin,
+        bool              noPlugins,
+        bool              noThirdPlugins,
+        string            gameArgs
+    )
+    {
+        var launchArguments = new List<string>
+        {
+            DalamudInjectorArgs.LAUNCH,
+            DalamudInjectorArgs.Mode(loadMethod == DalamudLoadMethod.EntryPoint ? "entrypoint" : "inject"),
+            DalamudInjectorArgs.Game(gameExe.FullName),
+            DalamudInjectorArgs.WorkingDirectory(dalamudStartInfo.WorkingDirectory),
+            DalamudInjectorArgs.ConfigurationPath(dalamudStartInfo.ConfigurationPath),
+            DalamudInjectorArgs.LoggingPath(dalamudStartInfo.LoggingPath),
+            DalamudInjectorArgs.PluginDirectory(dalamudStartInfo.PluginDirectory),
+            DalamudInjectorArgs.AssetDirectory(dalamudStartInfo.AssetDirectory),
+            DalamudInjectorArgs.ClientLanguage(dalamudStartInfo.ClientLanguage),
+            DalamudInjectorArgs.DelayInitialize(dalamudStartInfo.DelayInitializeMs),
+            DalamudInjectorArgs.TsPackB64(Convert.ToBase64String(Encoding.UTF8.GetBytes(dalamudStartInfo.TroubleshootingPackData)))
+        };
+
+        if (dalamudStartInfo.PassLauncherDirectory)
+            launchArguments.Add(DalamudInjectorArgs.LauncherDirectory(dalamudStartInfo.LauncherDirectory));
+
+        if (handleOwner is { } handle)
+            launchArguments.Add(DalamudInjectorArgs.HandleOwner(handle));
+
+        if (loadMethod == DalamudLoadMethod.ACLonly)
+            launchArguments.Add(DalamudInjectorArgs.WITHOUT_DALAMUD);
+
+        if (fakeLogin)
+            launchArguments.Add(DalamudInjectorArgs.FAKE_ARGUMENTS);
+
+        if (noPlugins)
+            launchArguments.Add(DalamudInjectorArgs.NO_PLUGIN);
+
+        if (noThirdPlugins)
+            launchArguments.Add(DalamudInjectorArgs.NO_THIRD_PARTY);
+
+        // 国服始终启用托管重启: 崩溃处理器据此把重启决策编码进退出码, 由 RestartMonitor 接管
+        if (dalamudStartInfo.ManagedRestart)
+            launchArguments.Add(DalamudInjectorArgs.MANAGED_RESTART);
+
+        launchArguments.Add("--");
+        launchArguments.Add(gameArgs);
+
+        return launchArguments;
+    }
+
     public unsafe Process? Run
     (
         FileInfo                    runner,
@@ -157,42 +231,17 @@ public class DalamudInjector : IDalamudRunner
         if (dalamudStartInfo.TroubleshootingPackData == null)
             throw new ArgumentNullException(nameof(dalamudStartInfo.TroubleshootingPackData), "TS data was null");
 
-        var launchArguments = new List<string>
-        {
-            DalamudInjectorArgs.LAUNCH,
-            DalamudInjectorArgs.Mode(loadMethod == DalamudLoadMethod.EntryPoint ? "entrypoint" : "inject"),
-            DalamudInjectorArgs.Game(gameExe.FullName),
-            DalamudInjectorArgs.WorkingDirectory(dalamudStartInfo.WorkingDirectory),
-            DalamudInjectorArgs.ConfigurationPath(dalamudStartInfo.ConfigurationPath),
-            DalamudInjectorArgs.LoggingPath(dalamudStartInfo.LoggingPath),
-            DalamudInjectorArgs.PluginDirectory(dalamudStartInfo.PluginDirectory),
-            DalamudInjectorArgs.AssetDirectory(dalamudStartInfo.AssetDirectory),
-            DalamudInjectorArgs.ClientLanguage(4),
-            DalamudInjectorArgs.DelayInitialize(dalamudStartInfo.DelayInitializeMs),
-            DalamudInjectorArgs.TsPackB64(Convert.ToBase64String(Encoding.UTF8.GetBytes(dalamudStartInfo.TroubleshootingPackData))),
-            DalamudInjectorArgs.LauncherDirectory(dalamudStartInfo.LauncherDirectory)
-        };
-
-        if (inheritableCurrentProcess != null)
-            launchArguments.Add(DalamudInjectorArgs.HandleOwner(inheritableCurrentProcess.Handle));
-
-        if (loadMethod == DalamudLoadMethod.ACLonly)
-            launchArguments.Add(DalamudInjectorArgs.WITHOUT_DALAMUD);
-
-        if (fakeLogin)
-            launchArguments.Add(DalamudInjectorArgs.FAKE_ARGUMENTS);
-
-        if (noPlugins)
-            launchArguments.Add(DalamudInjectorArgs.NO_PLUGIN);
-
-        if (noThirdPlugins)
-            launchArguments.Add(DalamudInjectorArgs.NO_THIRD_PARTY);
-
-        // 始终启用托管重启: 崩溃处理器据此把重启决策编码进退出码, 由 RestartMonitor 接管
-        launchArguments.Add(DalamudInjectorArgs.MANAGED_RESTART);
-
-        launchArguments.Add("--");
-        launchArguments.Add(gameArgs);
+        var launchArguments = BuildLaunchArguments
+        (
+            loadMethod,
+            gameExe,
+            dalamudStartInfo,
+            inheritableCurrentProcess?.Handle,
+            fakeLogin,
+            noPlugins,
+            noThirdPlugins,
+            gameArgs
+        );
 
         var joinedArguments = string.Join(" ", launchArguments);
         var fullCommandLine = $"\"{runner.FullName}\" {joinedArguments}";

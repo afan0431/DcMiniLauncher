@@ -6,7 +6,7 @@ namespace XIVLauncher.Dalamud;
 public class DalamudSession
 (
     IDalamudRunner              injector,
-    DalamudUpdater              updater,
+    IDalamudUpdater             updater,
     DalamudLoadMethod           loadMethod,
     DirectoryInfo               gamePath,
     DirectoryInfo               configDirectory,
@@ -16,9 +16,12 @@ public class DalamudSession
     bool                        noPlugin,
     bool                        noThirdPlugin,
     string                      troubleshootingData,
-    IDalamudGameVersionProvider gameVersionProvider
+    IDalamudGameVersionProvider gameVersionProvider,
+    DalamudSessionFlavor?       flavor = null
 )
 {
+    private readonly DalamudSessionFlavor flavor = flavor ?? DalamudSessionFlavor.Default;
+
     public DalamudInstallState EnsureReady(DirectoryInfo gamePathDir)
     {
         Log.Information("[HOOKS] DalamudSession::EnsureReady(gp:{0})", gamePathDir.FullName);
@@ -39,6 +42,18 @@ public class DalamudSession
 
         if (updater.Runner == null || !updater.Runner.Exists)
             throw new DalamudRunnerException("Dalamud 本地注入文件不存在, 请重新启动 XIVLauncher 以开始完整性检测与下载流程");
+
+        // 国服不核对（flavor 缺省时 IsGameVersionSupported 为 null, 这一段不执行）
+        if (flavor.IsGameVersionSupported is { } isSupported)
+        {
+            var applicable = isSupported(gamePathDir) ?? throw new DalamudRunnerException("无法核对 Dalamud 支持的游戏版本");
+
+            if (!applicable)
+            {
+                Log.Error("[HOOKS] Dalamud 支持的游戏版本与本地游戏版本不一致");
+                return DalamudInstallState.OutOfDate;
+            }
+        }
 
         return DalamudInstallState.Ok;
     }
@@ -107,7 +122,10 @@ public class DalamudSession
             WorkingDirectory        = updater.Runner.Directory?.FullName ?? updater.Runner.DirectoryName ?? Environment.CurrentDirectory,
             DelayInitializeMs       = injectionDelay,
             TroubleshootingPackData = troubleshootingData,
-            LauncherDirectory       = Environment.CurrentDirectory
+            LauncherDirectory       = Environment.CurrentDirectory,
+            ClientLanguage          = flavor.ClientLanguage,
+            PassLauncherDirectory   = flavor.PassLauncherDirectory,
+            ManagedRestart          = flavor.ManagedRestart
         };
     }
 

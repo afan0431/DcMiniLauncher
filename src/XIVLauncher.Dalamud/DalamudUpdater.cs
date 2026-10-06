@@ -11,7 +11,7 @@ using XIVLauncher.Common.Util;
 
 namespace XIVLauncher.Dalamud;
 
-public class DalamudUpdater
+public class DalamudUpdater : IDalamudUpdater
 {
     public DirectoryInfo Runtime { get; }
 
