@@ -74,6 +74,33 @@ public sealed class InternationalClientConfigProvider
     }
 
     /// <summary>
+    ///     逐个字段读: 属性名不分大小写; frontierUrl 必须是字符串; cutOffBootver 是字符串才采用, null、缺失或别的形状都当作没有; 其它字段（如 flags）不看。
+    ///     整体不是 JSON 对象时返回 null。
+    /// </summary>
+    private static ConfigDto? ParseConfig(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var dto = new ConfigDto();
+
+        foreach (var property in document.RootElement.EnumerateObject())
+        {
+            if (property.Value.ValueKind != JsonValueKind.String)
+                continue;
+
+            if (string.Equals(property.Name, nameof(ConfigDto.FrontierUrl), StringComparison.OrdinalIgnoreCase))
+                dto.FrontierUrl = property.Value.GetString();
+            else if (string.Equals(property.Name, nameof(ConfigDto.CutOffBootver), StringComparison.OrdinalIgnoreCase))
+                dto.CutOffBootver = property.Value.GetString();
+        }
+
+        return dto;
+    }
+
+    /// <summary>
     ///     取配置; 不抛网络异常（取消除外）
     /// </summary>
     public async Task<InternationalClientConfig> GetAsync(CancellationToken cancellationToken = default)
@@ -134,7 +161,7 @@ public sealed class InternationalClientConfigProvider
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-        var dto  = JsonSerializer.Deserialize<ConfigDto>(json, JsonOptions);
+        var dto  = ParseConfig(json);
 
         return IsValidFrontierUrlTemplate(dto?.FrontierUrl) ? dto : null;
     }
@@ -149,7 +176,7 @@ public sealed class InternationalClientConfigProvider
             if (!File.Exists(cacheFile.FullName))
                 return null;
 
-            var dto = JsonSerializer.Deserialize<ConfigDto>(File.ReadAllText(cacheFile.FullName), JsonOptions);
+            var dto = ParseConfig(File.ReadAllText(cacheFile.FullName));
             return IsValidFrontierUrlTemplate(dto?.FrontierUrl) ? dto : null;
         }
         catch (Exception ex)

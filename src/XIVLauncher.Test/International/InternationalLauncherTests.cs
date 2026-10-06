@@ -673,10 +673,11 @@ public sealed class InternationalLauncherTests
     [Fact]
     public async Task LoginStatus_And_GateStatus_UseLauncherHeaders()
     {
+        // login_status 用 2026-10-06 从线上读到的原文（status 是数字）; gate_status 用同样形状的维护中样本
         var handler = new FakeHttpHandler
         (request => request.Url.Contains("login_status", StringComparison.Ordinal)
-                        ? FakeHttpHandler.Text("{\"status\":1}".Replace("1", "true"))
-                        : FakeHttpHandler.Text("{\"status\":false,\"message\":[\"All Worlds Maintenance\",\"until 10:00 GMT\"],\"news\":[\"n1\"]}")
+                        ? FakeHttpHandler.Text(REAL_LOGIN_STATUS)
+                        : FakeHttpHandler.Text("{\"status\":0,\"message\":[\"All Worlds Maintenance\",\"until 10:00 GMT\"],\"news\":[\"n1\"]}")
         );
         using var launcher = NewLauncher(handler);
 
@@ -710,6 +711,80 @@ public sealed class InternationalLauncherTests
     }
 
     #endregion
+
+    /// <summary>2026-10-06 从 https://frontier.ffxiv.com/worldStatus/login_status.json 读到的原文</summary>
+    private const string REAL_LOGIN_STATUS = "{\"status\":1}";
+
+    /// <summary>2026-10-06 从 https://frontier.ffxiv.com/worldStatus/gate_status.json?lang=en-us 读到的原文: 开放（status 1）时 message 里照样带着维护文字</summary>
+    private const string REAL_GATE_STATUS = "{\"status\":1,\"message\":[\"The game is unavailable for play during maintenance.\"]}";
+
+    [Fact]
+    public async Task RealStatusResponses_NumericStatus1_MeansOpen_EvenWithMaintenanceTextInMessage()
+    {
+        var handler = new FakeHttpHandler
+        (request => FakeHttpHandler.Text(request.Url.Contains("login_status", StringComparison.Ordinal) ? REAL_LOGIN_STATUS : REAL_GATE_STATUS));
+        using var launcher = NewLauncher(handler);
+
+        var login = await launcher.GetLoginStatusAsync();
+        var gate  = await launcher.GetGateStatusAsync(ClientLanguage.English);
+
+        Assert.True(login.Status);
+        Assert.Null(login.Message);
+        Assert.True(gate.Status);
+        Assert.Equal(["The game is unavailable for play during maintenance."], gate.Message);
+        Assert.Null(gate.News);
+    }
+
+    [Theory]
+    [InlineData("{\"status\":1}", true)]
+    [InlineData("{\"status\":0}", false)]
+    [InlineData("{\"status\":2}", true)]
+    [InlineData("{\"status\":true}", true)]
+    [InlineData("{\"status\":false}", false)]
+    [InlineData("{\"status\":\"1\"}", true)]
+    [InlineData("{\"status\":\"0\"}", false)]
+    [InlineData("{\"status\":\"true\"}", true)]
+    [InlineData("{\"status\":\"False\"}", false)]
+    [InlineData("{\"status\":1.0}", true)]
+    [InlineData("{\"status\":null}", false)]
+    [InlineData("{\"status\":\"\"}", false)]
+    [InlineData("{\"status\":{\"a\":1},\"message\":[\"m\"]}", false)]
+    [InlineData("{}", false)]
+    [InlineData("{\"STATUS\":1}", true)]
+    public async Task StatusField_IsReadLeniently_LikeNewtonsoft(string json, bool expected)
+    {
+        using var launcher = NewLauncher(new FakeHttpHandler(_ => FakeHttpHandler.Text(json)));
+
+        Assert.Equal(expected, (await launcher.GetLoginStatusAsync()).Status);
+    }
+
+    [Theory]
+    [InlineData("{\"status\":0,\"message\":null,\"news\":null}", null)]
+    [InlineData("{\"status\":0}", null)]
+    [InlineData("{\"status\":0,\"message\":[]}", "")]
+    [InlineData("{\"status\":0,\"message\":\"single line\"}", "single line")]
+    [InlineData("{\"status\":0,\"message\":[\"a\",1,true,null,{\"x\":1},[2],\"b\"]}", "a|1|true|b")]
+    [InlineData("{\"status\":0,\"message\":{\"x\":1},\"news\":[\"n\"]}", null)]
+    public async Task MessageField_IsReadLeniently(string json, string? expectedJoined)
+    {
+        using var launcher = NewLauncher(new FakeHttpHandler(_ => FakeHttpHandler.Text(json)));
+
+        var status = await launcher.GetGateStatusAsync(ClientLanguage.English);
+
+        Assert.False(status.Status);
+        Assert.Equal(expectedJoined, status.Message == null ? null : string.Join("|", status.Message));
+    }
+
+    [Theory]
+    [InlineData("<html>503</html>")]
+    [InlineData("")]
+    [InlineData("[1]")]
+    public async Task StatusResponse_NotJsonObject_Throws(string body)
+    {
+        using var launcher = NewLauncher(new FakeHttpHandler(_ => FakeHttpHandler.Text(body)));
+
+        await Assert.ThrowsAnyAsync<System.Text.Json.JsonException>(() => launcher.GetLoginStatusAsync());
+    }
 
     #region 启动参数
 

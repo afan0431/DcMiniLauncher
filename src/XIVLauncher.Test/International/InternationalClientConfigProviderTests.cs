@@ -81,6 +81,32 @@ public sealed class InternationalClientConfigProviderTests : IDisposable
         Assert.False(File.Exists(CacheFile.FullName));
     }
 
+    [Theory]
+    [InlineData("{\"frontierUrl\":\"https://launcher.finalfantasyxiv.com/v1/index.html?rc_lang={0}&time={1}\",\"cutOffBootver\":null,\"flags\":0}", null)]
+    [InlineData("{\"frontierUrl\":\"https://launcher.finalfantasyxiv.com/v1/index.html?rc_lang={0}&time={1}\"}", null)]
+    [InlineData("{\"FrontierUrl\":\"https://launcher.finalfantasyxiv.com/v1/index.html?rc_lang={0}&time={1}\",\"CutOffBootver\":\" 2026.05.01.0000.0001 \",\"flags\":\"x\"}", "2026.05.01.0000.0001")]
+    [InlineData("{\"frontierUrl\":\"https://launcher.finalfantasyxiv.com/v1/index.html?rc_lang={0}&time={1}\",\"cutOffBootver\":20260501,\"flags\":{\"a\":[1]}}", null)]
+    public async Task Remote_OddlyShapedOptionalFields_DoNotDiscardTheTemplate(string body, string? expectedCutOff)
+    {
+        var config = await new InternationalClientConfigProvider(CacheFile, new FakeHttpHandler(_ => FakeHttpHandler.Text(body))).GetAsync();
+
+        Assert.Equal(InternationalClientConfigSource.Remote, config.Source);
+        Assert.Contains("/v1/", config.FrontierUrl);
+        Assert.Equal(expectedCutOff, config.CutOffBootVersion);
+    }
+
+    [Theory]
+    [InlineData("{\"frontierUrl\":740}")]
+    [InlineData("{\"frontierUrl\":null}")]
+    [InlineData("[]")]
+    [InlineData("\"text\"")]
+    public async Task Remote_TemplateNotAString_FallsBack(string body)
+    {
+        var config = await new InternationalClientConfigProvider(CacheFile, new FakeHttpHandler(_ => FakeHttpHandler.Text(body))).GetAsync();
+
+        Assert.Equal(InternationalClientConfigSource.Builtin, config.Source);
+    }
+
     [Fact]
     public async Task Cancellation_IsNotSwallowed()
     {

@@ -59,9 +59,11 @@ public sealed class LauncherSettingsV3 : IAccountSettingsStore
     }
 
     /// <summary>
-    ///     国际服客户端语言（0 日 / 1 英 / 2 德 / 3 法）, 缺省英语。界面上暂时没有入口, 要改就改配置文件里的这一项。
-    ///     配置文件里是别的数字时按英语。
+    ///     国际服客户端语言, 缺省英语。界面上暂时没有入口, 要改就改配置文件里的这一项:
+    ///     填数字 0（日）/ 1（英）/ 2（德）/ 3（法）, 或填语言名 Japanese / English / German / French。
+    ///     填了别的（别的数字、别的文字、null）按英语, 不会影响这份配置里的其它项（见 <see cref="ClientLanguageJsonConverter" />）。
     /// </summary>
+    [JsonConverter(typeof(ClientLanguageJsonConverter))]
     public ClientLanguage InternationalLanguage
     {
         get => Enum.IsDefined(field) ? field : ClientLanguage.English;

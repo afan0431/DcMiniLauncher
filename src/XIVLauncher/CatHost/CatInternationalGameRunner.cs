@@ -10,7 +10,7 @@ namespace XIVLauncher.CatHost;
 
 /// <summary>
 ///     国际服（Square Enix 账号, Windows 版, 账号密码, 不带一次性密码）的无界面启动:
-///     检查目录与版本 → 准备 Dalamud → 登录 → 启动游戏 → 等 Dalamud 落地 → 挂 Minion → 守到游戏退出。
+///     检查目录与版本 → 登录 → 准备 Dalamud → 启动游戏 → 等 Dalamud 落地 → 挂 Minion → 守到游戏退出。
 ///     <para>
 ///         与国服启动器 <see cref="CatRealGameRunner" /> 是两个互不相干的类: 不用账号库、设备信息、大区、跨区服务, 不打补丁（有更新只报
 ///         gameUpdateRequired）。对外部世界的依赖全在 <see cref="ICatInternationalEnvironment" /> 里。
@@ -61,11 +61,15 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
         {
             loginClient = await PrepareAsync(reporter, linked.Token).ConfigureAwait(false);
 
-            var dalamud = await PrepareDalamudAsync(reporter, linked.Token).ConfigureAwait(false);
-            var login   = await LoginAsync(loginClient, linked.Token).ConfigureAwait(false);
+            // 先登录再准备 Dalamud: 密码不对、号不能玩、游戏要更新这些都能立刻报出来, 不用等 Dalamud 下载完（首次下载要几分钟）。
+            // 只登录这一次, Dalamud 准备完不再重新登录。goatcorp 也是这个顺序: 登录后才等 Dalamud 更新器
+            //（MainWindowViewModel.cs:446 登录 → :1072-1117 StartGameAndAddon 里 HoldForUpdate）, 它还允许把登录得到的会话值缓存一天（CommonUniqueIdCache.cs）。
+            var login = await LoginAsync(loginClient, linked.Token).ConfigureAwait(false);
 
             loginClient.Dispose();
             loginClient = null;
+
+            var dalamud = await PrepareDalamudAsync(reporter, linked.Token).ConfigureAwait(false);
 
             var process = await StartAsync(login, dalamud, reporter, linked.Token).ConfigureAwait(false);
 
@@ -77,14 +81,18 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
 
             return CatHostRuntime.EXIT_OK;
         }
+        catch (Exception ex) when (currentProcess == null && IsCloseRequested)
+        {
+            // 还没起游戏就收到了关闭请求: 不管这一刻手头的步骤是被取消、恰好网络出错、还是已经判成了别的失败, 都按取消报
+            if (ex is not OperationCanceledException)
+                LogException("启动途中收到关闭请求, 当时的步骤以这个错误结束", ex);
+
+            reporter.Failed(CatCodes.CANCELLED, "启动途中收到关闭请求, 没有起游戏");
+            return CatLaunchHost.EXIT_LAUNCH_FAILED;
+        }
         catch (CatLaunchException ex) when (currentProcess == null)
         {
             reporter.Failed(ex.Code, ex.Message);
-            return CatLaunchHost.EXIT_LAUNCH_FAILED;
-        }
-        catch (OperationCanceledException) when (currentProcess == null && IsCloseRequested)
-        {
-            reporter.Failed(CatCodes.CANCELLED, "启动途中收到关闭请求, 没有起游戏");
             return CatLaunchHost.EXIT_LAUNCH_FAILED;
         }
         catch (Exception ex) when (currentProcess != null)
@@ -217,7 +225,7 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
                 "warning",
                 config.Source == InternationalClientConfigSource.Cache
                     ? "取不到国际服登录页的最新地址, 这次用的是本机上次存下的"
-                    : "取不到国际服登录页的最新地址, 本机也没有存过, 这次用的是程序里自带的（可能已经过期, 登录失败时请先检查这台电脑能不能访问 kamori.goats.dev）"
+                    : "取不到国际服登录页的最新地址, 本机也没有存过, 这次用的是程序里自带的（可能已经过期; 这次登录要是失败, 请先检查这台电脑的网络）"
             );
         }
 
@@ -286,7 +294,7 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
     }
 
     /// <summary>
-    ///     Dalamud 的下载可能要几分钟, 放在登录之前: 登录得到的会话值有时效, 准备完再现取（国服也是这个顺序）
+    ///     下载 / 校验国际服 Dalamud。在登录之后做（理由见 <see cref="RunAsync" />）
     /// </summary>
     private async Task<ICatInternationalDalamudSession?> PrepareDalamudAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
@@ -315,7 +323,10 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
         }
 
         if (CatInternationalLoginFailures.FromState(login.State) is { } failure)
+        {
+            Log.Warning("[CatHost] 国际服登录结果: {State}", login.State);
             throw new CatLaunchException(failure.Code, failure.Message);
+        }
 
         if (string.IsNullOrEmpty(login.UniqueId))
             throw new CatLaunchException(CatCodes.LAUNCH_FAILED, "国际服的版本服务器返回异常（可能正在维护）, 请稍后再试");
@@ -402,7 +413,7 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
         catch (Exception ex)
         {
             LogException("启动国际服游戏进程失败", ex);
-            throw new CatLaunchException(CatCodes.LAUNCH_FAILED, $"启动游戏进程失败: {ex.GetType().Name}: {redactor.Redact(ex.Message)}");
+            throw new CatLaunchException(CatCodes.LAUNCH_FAILED, "启动游戏进程失败, 详细原因在这台电脑的 DcMiniLauncher 日志里");
         }
 
         bool closeNow;
@@ -451,11 +462,13 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
     /// </summary>
     private async Task<int> GuardAfterErrorAsync(Exception exception, ICatLaunchReporter reporter)
     {
-        var detail  = $"{exception.GetType().Name}: {redactor.Redact(exception.Message)}";
+        const string DETAIL = "游戏起来后启动器内部出错, 详细原因在这台电脑的 DcMiniLauncher 日志里";
+
+        var detail  = DETAIL;
         var process = currentProcess!;
 
         LogException("守护国际服游戏时出错", exception);
-        reporter.Log("error", $"守护游戏时出错, 游戏结束后才会发 game.exited: {detail}");
+        reporter.Log("error", $"{detail}; 游戏不受影响, 等它结束后才会报告已退出");
 
         try
         {

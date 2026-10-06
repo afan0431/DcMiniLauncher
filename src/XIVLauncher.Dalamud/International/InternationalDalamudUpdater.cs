@@ -45,8 +45,11 @@ public sealed record InternationalDalamudUpdaterOptions
     /// <summary>是否有游戏在运行（有则不清理旧版本目录）; 不传时按进程名看</summary>
     public Func<bool>? IsGameOpen { get; init; }
 
-    /// <summary>等别的进程更新完的上限</summary>
-    public TimeSpan UpdateMutexTimeout { get; init; } = TimeSpan.FromMinutes(5);
+    /// <summary>
+    ///     等别的进程更新完, 单次最多等多久。缺省 45 分钟: 明显长于持锁方一次完整下载的上限（4 个文件, 每个请求最多 10 分钟）。
+    ///     等到超时算本次尝试失败, 进入下一次尝试继续等; 绝不在别人还持锁时不加锁就进去 —— 那会删掉对方正在写的目录。
+    /// </summary>
+    public TimeSpan UpdateMutexTimeout { get; init; } = TimeSpan.FromMinutes(45);
 }
 
 /// <summary>
@@ -173,13 +176,8 @@ public sealed class InternationalDalamudUpdater : IDalamudUpdater, IDisposable
         {
             try
             {
-                // 多个无界面进程共用这套目录; 拿不到锁（超时）时不加锁照常更新, 不让锁成为失败原因
-                using (await CrossProcessMutex.TryAcquireAsync
-                                              (
-                                                  CrossProcessMutex.NameForPath(UPDATE_MUTEX_PREFIX, addonDirectory.FullName),
-                                                  options.UpdateMutexTimeout
-                                              )
-                                              .ConfigureAwait(false))
+                // 多个无界面进程共用这套目录, 同一时刻只允许一个在更新。拿到锁之后会重新校验, 所以等待方通常什么都不用再下
+                using (await AcquireUpdateLockAsync().ConfigureAwait(false))
                     await UpdateDalamudAsync().ConfigureAwait(false);
 
                 isUpdated = true;
@@ -196,6 +194,29 @@ public sealed class InternationalDalamudUpdater : IDalamudUpdater, IDisposable
         }
 
         State = isUpdated ? DalamudUpdater.DownloadState.Done : DalamudUpdater.DownloadState.NoIntegrity;
+    }
+
+    /// <summary>
+    ///     拿更新锁。等到超时 = 别的进程还在更新: 抛 <see cref="TimeoutException" />, 算本次尝试失败（由外层重试继续等）, 不降级成无锁。
+    ///     互斥量本身打不开（如被提权进程创建、无权访问）时等多久都没用, 只有这种情况才不加锁继续。
+    /// </summary>
+    private async Task<CrossProcessMutex?> AcquireUpdateLockAsync()
+    {
+        var name = CrossProcessMutex.NameForPath(UPDATE_MUTEX_PREFIX, addonDirectory.FullName);
+
+        try
+        {
+            return await CrossProcessMutex.AcquireAsync(name, options.UpdateMutexTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            throw new TimeoutException($"等了 {options.UpdateMutexTimeout.TotalMinutes:0.#} 分钟, 别的 DcMiniLauncher 进程还在更新国际服 Dalamud");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[DUPDATE-INTL] 打不开更新锁 {Name}, 不加锁继续", name);
+            return null;
+        }
     }
 
     /// <summary>出处: DalamudUpdater.cs:174-198（只取 release）</summary>

@@ -17,6 +17,9 @@ public static class CatInternationalLoginFailures
     /// <summary>有更新时的处理办法: 本启动器打不了国际服的补丁</summary>
     public const string UPDATE_HINT = "请在这台电脑上用官方启动器更新国际服客户端";
 
+    /// <summary>没见过的错误给员工看的话; 细节在本地日志里</summary>
+    public const string UNEXPECTED_ERROR_MESSAGE = "国际服上号时出了没预料到的错误, 请把这台电脑的 DcMiniLauncher 日志发给负责人";
+
     /// <summary>SE 原文最多带多少个字（外壳把整条消息截到 200 字）</summary>
     private const int MAX_SE_MESSAGE_LENGTH = 120;
 
@@ -40,7 +43,8 @@ public static class CatInternationalLoginFailures
             InternationalLoginState.NeedsPatchBoot =>
                 (CatCodes.GAME_UPDATE_REQUIRED, $"国际服客户端的启动文件和官方的不一样（被改过或损坏）, {UPDATE_HINT}; 更新不了就要重装"),
 
-            _ => (CatCodes.LAUNCH_FAILED, $"国际服登录返回了不认识的状态: {state}")
+            // 枚举以后加了新值而这里没跟上: 状态名只进本地日志（由调用方记）
+            _ => (CatCodes.LAUNCH_FAILED, UNEXPECTED_ERROR_MESSAGE)
         };
 
     /// <summary>
@@ -79,7 +83,8 @@ public static class CatInternationalLoginFailures
             }
         }
 
-        return (CatCodes.LAUNCH_FAILED, $"国际服登录出错: {exception.GetType().Name}: {redact(exception.Message)}");
+        // 没见过的错误: 类型名和原文只进本地日志（由调用方记）, 给员工的话不带
+        return (CatCodes.LAUNCH_FAILED, UNEXPECTED_ERROR_MESSAGE);
     }
 
     /// <summary>

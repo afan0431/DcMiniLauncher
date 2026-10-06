@@ -204,15 +204,41 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     }
 
     [Fact]
-    public async Task DalamudUnavailable_FailsBeforeLogin()
+    public async Task DalamudUnavailable_IsReportedAfterTheSingleLogin_AndNoGameIsStarted()
     {
         environment.DalamudError = "国际服的 Dalamud 还没有适配现在的游戏版本";
 
         await RunToFailureAsync(Request(dalamud: true));
 
         AssertFailed(CatCodes.DALAMUD_UNAVAILABLE, "还没有适配");
-        Assert.Equal(["config", "boot", "loginStatus", "dalamud"], environment.Calls);
+        Assert.Equal(["config", "boot", "loginStatus", "login", "gate", "dalamud"], environment.Calls);
         Assert.Equal(["stage:preparing", "stage:updatingDalamud", $"failed:{CatCodes.DALAMUD_UNAVAILABLE}"], reporter.Entries);
+    }
+
+    /// <summary>登录在 Dalamud 准备之前: 密码不对立刻报, 不去下载 Dalamud</summary>
+    [Fact]
+    public async Task LoginRejected_WithDalamudRequested_FailsWithoutPreparingDalamud()
+    {
+        environment.Login.LoginError = new InternationalLoginRejectedException("ID or password is incorrect.");
+
+        await RunToFailureAsync(Request(dalamud: true));
+
+        AssertFailed(CatCodes.AUTHORIZATION_REQUIRED, "国际服登录被拒绝");
+        Assert.DoesNotContain("dalamud", environment.Calls);
+        Assert.DoesNotContain("stage:updatingDalamud", reporter.Entries);
+    }
+
+    [Fact]
+    public async Task UnexpectedLoginError_IsLaunchFailed_WithPlainMessage_AndDetailsOnlyInLocalLog()
+    {
+        environment.Login.LoginError = new InvalidOperationException("Sequence contains no elements");
+
+        using var logs = new CapturedLogs();
+        await RunToFailureAsync(Request());
+
+        AssertFailed(CatCodes.LAUNCH_FAILED, "没预料到的错误");
+        Assert.DoesNotContain(reporter.Messages, x => x.Contains("InvalidOperationException") || x.Contains("Sequence contains"));
+        Assert.Contains("InvalidOperationException", logs.All);
     }
 
     [Fact]
@@ -293,6 +319,8 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         await RunToFailureAsync(Request());
 
         AssertFailed(CatCodes.LAUNCH_FAILED, "启动游戏进程失败");
+        Assert.DoesNotContain(reporter.Messages, x => x.Contains("InvalidOperationException") || x.Contains("CreateProcess"));
+        Assert.Contains("CreateProcess failed", logs.All);
         Assert.DoesNotContain(UNIQUE_ID, logs.All);
         Assert.DoesNotContain(PASSWORD, logs.All);
     }
@@ -305,7 +333,8 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
 
         await RunToFailureAsync(Request());
 
-        Assert.Contains(reporter.Messages, x => x.Contains("kamori.goats.dev"));
+        Assert.Contains(reporter.Messages, x => x.Contains("程序里自带的"));
+        Assert.DoesNotContain(reporter.Messages, x => x.Contains("kamori"));
         Assert.Equal($"failed:{CatCodes.GAME_UPDATE_REQUIRED}", reporter.Entries.Last());
     }
 
@@ -325,6 +354,30 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         Assert.Equal($"failed:{CatCodes.CANCELLED}", reporter.Entries.Last());
         Assert.Null(environment.GameProcess);
         gate.TrySetResult();
+    }
+
+    /// <summary>下号恰好撞上网络错误（或别的失败）: 还没起游戏就按取消报, 不报成启动失败, 也不往外抛</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task CloseDuringPreparation_WhileStepFailsWithNonCancellationError_IsStillCancelled(bool rejected)
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        environment.Login.LoginGate                  = gate.Task;
+        environment.Login.LoginGateIgnoresCancellation = true;
+        environment.Login.LoginError                 = rejected ? new InternationalLoginRejectedException("locked") : new HttpRequestException("connection reset");
+
+        var runner = NewRunner();
+        var run    = runner.RunAsync(Request(dalamud: true), reporter, CancellationToken.None);
+
+        await environment.Login.LoginEntered.Task.WaitAsync(Timeout);
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        gate.TrySetResult();
+
+        Assert.Equal(CatLaunchHost.EXIT_LAUNCH_FAILED, await run.WaitAsync(Timeout));
+        Assert.Equal($"failed:{CatCodes.CANCELLED}", reporter.Entries.Last());
+        Assert.Single(reporter.Entries, x => x.StartsWith("failed:", StringComparison.Ordinal));
+        Assert.Null(environment.GameProcess);
     }
 
     #endregion
@@ -373,7 +426,7 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
             ],
             reporter.Entries
         );
-        Assert.Equal(["config", "boot", "loginStatus", "dalamud", "login", "gate", "start"], environment.Calls);
+        Assert.Equal(["config", "boot", "loginStatus", "login", "gate", "dalamud", "start"], environment.Calls);
         Assert.Equal([environment.GameProcess.Id], environment.FakeMinion.ReportedStopped);
         Assert.True(environment.Login.Disposed);
 
@@ -572,6 +625,21 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     }
 
     [Fact]
+    public void FallbackMessages_CarryNoTypeOrEnumNames()
+    {
+        var (_, fromException) = CatInternationalLoginFailures.FromException(new InvalidOperationException("boom detail"), x => x);
+        var fromState          = CatInternationalLoginFailures.FromState((InternationalLoginState)999)!.Value.Message;
+
+        foreach (var message in new[] { fromException, fromState })
+        {
+            Assert.Equal(CatInternationalLoginFailures.UNEXPECTED_ERROR_MESSAGE, message);
+            Assert.DoesNotContain("Exception", message);
+            Assert.DoesNotContain("boom", message);
+            Assert.DoesNotContain("999", message);
+        }
+    }
+
+    [Fact]
     public void FromState_Ok_IsNull_AndEveryOtherStateHasACode()
     {
         Assert.Null(CatInternationalLoginFailures.FromState(InternationalLoginState.Ok));
@@ -731,6 +799,8 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
 
         public Task? LoginGate { get; set; }
 
+        public bool LoginGateIgnoresCancellation { get; set; }
+
         public TaskCompletionSource LoginEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public (string UserName, string Password, ClientLanguage Language)? LoginArguments { get; private set; }
@@ -764,7 +834,7 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
             LoginEntered.TrySetResult();
 
             if (LoginGate != null)
-                await LoginGate.WaitAsync(cancellationToken);
+                await (LoginGateIgnoresCancellation ? LoginGate : LoginGate.WaitAsync(cancellationToken));
 
             if (LoginError != null)
                 throw LoginError;

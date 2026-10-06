@@ -152,6 +152,49 @@ public static class MinionCards
         return new MinionCardSelection(candidates[0], notes, true);
     }
 
+    /// <summary>
+    ///     给国际服的游戏选行: 只有执行程序路径位于 <paramref name="internationalGameRoot" />（启动器设置的国际服游戏目录）之下的行才算国际服行,
+    ///     然后照 <see cref="SelectRow" /> 的规则选（跳过已占用的、都占用时取第一行）。
+    ///     国服行的判定（<see cref="VariantOf(MinionAccount, IEnumerable{string?})" />）不变; 这里只是不再把「不在国服目录下」的行都当成国际服行 ——
+    ///     那样会把韩服、繁中服的行也选进来。
+    /// </summary>
+    /// <param name="accounts">Accounts.json 的全部行</param>
+    /// <param name="fingerprint">卡指纹</param>
+    /// <param name="internationalGameRoot">国际服游戏目录; 为空时选不出任何行</param>
+    /// <param name="cnGameRoots">国服游戏目录, 空项忽略</param>
+    /// <param name="occupiedUids">已被占用的 Minion 行 UID</param>
+    public static MinionCardSelection SelectInternationalRow
+    (
+        IEnumerable<MinionAccount> accounts,
+        string                     fingerprint,
+        string?                    internationalGameRoot,
+        IEnumerable<string?>       cnGameRoots,
+        IReadOnlySet<string>       occupiedUids
+    )
+    {
+        var all      = accounts.ToList();
+        var eligible = all.Where(x => !string.IsNullOrWhiteSpace(x.PathToExe) && IsUnderDirectory(x.PathToExe, internationalGameRoot)).ToList();
+
+        var selection = SelectRow(eligible, fingerprint, VARIANT_GLOBAL, cnGameRoots, occupiedUids);
+        var notes     = new List<string> { $"国际服游戏目录: {(string.IsNullOrWhiteSpace(internationalGameRoot) ? "(未配置)" : internationalGameRoot)}" };
+
+        notes.AddRange(selection.Notes);
+
+        if (IsValidFingerprint(fingerprint))
+        {
+            foreach (var account in all.Except(eligible))
+            {
+                if (string.IsNullOrWhiteSpace(account.Keycode) || !string.Equals(Fingerprint(account.Keycode), fingerprint, StringComparison.Ordinal))
+                    continue;
+
+                var uid = string.IsNullOrWhiteSpace(account.Uid) ? "(无 UID)" : account.Uid.Trim()[..Math.Min(8, account.Uid.Trim().Length)];
+                notes.Add($"行 UID {uid}: 执行程序 {(string.IsNullOrWhiteSpace(account.PathToExe) ? "(空)" : account.PathToExe)} 不在国际服游戏目录之下, 不算国际服行");
+            }
+        }
+
+        return new MinionCardSelection(selection.Row, notes, selection.AllOccupied);
+    }
+
     private static bool IsOccupied(MinionAccount account, IReadOnlySet<string> occupiedUids) =>
         !string.IsNullOrWhiteSpace(account.Uid) && occupiedUids.Contains(account.Uid.Trim());
 

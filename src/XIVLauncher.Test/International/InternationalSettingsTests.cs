@@ -68,6 +68,43 @@ public sealed class InternationalSettingsTests : IDisposable
         Assert.Equal(expected, LauncherSettingsV3.Load(ConfigPath).InternationalLanguage);
     }
 
+    /// <summary>手改配置写成名字、写错、写成 null 都不能让整份（国服也在用的）配置被判成损坏</summary>
+    [Theory]
+    [InlineData("\"Japanese\"", ClientLanguage.Japanese)]
+    [InlineData("\"german\"", ClientLanguage.German)]
+    [InlineData("\" FRENCH \"", ClientLanguage.French)]
+    [InlineData("\"English\"", ClientLanguage.English)]
+    [InlineData("\"0\"", ClientLanguage.Japanese)]
+    [InlineData("\"3\"", ClientLanguage.French)]
+    [InlineData("\"日语\"", ClientLanguage.English)]
+    [InlineData("\"\"", ClientLanguage.English)]
+    [InlineData("null", ClientLanguage.English)]
+    [InlineData("true", ClientLanguage.English)]
+    [InlineData("1.5", ClientLanguage.English)]
+    [InlineData("99999999999", ClientLanguage.English)]
+    [InlineData("[0]", ClientLanguage.English)]
+    [InlineData("{\"x\":2}", ClientLanguage.English)]
+    public void InternationalLanguage_HandEditedOddValues_NeverBreakTheSharedConfig(string raw, ClientLanguage expected)
+    {
+        File.WriteAllText(ConfigPath, $"{{ \"GamePath\": \"D:\\\\FF14\", \"InternationalLanguage\": {raw}, \"MinionId\": \"someone\" }}");
+
+        var settings = LauncherSettingsV3.Load(ConfigPath);
+
+        Assert.Equal(expected, settings.InternationalLanguage);
+        Assert.Equal(@"D:\FF14", settings.GamePath!.FullName);
+        Assert.Equal("someone", settings.MinionId);
+        Assert.Empty(Directory.GetFiles(directory.FullName, "*.broken-*"));
+    }
+
+    [Fact]
+    public void InternationalLanguage_IsWrittenAsNumber()
+    {
+        var settings = LauncherSettingsV3.Load(ConfigPath);
+        settings.InternationalLanguage = ClientLanguage.French;
+
+        Assert.Contains("\"InternationalLanguage\": 3", File.ReadAllText(ConfigPath));
+    }
+
     [Fact]
     public void GamePathCheck_RecognizesInternationalClientLayout()
     {

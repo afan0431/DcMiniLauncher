@@ -442,6 +442,57 @@ public sealed class InternationalDalamudUpdaterTests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(InternationalRoot.FullName, "addon", "Hooks")));
     }
 
+    /// <summary>别的进程持着更新锁时: 等到超时算失败, 绝不无锁进去动目录; 对方放锁后再来就正常</summary>
+    [Fact]
+    public async Task UpdateLockHeldByAnother_TimesOut_WithoutTouchingAnything_ThenSucceedsOnceReleased()
+    {
+        var lockName = XIVLauncher.Common.Util.CrossProcessMutex.NameForPath("DcMiniLauncher-IntlDalamudUpdate", Paths.AddonDirectory.FullName);
+        var server   = NewServer();
+
+        InternationalDalamudUpdater NewLockedOutUpdater() =>
+            new
+            (
+                Paths.AddonDirectory,
+                Paths.RuntimeDirectory,
+                Paths.AssetDirectory,
+                new InternationalDalamudUpdaterOptions
+                {
+                    HttpHandler        = server,
+                    RolloutBucket      = "Control",
+                    MaxTries           = 2,
+                    RetryDelay         = TimeSpan.Zero,
+                    DeleteSettleDelay  = TimeSpan.Zero,
+                    IsGameOpen         = () => false,
+                    UpdateMutexTimeout = TimeSpan.FromMilliseconds(300)
+                }
+            );
+
+        using (await XIVLauncher.Common.Util.CrossProcessMutex.AcquireAsync(lockName, TimeSpan.FromSeconds(10)))
+        {
+            using var blocked = NewLockedOutUpdater();
+            RunToEnd(blocked);
+
+            Assert.Equal(DalamudUpdater.DownloadState.NoIntegrity, blocked.State);
+            Assert.IsType<TimeoutException>(blocked.EnsurementException);
+            Assert.Empty(server.Requests);
+            Assert.False(Directory.Exists(Paths.AddonDirectory.FullName));
+            Assert.False(Directory.Exists(Paths.RuntimeDirectory.FullName));
+            Assert.False(Directory.Exists(Paths.AssetDirectory.FullName));
+        }
+
+        using var free = NewLockedOutUpdater();
+        RunToEnd(free);
+
+        Assert.Equal(DalamudUpdater.DownloadState.Done, free.State);
+    }
+
+    [Fact]
+    public void UpdateLockWait_DefaultIsLongerThanAFullDownload()
+    {
+        // 持锁方一次完整更新最多 4 个文件, 每个请求上限 10 分钟
+        Assert.True(new InternationalDalamudUpdaterOptions().UpdateMutexTimeout > TimeSpan.FromMinutes(40));
+    }
+
     [Fact]
     public void RolloutBucket_IsPersistedAndReused()
     {

@@ -304,8 +304,8 @@ internal sealed class CatInternationalRealEnvironment(Func<Task> ensureInitializ
 }
 
 /// <summary>
-///     国际服挂 Minion: 选行、预占、占用判断、停机补报与国服（CatRealGameRunner）是同一套做法和同一把跨进程锁,
-///     区别只有按国际服行挂载（注入文件与 -path 见 <see cref="MinionAttacher" />）。
+///     国际服挂 Minion: 预占、占用判断、停机补报与国服（CatRealGameRunner）是同一套做法和同一把跨进程锁,
+///     区别是只认位于国际服游戏目录之下的行（<see cref="MinionCards.SelectInternationalRow" />）, 并按国际服行挂载（注入文件与 -path 见 <see cref="MinionAttacher" />）。
 ///     这里是照国服那几段另写的一份, 没有去改国服启动器让两边共用 —— 国服路径正在生产使用, 保持它一行不动。
 /// </summary>
 internal sealed class CatInternationalMinion : ICatInternationalMinion
@@ -321,7 +321,7 @@ internal sealed class CatInternationalMinion : ICatInternationalMinion
 
         if (!request.Minion)
         {
-            error = (CatCodes.MINION_NOT_CONFIGURED, "launch 时没有指定 Minion 卡");
+            error = (CatCodes.MINION_NOT_CONFIGURED, "这次上号没有要求挂 Minion");
             return null;
         }
 
@@ -358,8 +358,16 @@ internal sealed class CatInternationalMinion : ICatInternationalMinion
                                       .Select(uid => uid!.Trim())
                                       .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        var selection = MinionCards.SelectRow(rows, request.CardFingerprint!, MinionCards.VARIANT_GLOBAL, MinionCards.ConfiguredCnGameRoots(), occupied);
-        var row       = selection.Row;
+        // 国际服行 = 游戏执行程序位于设置里的国际服游戏目录之下的行（不在国服目录下还不够, 韩服、繁中服的行也不在）
+        var selection = MinionCards.SelectInternationalRow
+        (
+            rows,
+            request.CardFingerprint!,
+            App.Settings.InternationalGamePath?.FullName,
+            MinionCards.ConfiguredCnGameRoots(),
+            occupied
+        );
+        var row = selection.Row;
 
         Log.Information("[CatHost] 按卡 {Fingerprint} 选国际服行: {Notes}", request.CardFingerprint, string.Join(" | ", selection.Notes));
 
@@ -367,7 +375,7 @@ internal sealed class CatInternationalMinion : ICatInternationalMinion
             reporter.Log("warning", $"卡 {request.CardFingerprint} 的国际服行都已挂在别的游戏上, 仍挂第一行, 可能把那边的 Minion 顶掉");
 
         if (row == null)
-            error = (CatCodes.MINION_CARD_NOT_FOUND, $"本机 Minion Accounts.json 里找不到卡 {request.CardFingerprint} 的国际服注入行（按该行的游戏执行程序是否位于国服游戏目录之下区分）");
+            error = (CatCodes.MINION_CARD_NOT_FOUND, $"这台电脑的 Minion 里找不到这张卡（{request.CardFingerprint}）给国际服用的那一行: 要在 Minion 里给这张卡加一行, 游戏程序选国际服游戏目录里的");
 
         return row;
     }
