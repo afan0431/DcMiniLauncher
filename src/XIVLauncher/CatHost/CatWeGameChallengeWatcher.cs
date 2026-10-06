@@ -345,6 +345,14 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
             return null;
 
         await Task.Delay(ClickSettle, cancellationToken).ConfigureAwait(false);
+
+        var after = screen.CaptureLoginWindow();
+
+        // 二维码要联网取, 可能还没画出来: 再等一次, 免得把刚切好的扫码页又点走
+        if (after == null || HasQr(after))
+            return after;
+
+        await Task.Delay(ClickSettle, cancellationToken).ConfigureAwait(false);
         return screen.CaptureLoginWindow();
     }
 
