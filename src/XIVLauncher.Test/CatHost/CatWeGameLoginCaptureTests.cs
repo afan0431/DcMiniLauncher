@@ -41,9 +41,10 @@ public sealed class CatWeGameLoginCaptureTests
     [Fact]
     public void ClientProcessNames_NeverIncludeTheGameOrTheService()
     {
-        Assert.Equal(["wegame", "wegame_env", "tgp_daemon", "rail"], CatWeGameLoginRealEnvironment.ClientProcessNames);
+        Assert.Equal(["wegame", "wegame_env", "tgp_daemon"], CatWeGameLoginRealEnvironment.ClientProcessNames);
         Assert.DoesNotContain(CatWeGameLoginRealEnvironment.ClientProcessNames, x => x.Contains("ffxiv", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain("wegameservice", CatWeGameLoginRealEnvironment.ClientProcessNames);
+        Assert.DoesNotContain("rail", CatWeGameLoginRealEnvironment.ClientProcessNames);
     }
 
     #region 三种情况都进入等待登录

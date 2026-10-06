@@ -352,9 +352,9 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
 public sealed class CatWeGameLoginRealEnvironment(Func<string?> gameRoot) : ICatWeGameLoginEnvironment
 {
     /// <summary>
-    ///     要结束的 WeGame 客户端进程名。只有这几个: 游戏进程（ffxiv_dx11）和系统服务（wegameservice）不在其中
+    ///     要结束的 WeGame 客户端进程名。只有这几个: 游戏进程（ffxiv_dx11）、游戏运行时用到的 rail 和系统服务（wegameservice）不在其中
     /// </summary>
-    internal static readonly string[] ClientProcessNames = ["wegame", "wegame_env", "tgp_daemon", "rail"];
+    internal static readonly string[] ClientProcessNames = ["wegame", "wegame_env", "tgp_daemon"];
 
     private static readonly TimeSpan ClientExitTimeout = TimeSpan.FromSeconds(5);
 
