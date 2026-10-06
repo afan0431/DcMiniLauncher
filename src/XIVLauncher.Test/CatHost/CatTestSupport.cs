@@ -221,18 +221,33 @@ internal sealed class RecordingReporter : ICatLaunchReporter
     public void Crashed(int pid) =>
         Entries.Enqueue("crashed");
 
-    public void Agent(string kind, bool ok, string? code = null, string? message = null) =>
+    public void Agent(string kind, bool ok, string? code = null, string? message = null)
+    {
         Entries.Enqueue($"agent:{kind}:{(ok ? "ok" : code)}");
 
-    public void Exited(int pid, int? exitCode, string? reason = null, string? code = null, string? message = null) =>
+        if (message != null)
+            Messages.Enqueue(message);
+    }
+
+    public void Exited(int pid, int? exitCode, string? reason = null, string? code = null, string? message = null)
+    {
         Entries.Enqueue(reason == null ? "exited" : $"exited:{reason}");
 
-    public void Failed(string code, string message) =>
-        Entries.Enqueue($"failed:{code}");
-
-    public void Log(string level, string message)
-    {
+        if (message != null)
+            Messages.Enqueue(message);
     }
+
+    public void Failed(string code, string message)
+    {
+        Entries.Enqueue($"failed:{code}");
+        Messages.Enqueue(message);
+    }
+
+    /// <summary>所有带文字的报告（日志、失败、代理、退出）里的文字, 查敏感值有没有漏出来用</summary>
+    public ConcurrentQueue<string> Messages { get; } = new();
+
+    public void Log(string level, string message) =>
+        Messages.Enqueue(message);
 }
 
 internal static class CatTestNames

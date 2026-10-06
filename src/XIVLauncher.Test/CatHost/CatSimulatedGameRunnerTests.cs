@@ -82,6 +82,44 @@ public sealed class CatSimulatedGameRunnerTests
     }
 
     [Fact]
+    public async Task Run_International_EmitsSameEventsAsShengqu_AndNeverPrintsPassword()
+    {
+        const string PASSWORD = "Sim-Pass-9981";
+        var reporter = new RecordingReporter();
+        var run = runner.RunAsync
+        (
+            new CatLaunchRequest("op", "seAccount", true, "0123456789abcdef", "global", IsInternational: true, Password: new CatSecret(PASSWORD)),
+            reporter,
+            CancellationToken.None
+        );
+
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        using (var placeholder = Process.GetProcessById(reporter.Pid!.Value))
+            placeholder.Kill();
+
+        await run.WaitAsync(Timeout);
+        Assert.Equal
+        (
+            [
+                "stage:preparing",
+                "stage:updatingDalamud",
+                "stage:starting",
+                "started",
+                "stage:injecting",
+                "agent:dalamud:ok",
+                "stage:attachingMinion",
+                "agent:minion:ok",
+                "stage:running",
+                "exited"
+            ],
+            reporter.Entries
+        );
+        Assert.Contains(reporter.Messages, x => x.Contains("国际服"));
+        Assert.DoesNotContain(reporter.Messages, x => x.Contains(PASSWORD));
+    }
+
+    [Fact]
     public async Task Run_MissingCard_FailsWithMinionCardNotFound_BeforeStarting()
     {
         var reporter = new RecordingReporter();

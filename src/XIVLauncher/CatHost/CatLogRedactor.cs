@@ -26,6 +26,27 @@ public sealed class CatLogRedactor
     }
 
     /// <summary>
+    ///     登记一个必须遮住的值（国际服密码、登录得到的会话值）: 不受最短长度限制, 并同时登记它在网址和表单里的编码形式
+    ///     （登录表单是 URL 编码的, 异常信息里可能出现编码后的样子）。短值可能误伤正常文字, 宁可误伤。
+    /// </summary>
+    public void RegisterSecret(string? secret)
+    {
+        if (string.IsNullOrEmpty(secret))
+            return;
+
+        string[] forms = [secret, Uri.EscapeDataString(secret), System.Net.WebUtility.UrlEncode(secret)];
+
+        lock (secretsLock)
+        {
+            foreach (var form in forms)
+            {
+                if (!string.IsNullOrEmpty(form) && !secrets.Contains(form))
+                    secrets.Add(form);
+            }
+        }
+    }
+
+    /// <summary>
     ///     把文字里出现的敏感值替换成 ***
     /// </summary>
     public string Redact(string text)

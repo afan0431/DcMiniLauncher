@@ -90,8 +90,17 @@ public partial class App
                                     ? new CatSimulatedGameRunner()
                                     : new CatRealGameRunner(redactor, () => initialization);
 
+        // 渠道要等收到 launch 才知道: 国服（盛趣 / WeGame）仍用上面那个启动器, 国际服另用一个互不相干的类, 它的代码不会进国服路径
+        ICatGameRunner SelectRunner(CatLaunchRequest launchRequest)
+        {
+            if (CatHostMode.IsSimulate || !launchRequest.IsInternational)
+                return runner;
+
+            return new CatUnsupportedGameRunner("这个版本的 DcMiniLauncher 还不能自动上国际服的号");
+        }
+
         CatRpcServer? server = null;
-        var host = new CatLaunchHost(runner, (method, parameters) => server!.NotifyAsync(method, parameters), redactor);
+        var host = new CatLaunchHost(SelectRunner, (method, parameters) => server!.NotifyAsync(method, parameters), redactor);
         server = new CatRpcServer(bootstrap.PipeName, bootstrap.Token, host, AppUtil.GetAssemblyVersion());
 
         try
@@ -190,4 +199,22 @@ internal sealed class CatDalamudProgressSink : IDalamudProgressSink
     public void ReportLoadingProgress(long? size, long downloaded, double? progress)
     {
     }
+}
+
+/// <summary>
+///     还不支持的渠道: 直接报启动失败, 不碰任何游戏
+/// </summary>
+internal sealed class CatUnsupportedGameRunner(string message) : ICatGameRunner
+{
+    public Task<int> RunAsync(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        reporter.Failed(CatCodes.LAUNCH_FAILED, message);
+        return Task.FromResult(CatLaunchHost.EXIT_LAUNCH_FAILED);
+    }
+
+    public Task InjectAsync(bool dalamud, bool minion, bool force, ICatLaunchReporter reporter, CancellationToken cancellationToken) =>
+        Task.CompletedTask;
+
+    public Task CloseAsync(TimeSpan gracefulTimeout) =>
+        Task.CompletedTask;
 }

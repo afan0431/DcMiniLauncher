@@ -113,8 +113,8 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     {
         var account = request.AccountName;
 
-        // 模拟模式不查账号库, 渠道只体现在这条日志里
-        reporter.Log("information", $"模拟模式: 不登录、不启动真游戏（渠道: {CatPlatforms.DisplayName(request.Platform)}）");
+        // 模拟模式不查账号库、不登录, 渠道只体现在这条日志里; 国际服带来的密码不看也不输出
+        reporter.Log("information", $"模拟模式: 不登录、不启动真游戏（渠道: {CatPlatforms.DisplayName(request.Channel)}）");
         reporter.Stage(CatStages.PREPARING);
         await Task.Delay(StepDelay, token).ConfigureAwait(false);
 

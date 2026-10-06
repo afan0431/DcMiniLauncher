@@ -158,6 +158,158 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Theory]
+    [InlineData("international")]
+    [InlineData("INTERNATIONAL")]
+    [InlineData(" International ")]
+    public async Task Launch_International_WithPassword_IsAccepted_AndPasswordNeverPrinted(string platform)
+    {
+        const string PASSWORD = "Pw-国际服!x9";
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new { operationId = "op1", accountName = "seAccount", dalamud = true, platform, password = PASSWORD, areaName = "Elemental" }
+        );
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        var request = runner.Request!;
+        Assert.True(request.IsInternational);
+        Assert.Equal(CatPlatform.International, request.Channel);
+        Assert.False(request.IsWeGame);
+        Assert.Equal(PASSWORD, request.Password!.Reveal());
+        Assert.DoesNotContain(PASSWORD, request.ToString());
+        Assert.Equal("***", request.Password.ToString());
+
+        // 密码已登记脱敏: 启动器不小心把它写进任何发给外壳的文字, 都会被遮住
+        runner.Reporter!.Log("error", $"登录失败 {PASSWORD} / {Uri.EscapeDataString(PASSWORD)}");
+        runner.Reporter.Failed(CatCodes.AUTHORIZATION_REQUIRED, $"国际服登录被拒绝: {PASSWORD}");
+
+        var seen = new List<(string Method, JsonNode? Params)>();
+        client.WaitForEvent("launch.failed", Timeout, seen);
+        Assert.All(seen, x => Assert.DoesNotContain(PASSWORD, x.Params?.ToJsonString(CatProtocol.JsonOptions) ?? string.Empty));
+        Assert.All(seen, x => Assert.DoesNotContain(Uri.EscapeDataString(PASSWORD), x.Params?.ToJsonString(CatProtocol.JsonOptions) ?? string.Empty));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task Launch_International_WithoutPassword_IsRejected(string? password)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = password == null
+                           ? await client.RequestAsync("launch", new { operationId = "op1", accountName = "seAccount", dalamud = false, platform = "international" })
+                           : await client.RequestAsync("launch", new { operationId = "op1", accountName = "seAccount", dalamud = false, platform = "international", password });
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+        Assert.False(host.HasLaunch);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("shengqu")]
+    [InlineData("weGame")]
+    public async Task Launch_DomesticPlatform_IgnoresPassword(string? platform)
+    {
+        const string PASSWORD = "should-not-be-kept";
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = platform == null
+                           ? await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, password = PASSWORD })
+                           : await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, platform, password = PASSWORD });
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.False(runner.Request!.IsInternational);
+        Assert.Null(runner.Request.Password);
+
+        // 与不带 password 时得到的请求完全相同
+        var expectedType = platform == "weGame" ? XIVAccountType.WeGame : XIVAccountType.Sdo;
+        Assert.Equal(new CatLaunchRequest("op1", "acc", false, null, null, Platform: expectedType), runner.Request);
+    }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData("weGame", false)]
+    [InlineData("international", true)]
+    public async Task Launch_RunnerIsChosenByPlatform_OnlyWhenLaunchIsAccepted(string? platform, bool expectInternational)
+    {
+        var domestic      = new FakeGameRunner();
+        var international = new FakeGameRunner();
+        var calls         = 0;
+
+        var factoryHost = new CatLaunchHost
+        (
+            launchRequest =>
+            {
+                calls++;
+                return launchRequest.IsInternational ? international : domestic;
+            },
+            (_, _) => Task.CompletedTask,
+            new CatLogRedactor()
+        );
+
+        // 被拒绝的 launch 不建启动器
+        Assert.False(factoryHost.Launch(new CatLaunchParams("op1", "acc", false, null, Platform: "international")).Accepted);
+        Assert.Equal(0, calls);
+
+        Assert.True(factoryHost.Launch(new CatLaunchParams("op1", "acc", false, null, Platform: platform, Password: "pw-123456")).Accepted);
+        Assert.Equal(1, calls);
+
+        var chosen = expectInternational ? international : domestic;
+        var other  = expectInternational ? domestic : international;
+        await chosen.Started.Task.WaitAsync(Timeout);
+        Assert.False(other.Started.Task.IsCompleted);
+
+        // close 交给选中的那个启动器
+        Assert.True(factoryHost.Close(new CatCloseParams(1)).Accepted);
+        await chosen.Closed.Task.WaitAsync(Timeout);
+        Assert.False(other.Closed.Task.IsCompleted);
+
+        chosen.Finish.TrySetResult(0);
+    }
+
+    [Fact]
+    public void LaunchParams_ToString_DoesNotPrintPassword()
+    {
+        var parameters = new CatLaunchParams("op1", "seAccount", true, null, Platform: "international", Password: "TopSecret-123");
+
+        Assert.DoesNotContain("TopSecret-123", parameters.ToString());
+        Assert.DoesNotContain("TopSecret-123", $"{parameters}");
+    }
+
+    [Theory]
+    [InlineData(null, true, CatPlatform.Shengqu)]
+    [InlineData(" ", true, CatPlatform.Shengqu)]
+    [InlineData("shengqu", true, CatPlatform.Shengqu)]
+    [InlineData("WEGAME", true, CatPlatform.WeGame)]
+    [InlineData("international", true, CatPlatform.International)]
+    [InlineData("International", true, CatPlatform.International)]
+    [InlineData(" INTERNATIONAL ", true, CatPlatform.International)]
+    [InlineData("global", false, CatPlatform.Shengqu)]
+    [InlineData("intl", false, CatPlatform.Shengqu)]
+    [InlineData("steam", false, CatPlatform.Shengqu)]
+    public void Platform_TryParsePlatform(string? platform, bool expectedOk, CatPlatform expected)
+    {
+        Assert.Equal(expectedOk, CatPlatforms.TryParsePlatform(platform, out var channel));
+        Assert.Equal(expected, channel);
+    }
+
+    [Fact]
+    public void Redactor_RegisterSecret_HidesShortValuesAndEncodedForms()
+    {
+        var redactor = new CatLogRedactor();
+        redactor.Register("abc");           // 普通登记: 短于 6 个字符不登记
+        redactor.RegisterSecret("p@ 1");    // 必须遮住的值: 不看长度, 连同编码形式
+
+        Assert.Equal("abc *** *** ***", redactor.Redact("abc p@ 1 p%40%201 p%40+1"));
+    }
+
+    [Theory]
     [InlineData("steam")]
     [InlineData("sdo")]
     [InlineData("we game")]

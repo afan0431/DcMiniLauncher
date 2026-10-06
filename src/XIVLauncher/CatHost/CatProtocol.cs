@@ -180,6 +180,9 @@ public static class CatPlatforms
     /// <summary>WeGame 版国服: 只能启动已在本机界面版登录过一次的号</summary>
     public const string WE_GAME = "weGame";
 
+    /// <summary>国际服（Square Enix 账号, Windows 版）: 用 launch 带来的账号名和密码登录, 不用账号库</summary>
+    public const string INTERNATIONAL = "international";
+
     /// <summary>
     ///     解析 platform: 没带（或为空白）按盛趣, 取值不分大小写; 不认识的取值返回 false
     /// </summary>
@@ -209,6 +212,55 @@ public static class CatPlatforms
     /// </summary>
     public static string DisplayName(XIVAccountType accountType) =>
         accountType == XIVAccountType.WeGame ? "WeGame" : "盛趣";
+
+    /// <summary>
+    ///     解析 platform（含国际服）: 国服两个渠道的判定沿用 <see cref="TryParse(string?, out XIVAccountType)" />, 另认 international;
+    ///     不认识的取值返回 false
+    /// </summary>
+    public static bool TryParsePlatform(string? platform, out CatPlatform channel)
+    {
+        channel = CatPlatform.Shengqu;
+
+        if (TryParse(platform, out var accountType))
+        {
+            channel = accountType == XIVAccountType.WeGame ? CatPlatform.WeGame : CatPlatform.Shengqu;
+            return true;
+        }
+
+        if (string.Equals(platform!.Trim(), INTERNATIONAL, StringComparison.OrdinalIgnoreCase))
+        {
+            channel = CatPlatform.International;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    ///     渠道在日志和消息里的叫法（国服两个渠道与 <see cref="DisplayName(XIVAccountType)" /> 相同）
+    /// </summary>
+    public static string DisplayName(CatPlatform channel) =>
+        channel switch
+        {
+            CatPlatform.International => "国际服",
+            CatPlatform.WeGame        => DisplayName(XIVAccountType.WeGame),
+            _                         => DisplayName(XIVAccountType.Sdo)
+        };
+}
+
+/// <summary>
+///     launch 的渠道。国际服不进 <see cref="XIVAccountType" />: 那个枚举是国服账号库、登录方式、设置共用的, 加成员会波及界面版
+/// </summary>
+public enum CatPlatform
+{
+    /// <summary>盛趣官服</summary>
+    Shengqu,
+
+    /// <summary>WeGame 版国服</summary>
+    WeGame,
+
+    /// <summary>国际服</summary>
+    International
 }
 
 /// <summary>stdin 第一行握手</summary>
@@ -225,7 +277,8 @@ public sealed record CatMinionParams(string? CardFingerprint, string? Variant);
 
 /// <summary>
 ///     launch 参数; areaName = 资料里的大区名（如 豆豆柴）, 账号库没记这个号的大区时用它;
-///     platform = 渠道, 见 <see cref="CatPlatforms" />, 不带按盛趣
+///     platform = 渠道, 见 <see cref="CatPlatforms" />, 不带按盛趣;
+///     password = 国际服的 Square Enix 账号密码（国际服必填, 其它渠道带了也不用）
 /// </summary>
 public sealed record CatLaunchParams
 (
@@ -235,8 +288,41 @@ public sealed record CatLaunchParams
     CatMinionParams? Minion,
     int?             CrashDialogTimeoutSeconds = null,
     string?          AreaName                  = null,
-    string?          Platform                  = null
-);
+    string?          Platform                  = null,
+    string?          Password                  = null
+)
+{
+    /// <summary>
+    ///     record 自动生成的 ToString 会打印所有成员, 这里改成不带密码, 免得哪天被写进日志
+    /// </summary>
+    public override string ToString() =>
+        $"CatLaunchParams {{ OperationId = {OperationId}, AccountName = {AccountName}, Dalamud = {Dalamud}, Minion = {Minion}, " +
+        $"CrashDialogTimeoutSeconds = {CrashDialogTimeoutSeconds}, AreaName = {AreaName}, Platform = {Platform}, Password = {(Password == null ? "(无)" : "***")} }}";
+}
+
+/// <summary>
+///     不该出现在日志里的值（国际服密码）: ToString 恒为 ***, 取原文必须显式调 <see cref="Reveal" />
+/// </summary>
+public sealed class CatSecret(string value) : IEquatable<CatSecret>
+{
+    private readonly string value = value ?? throw new ArgumentNullException(nameof(value));
+
+    /// <summary>取原文; 只在真正要用的地方调, 不要把结果写进日志、事件或文件</summary>
+    public string Reveal() => value;
+
+    /// <inheritdoc />
+    public bool Equals(CatSecret? other) =>
+        other != null && string.Equals(value, other.value, StringComparison.Ordinal);
+
+    /// <inheritdoc />
+    public override bool Equals(object? obj) => Equals(obj as CatSecret);
+
+    /// <inheritdoc />
+    public override int GetHashCode() => 0;
+
+    /// <inheritdoc />
+    public override string ToString() => "***";
+}
 
 /// <summary>inject 参数; force = 已挂着也重新挂 Minion</summary>
 public sealed record CatInjectParams(bool? Dalamud, bool? Minion, bool? Force = null);

@@ -18,11 +18,19 @@ public sealed record CatLaunchRequest
     string?        Variant,
     int            CrashDialogTimeoutSeconds = CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS,
     string?        AreaName                  = null,
-    XIVAccountType Platform                  = XIVAccountType.Sdo
+    XIVAccountType Platform                  = XIVAccountType.Sdo,
+    bool           IsInternational           = false,
+    CatSecret?     Password                  = null
 )
 {
     /// <summary>是否为 WeGame 版国服的号</summary>
     public bool IsWeGame => Platform == XIVAccountType.WeGame;
+
+    /// <summary>
+    ///     渠道（含国际服）。<see cref="Platform" /> 只对国服有意义（账号库里的行类型）, 国际服时它停在缺省值, 不要拿去用
+    /// </summary>
+    public CatPlatform Channel =>
+        IsInternational ? CatPlatform.International : IsWeGame ? CatPlatform.WeGame : CatPlatform.Shengqu;
 
     /// <summary>是否要挂 Minion</summary>
     public bool Minion => CardFingerprint != null;
@@ -102,7 +110,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
     private static readonly TimeSpan GuardErrorPollInterval = TimeSpan.FromSeconds(1);
 
-    private readonly ICatGameRunner             runner;
+    private readonly Func<CatLaunchRequest, ICatGameRunner> runnerFactory;
     private readonly Func<string, object, Task> publish;
     private readonly CatLogRedactor             redactor;
     private readonly object                     stateLock  = new();
@@ -110,6 +118,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     private readonly Channel<(string Method, object Parameters)> events =
         Channel.CreateUnbounded<(string Method, object Parameters)>(new UnboundedChannelOptions { SingleReader = true });
 
+    private ICatGameRunner?   runner;
     private CatLaunchRequest? request;
     private string            stage = CatStages.IDLE;
     private int?              pid;
@@ -128,10 +137,21 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     /// <param name="publish">发事件（方法名, 参数）</param>
     /// <param name="redactor">日志脱敏</param>
     public CatLaunchHost(ICatGameRunner runner, Func<string, object, Task> publish, CatLogRedactor redactor)
+        : this(_ => runner, publish, redactor)
     {
-        this.runner   = runner;
-        this.publish  = publish;
-        this.redactor = redactor;
+    }
+
+    /// <summary>
+    ///     创建分发器; 启动器要等收到 launch、知道渠道后才选（国服与国际服是两个互不相干的启动器）
+    /// </summary>
+    /// <param name="runnerFactory">按已校验的 launch 请求给出启动器; 只在接受 launch 时调一次</param>
+    /// <param name="publish">发事件（方法名, 参数）</param>
+    /// <param name="redactor">日志脱敏</param>
+    public CatLaunchHost(Func<CatLaunchRequest, ICatGameRunner> runnerFactory, Func<string, object, Task> publish, CatLogRedactor redactor)
+    {
+        this.runnerFactory = runnerFactory;
+        this.publish       = publish;
+        this.redactor      = redactor;
 
         _ = Task.Run(PumpEventsAsync);
     }
@@ -203,10 +223,19 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (parameters.CrashDialogTimeoutSeconds is { } crashTimeout and (< 1 or > CatProtocol.MAX_CRASH_DIALOG_TIMEOUT_SECONDS))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"crashDialogTimeoutSeconds 必须在 1 到 {CatProtocol.MAX_CRASH_DIALOG_TIMEOUT_SECONDS} 之间");
 
-        if (!CatPlatforms.TryParse(parameters.Platform, out var platform))
-            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"platform 只能是 {CatPlatforms.SHENGQU} 或 {CatPlatforms.WE_GAME}");
+        if (!CatPlatforms.TryParsePlatform(parameters.Platform, out var channel))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"platform 只能是 {CatPlatforms.SHENGQU}、{CatPlatforms.WE_GAME} 或 {CatPlatforms.INTERNATIONAL}");
+
+        var isInternational = channel == CatPlatform.International;
+
+        // 密码不管哪个渠道带来的都先登记脱敏（不受最短长度限制）; 只有国际服会留着用
+        redactor.RegisterSecret(parameters.Password);
+
+        if (isInternational && string.IsNullOrEmpty(parameters.Password))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "国际服必须带 password");
 
         CatLaunchRequest accepted;
+        ICatGameRunner   selected;
 
         lock (stateLock)
         {
@@ -225,23 +254,27 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 parameters.Minion?.Variant,
                 parameters.CrashDialogTimeoutSeconds ?? CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS,
                 string.IsNullOrWhiteSpace(parameters.AreaName) ? null : parameters.AreaName.Trim(),
-                platform
+                channel == CatPlatform.WeGame ? XIVAccountType.WeGame : XIVAccountType.Sdo,
+                isInternational,
+                isInternational ? new CatSecret(parameters.Password!) : null
             );
-            request = accepted;
+            selected = runnerFactory(accepted);
+            runner   = selected;
+            request  = accepted;
         }
 
         Serilog.Log.Information
         (
             "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s",
             accepted.OperationId,
-            CatPlatforms.DisplayName(accepted.Platform),
+            CatPlatforms.DisplayName(accepted.Channel),
             accepted.AccountName,
             accepted.Dalamud,
             accepted.Minion ? $"{accepted.CardFingerprint}/{accepted.Variant}" : "否",
             accepted.CrashDialogTimeoutSeconds
         );
 
-        _ = Task.Run(() => RunLifecycleAsync(accepted));
+        _ = Task.Run(() => RunLifecycleAsync(selected, accepted));
         return CatAcceptResult.Ok();
     }
 
@@ -257,11 +290,18 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (!wantDalamud && !wantMinion)
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "dalamud 与 minion 至少要有一个为 true");
 
+        ICatGameRunner? current;
+
         lock (stateLock)
         {
             if (pid == null || stage != CatStages.RUNNING || closeRequested || runnerFaulted)
                 return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
+
+            current = runner;
         }
+
+        if (current == null)
+            return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
 
         if (Interlocked.Exchange(ref injectBusy, 1) == 1)
             return CatAcceptResult.Rejected(CatCodes.BUSY, "上一次补注入还没结束");
@@ -271,7 +311,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             {
                 try
                 {
-                    await runner.InjectAsync(wantDalamud, wantMinion, force, this, CancellationToken.None).ConfigureAwait(false);
+                    await current.InjectAsync(wantDalamud, wantMinion, force, this, CancellationToken.None).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -302,6 +342,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         bool faulted;
         int? gamePid;
         DateTimeOffset? startedAt;
+        ICatGameRunner? current;
 
         lock (stateLock)
         {
@@ -309,6 +350,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 return CatAcceptResult.Ok();
 
             closeRequested = true;
+            current        = runner;
             hasLaunch      = request != null;
             faulted        = runnerFaulted;
             gamePid        = pid;
@@ -320,7 +362,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         Serilog.Log.Information("[CatHost] 收到 close, 等游戏自己退出最多 {Seconds}s", timeout.TotalSeconds);
 
-        if (!hasLaunch)
+        if (!hasLaunch || current == null)
         {
             completion.TrySetResult(CatHostRuntime.EXIT_OK);
             return CatAcceptResult.Ok();
@@ -335,7 +377,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                     if (faulted && gamePid is { } target)
                         await CatGameCloser.CloseAsync(target, startedAt, timeout).ConfigureAwait(false);
                     else
-                        await runner.CloseAsync(timeout).ConfigureAwait(false);
+                        await current.CloseAsync(timeout).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -455,13 +497,13 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
     #endregion
 
-    private async Task RunLifecycleAsync(CatLaunchRequest accepted)
+    private async Task RunLifecycleAsync(ICatGameRunner selected, CatLaunchRequest accepted)
     {
         int exitCode;
 
         try
         {
-            exitCode = await runner.RunAsync(accepted, this, CancellationToken.None).ConfigureAwait(false);
+            exitCode = await selected.RunAsync(accepted, this, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
