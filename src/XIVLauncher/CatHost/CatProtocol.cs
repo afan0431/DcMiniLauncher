@@ -146,6 +146,21 @@ public static class CatCodes
 
     /// <summary>已收到 close, 不再接受 launch</summary>
     public const string CLOSING = "closing";
+
+    /// <summary>已拉起 WeGame, 等够时间没有人登录（只在 launch 带 weGameLogin 时报）</summary>
+    public const string WE_GAME_LOGIN_TIMEOUT = "weGameLoginTimeout";
+
+    /// <summary>本机已有另一个号在等 WeGame 登录（只在 launch 带 weGameLogin 时报）</summary>
+    public const string WE_GAME_LOGIN_BUSY = "weGameLoginBusy";
+
+    /// <summary>在 WeGame 里登录的不是上号请求指的那个号, 没有保存（只在 launch 带 weGameLogin 时报）</summary>
+    public const string WE_GAME_ACCOUNT_MISMATCH = "weGameAccountMismatch";
+
+    /// <summary>账号库里有多个 WeGame 号的备注写着请求的号（launch 带 weGameLogin 时报; 不带时仍报 authorizationRequired）</summary>
+    public const string WE_GAME_ACCOUNT_AMBIGUOUS = "weGameAccountAmbiguous";
+
+    /// <summary>登录用的文件写不进游戏目录, 要用管理员身份打开一次界面版（只在 launch 带 weGameLogin 时报）</summary>
+    public const string WE_GAME_SETUP_REQUIRED = "weGameSetupRequired";
 }
 
 /// <summary>game.exited 的 reason（不带 reason = 游戏自己退出或被外部结束）</summary>

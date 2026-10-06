@@ -201,7 +201,7 @@ public sealed class CatWeGameLoginCaptureTests
 
         var ex = await Assert.ThrowsAsync<CatLaunchException>(() => Create().FindRowAsync(Request(weGameLogin), reporter, CancellationToken.None));
 
-        Assert.Equal(CatCodes.AUTHORIZATION_REQUIRED, ex.Code);
+        Assert.Equal(weGameLogin ? CatCodes.WE_GAME_ACCOUNT_AMBIGUOUS : CatCodes.AUTHORIZATION_REQUIRED, ex.Code);
         Assert.Equal("DcMiniLauncher 里有多个 WeGame 号的备注写着 123456，请只留一个", ex.Message);
         Assert.Equal(0, environment.CaptureCount);
     }
@@ -214,7 +214,7 @@ public sealed class CatWeGameLoginCaptureTests
 
         var ex = await Assert.ThrowsAsync<CatLaunchException>(() => Create().FindRowAsync(Request(true), reporter, CancellationToken.None));
 
-        Assert.Equal(CatCodes.AUTHORIZATION_REQUIRED, ex.Code);
+        Assert.Equal(CatCodes.WE_GAME_ACCOUNT_MISMATCH, ex.Code);
         Assert.Equal("登录的 WeGame 账号已经绑定了客户 654321，请确认登录的是不是这个号", ex.Message);
         Assert.Empty(store.Saved);
         Assert.Equal("654321", store.Rows.Single().Note);
@@ -231,7 +231,7 @@ public sealed class CatWeGameLoginCaptureTests
 
         var ex = await Assert.ThrowsAsync<CatLaunchException>(() => capture.LoginAsync(Request(true), row, reporter, LoginOk, CancellationToken.None));
 
-        Assert.Equal(CatCodes.AUTHORIZATION_REQUIRED, ex.Code);
+        Assert.Equal(CatCodes.WE_GAME_ACCOUNT_MISMATCH, ex.Code);
         Assert.Equal("登录的 WeGame 账号不是 DcMiniLauncher 里记着 123456 的那一个，请确认登录的是不是这个号", ex.Message);
         Assert.Empty(store.Saved);
         Assert.Empty(loginTokens);
@@ -245,7 +245,7 @@ public sealed class CatWeGameLoginCaptureTests
 
         var ex = await Assert.ThrowsAsync<CatLaunchException>(() => Create().FindRowAsync(Request(true), reporter, CancellationToken.None));
 
-        Assert.Equal(CatCodes.BUSY, ex.Code);
+        Assert.Equal(CatCodes.WE_GAME_LOGIN_BUSY, ex.Code);
         Assert.Equal("这台电脑正在等另一个 WeGame 号登录，请先完成或取消那一个", ex.Message);
 
         // 没轮到自己: 不结束 WeGame 客户端（那会打断正在等的那个号）, 不报等待
@@ -261,7 +261,7 @@ public sealed class CatWeGameLoginCaptureTests
 
         var ex = await Assert.ThrowsAsync<CatLaunchException>(() => capture.FindRowAsync(Request(true), reporter, CancellationToken.None)).WaitAsync(Timeout);
 
-        Assert.Equal(CatCodes.AUTHORIZATION_REQUIRED, ex.Code);
+        Assert.Equal(CatCodes.WE_GAME_LOGIN_TIMEOUT, ex.Code);
         Assert.StartsWith("WeGame 等了 ", ex.Message);
         Assert.EndsWith(" 分钟没有登录，请重新上号", ex.Message);
         Assert.Equal(["stage:waitingWeGameLogin"], reporter.Entries);
@@ -307,13 +307,13 @@ public sealed class CatWeGameLoginCaptureTests
     }
 
     [Fact]
-    public async Task VersionDllNotWritable_ReportsInvalidGamePath_WithoutElevation()
+    public async Task VersionDllNotWritable_ReportsSetupRequired_WithoutElevation()
     {
         environment.Failure = new VersionDllPermissionDeniedException(@"X:\res\version.dll", @"X:\game\sdo\sdologin\version.dll", new UnauthorizedAccessException());
 
         var ex = await Assert.ThrowsAsync<CatLaunchException>(() => Create().FindRowAsync(Request(true), reporter, CancellationToken.None));
 
-        Assert.Equal(CatCodes.INVALID_GAME_PATH, ex.Code);
+        Assert.Equal(CatCodes.WE_GAME_SETUP_REQUIRED, ex.Code);
         Assert.Equal("请用管理员身份打开一次 DcMiniLauncher 界面版完成 WeGame 设置", ex.Message);
         Assert.Empty(environment.Calls);
         Assert.Empty(reporter.Entries);

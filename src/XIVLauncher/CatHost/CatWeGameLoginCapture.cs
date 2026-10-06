@@ -248,18 +248,18 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
             catch (Exception ex) when (timeout.IsCancellationRequested)
             {
                 Log.Warning(ex, "[CatHost] 等了 {Timeout} 没有人在 WeGame 里登录", LoginTimeout);
-                throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, TimeoutMessage(LoginTimeout));
+                throw new CatLaunchException(CatCodes.WE_GAME_LOGIN_TIMEOUT, TimeoutMessage(LoginTimeout));
             }
             catch (WeGameCapturePipeBusyException ex)
             {
                 Log.Warning(ex, "[CatHost] 本机已有别的进程在等 WeGame 登录");
-                throw new CatLaunchException(CatCodes.BUSY, "这台电脑正在等另一个 WeGame 号登录，请先完成或取消那一个");
+                throw new CatLaunchException(CatCodes.WE_GAME_LOGIN_BUSY, "这台电脑正在等另一个 WeGame 号登录，请先完成或取消那一个");
             }
             catch (VersionDllPermissionDeniedException ex)
             {
                 // 无界面模式不弹 UAC、不提权
                 Log.Warning(ex, "[CatHost] 写不进 sdologin 目录: {Path}", ex.DestinationPath);
-                throw new CatLaunchException(CatCodes.INVALID_GAME_PATH, "请用管理员身份打开一次 DcMiniLauncher 界面版完成 WeGame 设置");
+                throw new CatLaunchException(CatCodes.WE_GAME_SETUP_REQUIRED, "请用管理员身份打开一次 DcMiniLauncher 界面版完成 WeGame 设置");
             }
             catch (Exception ex)
             {
@@ -292,7 +292,7 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
             Log.Warning("[CatHost] 登录的 WeGame 用户号 {UserId} 不是账号库里 {Requested} 对着的 {Expected}, 不保存", userId, requested, expected.UserName);
             throw new CatLaunchException
             (
-                CatCodes.AUTHORIZATION_REQUIRED,
+                CatCodes.WE_GAME_ACCOUNT_MISMATCH,
                 $"登录的 WeGame 账号不是 DcMiniLauncher 里记着 {requested} 的那一个，请确认登录的是不是这个号"
             );
         }
@@ -305,7 +305,7 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
             Log.Warning("[CatHost] 登录的 WeGame 用户号 {UserId} 的备注是 {Note}, 对不上请求的号 {Requested}, 不保存", userId, existing.Note, requested);
             throw new CatLaunchException
             (
-                CatCodes.AUTHORIZATION_REQUIRED,
+                CatCodes.WE_GAME_ACCOUNT_MISMATCH,
                 $"登录的 WeGame 账号已经绑定了客户 {existing.Note.Trim()}，请确认登录的是不是这个号"
             );
         }
@@ -343,7 +343,7 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
     }
 
     private static CatLaunchException AmbiguousNote(CatLaunchRequest request) =>
-        new(CatCodes.AUTHORIZATION_REQUIRED, $"DcMiniLauncher 里有多个 WeGame 号的备注写着 {request.AccountName}，请只留一个");
+        new(request.WeGameLogin ? CatCodes.WE_GAME_ACCOUNT_AMBIGUOUS : CatCodes.AUTHORIZATION_REQUIRED, $"DcMiniLauncher 里有多个 WeGame 号的备注写着 {request.AccountName}，请只留一个");
 }
 
 /// <summary>
