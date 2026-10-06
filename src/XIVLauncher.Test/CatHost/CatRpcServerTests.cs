@@ -140,6 +140,58 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)] // 不带 weGameLogin: 与加这个字段之前一样
+    public async Task Launch_WeGame_PassesWeGameLoginFlag(bool? weGameLogin)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = weGameLogin == null
+                           ? await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame" })
+                           : await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin });
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.Equal(weGameLogin == true, runner.Request!.WeGameLogin);
+        Assert.Equal(new CatLaunchRequest("op1", "123456", false, null, null, Platform: XIVAccountType.WeGame, WeGameLogin: weGameLogin == true), runner.Request);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("shengqu")]
+    [InlineData("international")]
+    public async Task Launch_WeGameLogin_OnOtherPlatform_IsRejected(string? platform)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = platform == null
+                           ? await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, weGameLogin = true, password = "pw-123456" })
+                           : await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, platform, weGameLogin = true, password = "pw-123456" });
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+        Assert.False(host.HasLaunch);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("shengqu")]
+    [InlineData("international")]
+    public async Task Launch_WeGameLoginFalse_OnOtherPlatform_IsAccepted(string? platform)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = platform == null
+                           ? await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, weGameLogin = false, password = "pw-123456" })
+                           : await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, platform, weGameLogin = false, password = "pw-123456" });
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.False(runner.Request!.WeGameLogin);
+    }
+
+    [Theory]
     [InlineData("shengqu")]
     [InlineData("ShengQu")]
     [InlineData(null)] // 不带 platform: 按盛趣, 与加这个字段之前一样
@@ -392,7 +444,8 @@ public sealed class CatRpcServerTests : IDisposable
     [InlineData("9876543210", null, CatWeGameAccountMatch.None)]
     // 两行的备注都写着: 不猜
     [InlineData("555666", null, CatWeGameAccountMatch.AmbiguousNote)]
-    // 不是纯数字的号不按备注找
+    // 不是纯数字的号: 备注整串相同才算
+    [InlineData("wang@example.com", "10000000000000007", CatWeGameAccountMatch.ByNote)]
     [InlineData("老王", null, CatWeGameAccountMatch.None)]
     [InlineData("QQ987654321", null, CatWeGameAccountMatch.None)]
     [InlineData("123 456", null, CatWeGameAccountMatch.None)]
@@ -411,6 +464,7 @@ public sealed class CatRpcServerTests : IDisposable
             ("10000000000000005", null),
             ("13800001111", ""),
             ("10000000000000006", "13800001111"),
+            ("10000000000000007", " wang@example.com "),
             ("", "777888")
         ];
         var boxed = rows.Select(x => Tuple.Create(x.Name, x.Note)).ToArray();

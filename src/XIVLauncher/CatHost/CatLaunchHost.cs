@@ -7,7 +7,7 @@ using XIVLauncher.Minion;
 namespace XIVLauncher.CatHost;
 
 /// <summary>
-///     一次 launch 的参数（已校验）
+///     一次 launch 的参数（已校验）; WeGameLogin = WeGame 号在本机没有可用的登录信息时拉起 WeGame 等员工登录, 为 false 时直接报 authorizationRequired
 /// </summary>
 public sealed record CatLaunchRequest
 (
@@ -20,7 +20,8 @@ public sealed record CatLaunchRequest
     string?        AreaName                  = null,
     XIVAccountType Platform                  = XIVAccountType.Sdo,
     bool           IsInternational           = false,
-    CatSecret?     Password                  = null
+    CatSecret?     Password                  = null,
+    bool           WeGameLogin               = false
 )
 {
     /// <summary>是否为 WeGame 版国服的号</summary>
@@ -238,6 +239,11 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (isInternational && parameters.Minion != null && parameters.Minion.Variant != MinionCards.VARIANT_GLOBAL)
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"国际服的 minion.variant 只能是 {MinionCards.VARIANT_GLOBAL}");
 
+        var weGameLogin = parameters.WeGameLogin == true;
+
+        if (weGameLogin && channel != CatPlatform.WeGame)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"weGameLogin 只能用于 platform 为 {CatPlatforms.WE_GAME} 的号");
+
         CatLaunchRequest accepted;
         ICatGameRunner   selected;
 
@@ -260,7 +266,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 string.IsNullOrWhiteSpace(parameters.AreaName) ? null : parameters.AreaName.Trim(),
                 channel == CatPlatform.WeGame ? XIVAccountType.WeGame : XIVAccountType.Sdo,
                 isInternational,
-                isInternational ? new CatSecret(parameters.Password!) : null
+                isInternational ? new CatSecret(parameters.Password!) : null,
+                weGameLogin
             );
             selected = runnerFactory(accepted);
             runner   = selected;
@@ -269,13 +276,14 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         Serilog.Log.Information
         (
-            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s",
+            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s, 就地登录 WeGame={WeGameLogin}",
             accepted.OperationId,
             CatPlatforms.DisplayName(accepted.Channel),
             accepted.AccountName,
             accepted.Dalamud,
             accepted.Minion ? $"{accepted.CardFingerprint}/{accepted.Variant}" : "否",
-            accepted.CrashDialogTimeoutSeconds
+            accepted.CrashDialogTimeoutSeconds,
+            accepted.WeGameLogin
         );
 
         _ = Task.Run(() => RunLifecycleAsync(selected, accepted));

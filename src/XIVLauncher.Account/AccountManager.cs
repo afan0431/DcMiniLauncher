@@ -204,6 +204,16 @@ public class AccountManager
     }
 
     /// <summary>
+    ///     从数据库读出当前所有账号行的副本，包含其它进程写入、本进程尚未加载的行，不改动内存中的账号列表
+    /// </summary>
+    /// <returns>数据库中的账号行</returns>
+    public IReadOnlyList<XIVAccount> ReadStoredAccounts()
+    {
+        lock (accountSyncRoot)
+            return Database.Table<XIVAccount>().ToArray();
+    }
+
+    /// <summary>
     ///     数据库表中除主键外的所有列
     /// </summary>
     private TableMapping.Column[] AccountColumns =>

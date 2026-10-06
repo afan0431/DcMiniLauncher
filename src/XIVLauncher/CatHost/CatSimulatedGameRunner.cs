@@ -13,6 +13,7 @@ namespace XIVLauncher.CatHost;
 ///         <item><c>crash:</c> 或 <c>crash:restart</c>: 运行一会儿后崩溃并重启一次（game.restarted, 进程号变）</item>
 ///         <item><c>crash:dialog</c>: 运行一会儿后崩溃, 崩溃对话框没人选 → game.crashed, 等待超时后 game.exited{reason:"crashDialogTimeout"}</item>
 ///         <item>minion.cardFingerprint 为 <c>0000000000000000</c>: 发 launch.failed{minionCardNotFound}</item>
+///         <item>WeGame 号带了 weGameLogin: 先进 waitingWeGameLogin 阶段停一会儿（当作员工在 WeGame 里登录）, 回到 preparing 后照常继续; 期间 close 则发 launch.failed{cancelled}</item>
 ///         <item>占位进程被结束时发 game.exited; close 时结束占位进程并发 game.exited{reason:"closed"}; 随后本进程退出</item>
 ///     </list>
 /// </summary>
@@ -44,6 +45,9 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
     /// <summary>每个阶段之间的停顿</summary>
     public TimeSpan StepDelay { get; init; } = TimeSpan.FromMilliseconds(300);
+
+    /// <summary>带了 weGameLogin 时在 waitingWeGameLogin 阶段停多久</summary>
+    public TimeSpan WeGameLoginDelay { get; init; } = TimeSpan.FromSeconds(8);
 
     /// <summary>崩溃前运行多久</summary>
     public TimeSpan CrashAfter { get; init; } = TimeSpan.FromSeconds(3);
@@ -117,6 +121,13 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         reporter.Log("information", $"模拟模式: 不登录、不启动真游戏（渠道: {CatPlatforms.DisplayName(request.Channel)}）");
         reporter.Stage(CatStages.PREPARING);
         await Task.Delay(StepDelay, token).ConfigureAwait(false);
+
+        if (request is { IsWeGame: true, WeGameLogin: true })
+        {
+            reporter.Stage(CatStages.WAITING_WE_GAME_LOGIN);
+            await Task.Delay(WeGameLoginDelay, token).ConfigureAwait(false);
+            reporter.Stage(CatStages.PREPARING);
+        }
 
         if (account.StartsWith(FAIL_PREFIX, StringComparison.Ordinal))
         {

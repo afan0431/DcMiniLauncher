@@ -11,11 +11,29 @@ public sealed class WeGameLoginCapturer
 {
     private const string PIPE_NAME = "ApkalluCaller";
 
-    public async Task<WeGameCaptureResult> CaptureAsync
+    public Task<WeGameCaptureResult> CaptureAsync
     (
         string            sdologinDir,
         CancellationToken cancellationToken,
         IProgress<string> progress
+    ) =>
+        CaptureAsync(sdologinDir, cancellationToken, progress, null, null);
+
+    /// <summary>
+    ///     部署 version.dll、占住管道、唤起 WeGame 并等登录信息
+    /// </summary>
+    /// <param name="sdologinDir">WeGame 版游戏的 sdologin 目录</param>
+    /// <param name="cancellationToken">取消</param>
+    /// <param name="progress">进度文字</param>
+    /// <param name="beforeLaunch">管道已占住（确认本机没有别的进程在等登录）、唤起 WeGame 之前调用</param>
+    /// <param name="afterLaunch">唤起 WeGame 之后、开始等登录之前调用</param>
+    public async Task<WeGameCaptureResult> CaptureAsync
+    (
+        string            sdologinDir,
+        CancellationToken cancellationToken,
+        IProgress<string> progress,
+        Action?           beforeLaunch,
+        Action?           afterLaunch
     )
     {
         progress.Report("正在部署 version.dll");
@@ -55,7 +73,9 @@ public sealed class WeGameLoginCapturer
                          }
                      }).ConfigureAwait(false))
         {
+            beforeLaunch?.Invoke();
             TryLaunchWeGame(progress);
+            afterLaunch?.Invoke();
 
             await pipe.WaitForConnectionAsync(cancellationToken).ConfigureAwait(false);
 
@@ -155,7 +175,7 @@ public sealed class WeGameLoginCapturer
     }
 }
 
-internal sealed class VersionDllPermissionDeniedException(string sourcePath, string destinationPath, Exception innerException)
+public sealed class VersionDllPermissionDeniedException(string sourcePath, string destinationPath, Exception innerException)
     : Exception($"无权限写入 {destinationPath}", innerException)
 {
     public string SourcePath { get; } = sourcePath;
@@ -163,5 +183,5 @@ internal sealed class VersionDllPermissionDeniedException(string sourcePath, str
     public string DestinationPath { get; } = destinationPath;
 }
 
-internal sealed class WeGameCapturePipeBusyException(Exception innerException)
+public sealed class WeGameCapturePipeBusyException(Exception innerException)
     : Exception("命名管道 ApkalluCaller 已被另一个进程占用", innerException);

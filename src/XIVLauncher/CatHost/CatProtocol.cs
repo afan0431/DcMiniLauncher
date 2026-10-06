@@ -68,6 +68,9 @@ public static class CatStages
     /// <summary>准备（账号、游戏目录、登录换票据、跨区会话）</summary>
     public const string PREPARING = "preparing";
 
+    /// <summary>已在本机拉起 WeGame, 等员工在 WeGame 窗口里登录这个号; 登录完回到 <see cref="PREPARING" /></summary>
+    public const string WAITING_WE_GAME_LOGIN = "waitingWeGameLogin";
+
     /// <summary>Dalamud 准备与更新</summary>
     public const string UPDATING_DALAMUD = "updatingDalamud";
 
@@ -177,7 +180,7 @@ public static class CatPlatforms
     /// <summary>盛趣官服（缺省）</summary>
     public const string SHENGQU = "shengqu";
 
-    /// <summary>WeGame 版国服: 只能启动已在本机界面版登录过一次的号</summary>
+    /// <summary>WeGame 版国服: 用本机存下的 WeGame 登录信息; 没有可用的时, launch 带 weGameLogin 才会拉起 WeGame 等员工登录</summary>
     public const string WE_GAME = "weGame";
 
     /// <summary>国际服（Square Enix 账号, Windows 版）: 用 launch 带来的账号名和密码登录, 不用账号库</summary>
@@ -278,7 +281,8 @@ public sealed record CatMinionParams(string? CardFingerprint, string? Variant);
 /// <summary>
 ///     launch 参数; areaName = 资料里的大区名（如 豆豆柴）, 账号库没记这个号的大区时用它;
 ///     platform = 渠道, 见 <see cref="CatPlatforms" />, 不带按盛趣;
-///     password = 国际服的 Square Enix 账号密码（国际服必填, 其它渠道带了也不用）
+///     password = 国际服的 Square Enix 账号密码（国际服必填, 其它渠道带了也不用）;
+///     weGameLogin = WeGame 号在本机没有可用的登录信息时, 拉起 WeGame 等员工在窗口里登录（只能用于 weGame 渠道, 不带按 false）
 /// </summary>
 public sealed record CatLaunchParams
 (
@@ -289,7 +293,8 @@ public sealed record CatLaunchParams
     int?             CrashDialogTimeoutSeconds = null,
     string?          AreaName                  = null,
     string?          Platform                  = null,
-    string?          Password                  = null
+    string?          Password                  = null,
+    bool?            WeGameLogin               = null
 )
 {
     /// <summary>
@@ -297,7 +302,8 @@ public sealed record CatLaunchParams
     /// </summary>
     public override string ToString() =>
         $"CatLaunchParams {{ OperationId = {OperationId}, AccountName = {AccountName}, Dalamud = {Dalamud}, Minion = {Minion}, " +
-        $"CrashDialogTimeoutSeconds = {CrashDialogTimeoutSeconds}, AreaName = {AreaName}, Platform = {Platform}, Password = {(Password == null ? "(无)" : "***")} }}";
+        $"CrashDialogTimeoutSeconds = {CrashDialogTimeoutSeconds}, AreaName = {AreaName}, Platform = {Platform}, Password = {(Password == null ? "(无)" : "***")}, " +
+        $"WeGameLogin = {WeGameLogin} }}";
 }
 
 /// <summary>

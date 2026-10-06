@@ -11,6 +11,7 @@ public sealed class CatSimulatedGameRunnerTests
     private readonly CatSimulatedGameRunner runner = new()
     {
         StepDelay          = TimeSpan.FromMilliseconds(10),
+        WeGameLoginDelay   = TimeSpan.FromMilliseconds(50),
         CrashAfter         = TimeSpan.FromMilliseconds(200),
         CrashDialogTimeout = TimeSpan.FromMilliseconds(200)
     };
@@ -79,6 +80,53 @@ public sealed class CatSimulatedGameRunnerTests
 
         await run.WaitAsync(Timeout);
         Assert.Equal(["stage:preparing", "stage:starting", "started", "stage:running", "exited"], reporter.Entries);
+    }
+
+    [Fact]
+    public async Task Run_WeGameLogin_WaitsForWeGameLoginFirst_ThenContinuesAsUsual()
+    {
+        var reporter = new RecordingReporter();
+        var run = runner.RunAsync
+        (
+            new CatLaunchRequest("op", "acc", false, null, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true),
+            reporter,
+            CancellationToken.None
+        );
+
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        using (var placeholder = Process.GetProcessById(reporter.Pid!.Value))
+            placeholder.Kill();
+
+        await run.WaitAsync(Timeout);
+        Assert.Equal
+        (
+            ["stage:preparing", "stage:waitingWeGameLogin", "stage:preparing", "stage:starting", "started", "stage:running", "exited"],
+            reporter.Entries
+        );
+    }
+
+    [Fact]
+    public async Task Run_WeGameLogin_CloseWhileWaiting_ReportsCancelled()
+    {
+        var waiting  = new CatSimulatedGameRunner { StepDelay = TimeSpan.FromMilliseconds(10), WeGameLoginDelay = TimeSpan.FromMinutes(5) };
+        var reporter = new RecordingReporter();
+        var run = waiting.RunAsync
+        (
+            new CatLaunchRequest("op", "acc", false, null, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true),
+            reporter,
+            CancellationToken.None
+        );
+
+        var deadline = DateTime.UtcNow + Timeout;
+
+        while (!reporter.Entries.Contains("stage:waitingWeGameLogin") && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+
+        await waiting.CloseAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(CatLaunchHost.EXIT_LAUNCH_FAILED, await run.WaitAsync(Timeout));
+        Assert.Equal(["stage:preparing", "stage:waitingWeGameLogin", "failed:cancelled"], reporter.Entries);
     }
 
     [Fact]
