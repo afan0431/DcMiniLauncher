@@ -93,6 +93,52 @@ public static class Links
     #endregion
     
     
+    #region 国际服（Square Enix）
+
+    // 以下地址与请求头取自 goatcorp/FFXIVQuickLauncher（GPL-3.0）提交 a6f33a9, 各项注明出处行号
+
+    /// <remarks>登录页, {0} = 免费试玩标志（0 / 1）; rgn 固定 3, lng 固定 en。出处: XIVLauncher.Common/Game/Launcher.cs:526-530, 160</remarks>
+    public const string SE_OAUTH_TOP_URL_FORMAT = "https://ffxiv-login.square-enix.com/oauth/ffxivarr/login/top?lng=en&rgn=3&isft={0}&cssmode=1&isnew=1&launchver=3";
+
+    /// <remarks>提交登录。出处: Launcher.cs:556-557</remarks>
+    public const string SE_OAUTH_SEND_URL = "https://ffxiv-login.square-enix.com/oauth/ffxivarr/login/login.send";
+
+    /// <remarks>登录服务器主机名（login.send 的 Host 头）。出处: Launcher.cs:565</remarks>
+    public const string SE_OAUTH_HOST = "ffxiv-login.square-enix.com";
+
+    /// <remarks>上报游戏版本, {0} = game 版本, {1} = 登录得到的会话值。出处: Launcher.cs:401-402</remarks>
+    public const string SE_PATCH_GAMEVER_URL_FORMAT = "https://patch-gamever.ffxiv.com/http/win32/ffxivneo_release_game/{0}/{1}";
+
+    /// <remarks>boot 版本检查（官方就是 http）, {0} = boot 版本, {1} = 时间。出处: Launcher.cs:373-375</remarks>
+    public const string SE_PATCH_BOOTVER_URL_FORMAT = "http://patch-bootver.ffxiv.com/http/win32/ffxivneo_release_boot/{0}/?time={1}";
+
+    /// <remarks>boot 版本检查的 Host 头。出处: Launcher.cs:378</remarks>
+    public const string SE_PATCH_BOOTVER_HOST = "patch-bootver.ffxiv.com";
+
+    /// <remarks>登录服务是否开放, {0} = 毫秒时间戳。出处: Launcher.cs:647</remarks>
+    public const string SE_LOGIN_STATUS_URL_FORMAT = "https://frontier.ffxiv.com/worldStatus/login_status.json?_={0}";
+
+    /// <remarks>游戏是否开放（维护）, {0} = 语言代码, {1} = 毫秒时间戳。出处: Launcher.cs:631</remarks>
+    public const string SE_GATE_STATUS_URL_FORMAT = "https://frontier.ffxiv.com/worldStatus/gate_status.json?lang={0}&_={1}";
+
+    /// <remarks>状态接口的 Origin 头。出处: Launcher.cs:689</remarks>
+    public const string SE_LAUNCHER_ORIGIN = "https://launcher.finalfantasyxiv.com";
+
+    /// <remarks>
+    ///     登录页地址模板（Referer 用）等运行时配置, 不在 goatcorp 源码里, 由它的服务器下发。
+    ///     出处: XIVLauncher.Common/Util/DebugHelpers.cs:77-94
+    /// </remarks>
+    public const string GOATCORP_LAUNCHER_CLIENT_CONFIG_URL = "https://kamori.goats.dev/Launcher/GetLauncherClientConfig";
+
+    /// <remarks>
+    ///     登录页地址模板的内置兜底值: 2026-10-06 从上面的接口实测取得。只在接口取不到、本地也没有上次成功的缓存时才用, 可能已过期。
+    ///     {0} = 语言代码（- 换成 _）, {1} = UTC 时间 yyyy-MM-dd-HH-mm
+    /// </remarks>
+    public const string SE_FRONTIER_URL_TEMPLATE_BUILTIN = "https://launcher.finalfantasyxiv.com/v740/index.html?rc_lang={0}&time={1}";
+
+    #endregion
+
+
     #region 新闻 API
 
     /// <remarks>文章正文</remarks>
