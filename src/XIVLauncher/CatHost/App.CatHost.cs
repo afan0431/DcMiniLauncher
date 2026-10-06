@@ -96,7 +96,7 @@ public partial class App
             if (CatHostMode.IsSimulate || !launchRequest.IsInternational)
                 return runner;
 
-            return new CatUnsupportedGameRunner("这个版本的 DcMiniLauncher 还不能自动上国际服的号");
+            return new CatInternationalGameRunner(redactor, new CatInternationalRealEnvironment(() => initialization));
         }
 
         CatRpcServer? server = null;
@@ -199,22 +199,4 @@ internal sealed class CatDalamudProgressSink : IDalamudProgressSink
     public void ReportLoadingProgress(long? size, long downloaded, double? progress)
     {
     }
-}
-
-/// <summary>
-///     还不支持的渠道: 直接报启动失败, 不碰任何游戏
-/// </summary>
-internal sealed class CatUnsupportedGameRunner(string message) : ICatGameRunner
-{
-    public Task<int> RunAsync(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken cancellationToken)
-    {
-        reporter.Failed(CatCodes.LAUNCH_FAILED, message);
-        return Task.FromResult(CatLaunchHost.EXIT_LAUNCH_FAILED);
-    }
-
-    public Task InjectAsync(bool dalamud, bool minion, bool force, ICatLaunchReporter reporter, CancellationToken cancellationToken) =>
-        Task.CompletedTask;
-
-    public Task CloseAsync(TimeSpan gracefulTimeout) =>
-        Task.CompletedTask;
 }

@@ -234,6 +234,10 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (isInternational && string.IsNullOrEmpty(parameters.Password))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "国际服必须带 password");
 
+        // 国际服的游戏只能挂卡的国际服行（注入文件不同）
+        if (isInternational && parameters.Minion != null && parameters.Minion.Variant != MinionCards.VARIANT_GLOBAL)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"国际服的 minion.variant 只能是 {MinionCards.VARIANT_GLOBAL}");
+
         CatLaunchRequest accepted;
         ICatGameRunner   selected;
 

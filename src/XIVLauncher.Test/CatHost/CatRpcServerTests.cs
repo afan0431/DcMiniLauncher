@@ -210,6 +210,41 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Theory]
+    [InlineData("cn", false)]
+    [InlineData("global", true)]
+    public async Task Launch_International_MinionVariantMustBeGlobal(string variant, bool expectedAccepted)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new
+            {
+                operationId = "op1",
+                accountName = "seAccount",
+                dalamud     = false,
+                platform    = "international",
+                password    = "pw-123456",
+                minion      = new { cardFingerprint = "0123456789abcdef", variant }
+            }
+        );
+
+        Assert.Equal(expectedAccepted, response["result"]!["accepted"]!.GetValue<bool>());
+
+        if (!expectedAccepted)
+            Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+    }
+
+    /// <summary>工作台外壳靠程序集里有没有这个类型名判断启动器是否支持国际服, 名字和命名空间不能改</summary>
+    [Fact]
+    public void InternationalRunner_TypeNameIsStable()
+    {
+        Assert.Equal("XIVLauncher.CatHost.CatInternationalGameRunner", typeof(CatInternationalGameRunner).FullName);
+        Assert.True(typeof(ICatGameRunner).IsAssignableFrom(typeof(CatInternationalGameRunner)));
+    }
+
+    [Theory]
     [InlineData(null)]
     [InlineData("shengqu")]
     [InlineData("weGame")]
