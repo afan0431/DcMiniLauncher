@@ -297,7 +297,8 @@ public sealed record CatMinionParams(string? CardFingerprint, string? Variant);
 ///     launch 参数; areaName = 资料里的大区名（如 豆豆柴）, 账号库没记这个号的大区时用它;
 ///     platform = 渠道, 见 <see cref="CatPlatforms" />, 不带按盛趣;
 ///     password = 国际服的 Square Enix 账号密码（国际服必填, 其它渠道带了也不用）;
-///     weGameLogin = WeGame 号在本机没有可用的登录信息时, 拉起 WeGame 等员工在窗口里登录（只能用于 weGame 渠道, 不带按 false）
+///     weGameLogin = WeGame 号在本机没有可用的登录信息时, 拉起 WeGame 等员工在窗口里登录（只能用于 weGame 渠道, 不带按 false）;
+///     weGameScan = 等 WeGame 登录时自动把登录窗口切到哪种扫码页, 见 <see cref="CatWeGameScans" />（只能和 weGameLogin 一起用, 不带 = 不切换）
 /// </summary>
 public sealed record CatLaunchParams
 (
@@ -309,7 +310,8 @@ public sealed record CatLaunchParams
     string?          AreaName                  = null,
     string?          Platform                  = null,
     string?          Password                  = null,
-    bool?            WeGameLogin               = null
+    bool?            WeGameLogin               = null,
+    string?          WeGameScan                = null
 )
 {
     /// <summary>
@@ -318,7 +320,7 @@ public sealed record CatLaunchParams
     public override string ToString() =>
         $"CatLaunchParams {{ OperationId = {OperationId}, AccountName = {AccountName}, Dalamud = {Dalamud}, Minion = {Minion}, " +
         $"CrashDialogTimeoutSeconds = {CrashDialogTimeoutSeconds}, AreaName = {AreaName}, Platform = {Platform}, Password = {(Password == null ? "(无)" : "***")}, " +
-        $"WeGameLogin = {WeGameLogin} }}";
+        $"WeGameLogin = {WeGameLogin}, WeGameScan = {WeGameScan} }}";
 }
 
 /// <summary>

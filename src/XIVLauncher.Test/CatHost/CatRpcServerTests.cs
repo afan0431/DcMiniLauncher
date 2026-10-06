@@ -192,6 +192,127 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Theory]
+    [InlineData("qq", CatWeGameScan.Qq)]
+    [InlineData("QQ", CatWeGameScan.Qq)]
+    [InlineData("weChat", CatWeGameScan.WeChat)]
+    [InlineData(" wechat ", CatWeGameScan.WeChat)]
+    [InlineData(null, null)] // 不带 weGameScan: 不切换, 与加这个字段之前一样
+    [InlineData("", null)]
+    public async Task Launch_WeGameLogin_PassesWeGameScan(string? weGameScan, CatWeGameScan? expected)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = weGameScan == null
+                           ? await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin = true })
+                           : await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin = true, weGameScan });
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.Equal(expected, runner.Request!.WeGameScan);
+        Assert.Equal(new CatLaunchRequest("op1", "123456", false, null, null, Platform: XIVAccountType.WeGame, WeGameLogin: true, WeGameScan: expected), runner.Request);
+    }
+
+    [Theory]
+    [InlineData("weGame", true, "weixin")]   // 不认识的取值
+    [InlineData("weGame", true, "password")]
+    [InlineData("weGame", false, "qq")]      // 没带 weGameLogin
+    [InlineData("weGame", null, "weChat")]
+    [InlineData("shengqu", null, "qq")]      // 别的渠道
+    [InlineData(null, null, "qq")]
+    public async Task Launch_WeGameScan_InvalidOrWithoutWeGameLogin_IsRejected(string? platform, bool? weGameLogin, string weGameScan)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, platform, weGameLogin, weGameScan });
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+        Assert.False(host.HasLaunch);
+    }
+
+    [Fact]
+    public async Task WeGameNotifications_ArePublishedWithTheAgreedNamesAndFields()
+    {
+        await using var client = await ConnectAndHelloAsync();
+        await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin = true, weGameScan = "qq" });
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        var reporter = runner.Reporter!;
+        reporter.WeGameChallenge(new CatWeGameChallenge("qrcode", "q-3", "UE5H", "https://txz.qq.com/p?k=abc", 120));
+        reporter.WeGameChallenge(new CatWeGameChallenge("sms", "s-1", Code: "AQLLJCAQMS", Phone: "1069070069", Text: "窗口原文"));
+        reporter.WeGameSmsResult("s-1", false);
+        reporter.WeGameChallengeCleared("q-3");
+        reporter.WeGameScanSwitchFailed("qq");
+
+        var qrcode = client.WaitForEvent("weGame.challenge", Timeout).Params!;
+        Assert.Equal
+        (
+            """{"operationId":"op1","kind":"qrcode","challengeId":"q-3","image":"UE5H","link":"https://txz.qq.com/p?k=abc","expiresInSeconds":120}""",
+            qrcode.ToJsonString(CatProtocol.JsonOptions)
+        );
+
+        var sms = client.WaitForEvent("weGame.challenge", Timeout).Params!;
+        Assert.Equal
+        (
+            """{"operationId":"op1","kind":"sms","challengeId":"s-1","code":"AQLLJCAQMS","phone":"1069070069","text":"窗口原文"}""",
+            sms.ToJsonString(CatProtocol.JsonOptions)
+        );
+
+        Assert.Equal
+        (
+            """{"operationId":"op1","challengeId":"s-1","passed":false}""",
+            client.WaitForEvent("weGame.smsResult", Timeout).Params!.ToJsonString(CatProtocol.JsonOptions)
+        );
+        Assert.Equal
+        (
+            """{"operationId":"op1","challengeId":"q-3"}""",
+            client.WaitForEvent("weGame.challengeCleared", Timeout).Params!.ToJsonString(CatProtocol.JsonOptions)
+        );
+        Assert.Equal
+        (
+            """{"operationId":"op1","scan":"qq"}""",
+            client.WaitForEvent("weGame.scanSwitchFailed", Timeout).Params!.ToJsonString(CatProtocol.JsonOptions)
+        );
+    }
+
+    [Fact]
+    public async Task ConfirmSms_IsAnsweredImmediately_ByTheRunner()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        // 还没 launch: 没有在等的验证
+        var early = await client.RequestAsync("weGame.confirmSms", new { challengeId = "s-1" });
+        Assert.False(early["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("notRunning", early["result"]!["code"]!.GetValue<string>());
+
+        await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin = true });
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        var missing = await client.RequestAsync("weGame.confirmSms", new { });
+        Assert.Equal("invalidParams", missing["result"]!["code"]!.GetValue<string>());
+
+        var accepted = await client.RequestAsync("weGame.confirmSms", new { challengeId = " s-1 " });
+        Assert.True(accepted["result"]!["accepted"]!.GetValue<bool>());
+
+        var stale = await client.RequestAsync("weGame.confirmSms", new { challengeId = "s-0" });
+        Assert.False(stale["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("notRunning", stale["result"]!["code"]!.GetValue<string>());
+
+        Assert.Equal(["s-1", "s-0"], runner.ConfirmedSms);
+    }
+
+    [Fact]
+    public void ConfirmSms_RunnersThatNeverWaitForWeGame_AnswerNotRunning()
+    {
+        ICatGameRunner international = new CatInternationalGameRunner(new CatLogRedactor(), null!);
+
+        var result = international.ConfirmWeGameSms("s-1");
+
+        Assert.False(result.Accepted);
+        Assert.Equal(CatCodes.NOT_RUNNING, result.Code);
+    }
+
+    [Theory]
     [InlineData("shengqu")]
     [InlineData("ShengQu")]
     [InlineData(null)] // 不带 platform: 按盛趣, 与加这个字段之前一样

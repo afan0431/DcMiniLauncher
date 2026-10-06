@@ -1,0 +1,468 @@
+using Serilog;
+
+namespace XIVLauncher.CatHost;
+
+/// <summary>launch 的 weGameScan: 等 WeGame 登录时自动切到哪种扫码页</summary>
+public enum CatWeGameScan
+{
+    /// <summary>QQ 扫码</summary>
+    Qq,
+
+    /// <summary>微信扫码</summary>
+    WeChat
+}
+
+/// <summary>weGameScan 在协议里的取值</summary>
+public static class CatWeGameScans
+{
+    /// <summary>QQ 扫码</summary>
+    public const string QQ = "qq";
+
+    /// <summary>微信扫码</summary>
+    public const string WE_CHAT = "weChat";
+
+    /// <summary>
+    ///     解析 weGameScan: 没带（或为空白）= 不切换, 取值不分大小写; 不认识的取值返回 false
+    /// </summary>
+    public static bool TryParse(string? value, out CatWeGameScan? scan)
+    {
+        scan = null;
+
+        if (string.IsNullOrWhiteSpace(value))
+            return true;
+
+        var trimmed = value.Trim();
+
+        if (string.Equals(trimmed, QQ, StringComparison.OrdinalIgnoreCase))
+            scan = CatWeGameScan.Qq;
+        else if (string.Equals(trimmed, WE_CHAT, StringComparison.OrdinalIgnoreCase))
+            scan = CatWeGameScan.WeChat;
+
+        return scan != null;
+    }
+
+    /// <summary>协议里的取值</summary>
+    public static string Name(CatWeGameScan scan) =>
+        scan == CatWeGameScan.WeChat ? WE_CHAT : QQ;
+}
+
+/// <summary>weGame.challenge 的 kind</summary>
+public static class CatWeGameChallengeKinds
+{
+    /// <summary>登录二维码, 要客户用另一台设备扫</summary>
+    public const string QRCODE = "qrcode";
+
+    /// <summary>设备验证, 要客户用密保手机发一条短信</summary>
+    public const string SMS = "sms";
+}
+
+/// <summary>
+///     等 WeGame 登录期间要客户配合的一项验证（weGame.challenge 的内容）。
+///     二维码: image = 二维码 PNG 的 base64, link = 二维码内容; 短信: code = 要发的内容, phone = 发到哪个号码, text = 窗口原文
+/// </summary>
+public sealed record CatWeGameChallenge
+(
+    string  Kind,
+    string  ChallengeId,
+    string? Image            = null,
+    string? Link             = null,
+    int?    ExpiresInSeconds = null,
+    string? Code             = null,
+    string? Phone            = null,
+    string? Text             = null
+)
+{
+    /// <summary>
+    ///     record 自动生成的 ToString 会打印所有成员, 这里只留种类和编号, 免得二维码内容、短信内容被写进日志
+    /// </summary>
+    public override string ToString() =>
+        $"CatWeGameChallenge {{ Kind = {Kind}, ChallengeId = {ChallengeId} }}";
+}
+
+/// <summary>weGame.confirmSms 参数</summary>
+public sealed record CatWeGameConfirmSmsParams(string? ChallengeId);
+
+/// <summary>
+///     WeGame 登录窗口的一次截取: 宽高是窗口客户区的实际大小; 窗口上有二维码时带二维码内容和一张可以直接给客户扫的 PNG
+/// </summary>
+public sealed record CatWeGameLoginWindow(int Width, int Height, string? QrLink = null, byte[]? QrPng = null);
+
+/// <summary>
+///     设备验证窗口的内容: 要发的短信内容、发到哪个号码、窗口原文
+/// </summary>
+public sealed record CatWeGameSmsPrompt(string Code, string Phone, string Text);
+
+/// <summary>
+///     等 WeGame 登录期间对本机屏幕的操作（找窗口、截窗识别二维码、发点击、读设备验证窗口）, 单独抽出来好让测试替换
+/// </summary>
+public interface ICatWeGameScreen
+{
+    /// <summary>
+    ///     截取 WeGame 登录窗口并识别上面的二维码; 没有登录窗口（没出现、已登录、最小化）时返回 null
+    /// </summary>
+    CatWeGameLoginWindow? CaptureLoginWindow();
+
+    /// <summary>
+    ///     在登录窗口的客户区坐标上点一下（不改变前台窗口）; 登录窗口不在时返回 false
+    /// </summary>
+    bool ClickLoginWindow(int x, int y);
+
+    /// <summary>
+    ///     当前的设备验证窗口; 没有时返回 null
+    /// </summary>
+    CatWeGameSmsPrompt? FindSmsPrompt();
+
+    /// <summary>
+    ///     点设备验证窗口上的「确定」; 窗口不在时返回 false
+    /// </summary>
+    bool ConfirmSmsPrompt();
+}
+
+/// <summary>
+///     等 WeGame 登录期间（拉起 WeGame 之后, 到取到登录信息、取消或超时）定时看 WeGame 的窗口,
+///     把要客户配合的验证报给工作台: 登录二维码（weGame.challenge kind=qrcode）、设备验证短信（kind=sms）。
+///     <para>
+///         launch 带了 weGameScan 时, 登录窗口出现后先自动切到对应的扫码页: 给窗口发鼠标消息点页签, 每点一下等一会儿再用识别结果核对;
+///         几轮都没有二维码就报 weGame.scanSwitchFailed, 之后只看不点。没带 weGameScan 时从头到尾只看不点。
+///     </para>
+///     <para>工作台外壳靠程序集里有没有这个类型名判断启动器是否支持把验证转给客户, 名字和命名空间不能改。</para>
+/// </summary>
+public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunchReporter reporter, CatLogRedactor redactor, CatWeGameScan? scan)
+{
+    /// <summary>下面几个点击位置对应的登录窗口宽度, 实际点击时按窗口实际大小换算</summary>
+    public const int DESIGN_WIDTH = 1210;
+
+    /// <summary>下面几个点击位置对应的登录窗口高度</summary>
+    public const int DESIGN_HEIGHT = 680;
+
+    /// <summary>自动切扫码页最多试几轮</summary>
+    public const int MAX_SWITCH_ROUNDS = 3;
+
+    /// <summary>连续几轮看不到才算验证已经不在了（窗口重绘的瞬间会识别不到）</summary>
+    public const int MISSES_TO_CLEAR = 2;
+
+    /// <summary>QQ 页签</summary>
+    internal static readonly (int X, int Y) QqTab = (125, 277);
+
+    /// <summary>微信页签</summary>
+    internal static readonly (int X, int Y) WeChatTab = (175, 277);
+
+    /// <summary>QQ 页底部的「QQ 扫码登录」; 已经在扫码页时同一位置是「QQ 账号密码登录」, 所以有二维码就不能再点</summary>
+    internal static readonly (int X, int Y) QqScanEntry = (208, 630);
+
+    /// <summary>微信页停在快捷登录时的「使用其他头像、昵称或账号」</summary>
+    internal static readonly (int X, int Y) WeChatOtherAccount = (150, 483);
+
+    private readonly object gate = new();
+
+    private string? qrId;
+    private string? qrLink;
+    private int     qrSeq;
+    private int     qrMisses;
+
+    private string?             smsId;
+    private CatWeGameSmsPrompt? smsPrompt;
+    private int                 smsSeq;
+    private int                 smsMisses;
+    private int                 smsConfirmTicks;
+
+    private SwitchState switchState = scan == null ? SwitchState.Off : SwitchState.Pending;
+    private int         switchRounds;
+    private int         windowSeen;
+
+    private enum SwitchState
+    {
+        /// <summary>launch 没带 weGameScan, 不点</summary>
+        Off,
+
+        /// <summary>还没切到扫码页</summary>
+        Pending,
+
+        /// <summary>已经看到二维码</summary>
+        Done,
+
+        /// <summary>试够了轮数, 不再点</summary>
+        GaveUp
+    }
+
+    /// <summary>多久看一次</summary>
+    public TimeSpan Interval { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>每点一下之后等多久再核对</summary>
+    public TimeSpan ClickSettle { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>点了设备验证的「确定」之后, 窗口过多久还在就算没通过</summary>
+    public TimeSpan SmsConfirmWait { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>报给工作台的二维码有效期（WeGame 没有给出确切时间; 二维码刷新后会作为新的验证再报）</summary>
+    public int QrExpiresInSeconds { get; init; } = 120;
+
+    /// <summary>
+    ///     一直看到被取消为止; 结束时把还没清掉的验证报成已清除
+    /// </summary>
+    public async Task RunAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (true)
+            {
+                try
+                {
+                    await TickAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // 看窗口出错不影响上号, 员工照旧可以自己在 WeGame 窗口里处理
+                    Log.Warning("[CatHost] 看 WeGame 窗口时出错: {Type}: {Message}", ex.GetType().Name, redactor.Redact(ex.Message));
+                }
+
+                await Task.Delay(Interval, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 正常结束
+        }
+        finally
+        {
+            ClearAll();
+        }
+    }
+
+    /// <summary>
+    ///     看一轮: 设备验证窗口、登录窗口上的二维码; 该切扫码页时切一轮
+    /// </summary>
+    internal async Task TickAsync(CancellationToken cancellationToken)
+    {
+        ObserveSms();
+
+        var window = screen.CaptureLoginWindow();
+
+        if (switchState != SwitchState.Pending)
+        {
+            ObserveQr(window);
+            return;
+        }
+
+        // 还没切到要的扫码页: 这时窗口上的二维码可能是另一种扫码方式的, 先不报
+        if (window == null)
+        {
+            windowSeen = 0;
+            return;
+        }
+
+        // 窗口刚出现时可能还没画完, 连着两轮都在才开始点
+        if (++windowSeen < 2)
+            return;
+
+        await SwitchRoundAsync(window, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     客户说短信已经发了: 点设备验证窗口的「确定」。立即返回是否点了; 通过与否之后看窗口还在不在
+    ///     （不在了报 weGame.challengeCleared, 还在报 weGame.smsResult passed=false）
+    /// </summary>
+    public CatAcceptResult ConfirmSms(string? challengeId)
+    {
+        lock (gate)
+        {
+            if (smsId == null || !string.Equals(smsId, challengeId, StringComparison.Ordinal))
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "这条短信验证已经不在了");
+
+            // 上一次点完还在等结果: 不重复点
+            if (smsConfirmTicks > 0)
+                return CatAcceptResult.Ok();
+
+            bool clicked;
+
+            try
+            {
+                clicked = screen.ConfirmSmsPrompt();
+            }
+            catch (Exception ex)
+            {
+                Log.Warning("[CatHost] 点设备验证窗口的确定时出错: {Type}: {Message}", ex.GetType().Name, redactor.Redact(ex.Message));
+                clicked = false;
+            }
+
+            if (!clicked)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "设备验证窗口已经不在了");
+
+            smsConfirmTicks = Math.Max(1, (int)Math.Ceiling(SmsConfirmWait.TotalMilliseconds / Math.Max(1, Interval.TotalMilliseconds)));
+            Log.Information("[CatHost] 已点设备验证窗口的确定 ({ChallengeId})", smsId);
+            return CatAcceptResult.Ok();
+        }
+    }
+
+    /// <summary>
+    ///     把按 1210×680 量的位置换算到窗口的实际大小
+    /// </summary>
+    internal static (int X, int Y) Scale((int X, int Y) point, int width, int height) =>
+        (
+            (int)Math.Round(point.X * (double)width  / DESIGN_WIDTH,  MidpointRounding.AwayFromZero),
+            (int)Math.Round(point.Y * (double)height / DESIGN_HEIGHT, MidpointRounding.AwayFromZero)
+        );
+
+    /// <summary>
+    ///     切一轮: 先点页签; 没有二维码再点进扫码的那个入口。有二维码就算切好了, 不再点。
+    /// </summary>
+    private async Task SwitchRoundAsync(CatWeGameLoginWindow window, CancellationToken cancellationToken)
+    {
+        var isWeChat = scan == CatWeGameScan.WeChat;
+        var after    = await ClickAndCaptureAsync(window, isWeChat ? WeChatTab : QqTab, cancellationToken).ConfigureAwait(false);
+
+        if (after != null && !HasQr(after))
+            after = await ClickAndCaptureAsync(after, isWeChat ? WeChatOtherAccount : QqScanEntry, cancellationToken).ConfigureAwait(false);
+
+        // 点的时候登录窗口没了（员工自己登录了、窗口被关了）: 这一轮不算
+        if (after == null)
+        {
+            windowSeen = 0;
+            return;
+        }
+
+        if (HasQr(after))
+        {
+            switchState = SwitchState.Done;
+            Log.Information("[CatHost] WeGame 登录窗口已切到{Scan}扫码页（第 {Round} 轮）", isWeChat ? "微信" : " QQ ", switchRounds + 1);
+            ObserveQr(after);
+            return;
+        }
+
+        if (++switchRounds < MAX_SWITCH_ROUNDS)
+            return;
+
+        switchState = SwitchState.GaveUp;
+        Log.Warning("[CatHost] 试了 {Rounds} 轮, WeGame 登录窗口没有切到{Scan}扫码页, 不再自动点", switchRounds, isWeChat ? "微信" : " QQ ");
+        reporter.WeGameScanSwitchFailed(CatWeGameScans.Name(scan!.Value));
+    }
+
+    private async Task<CatWeGameLoginWindow?> ClickAndCaptureAsync(CatWeGameLoginWindow window, (int X, int Y) point, CancellationToken cancellationToken)
+    {
+        var (x, y) = Scale(point, window.Width, window.Height);
+
+        if (!screen.ClickLoginWindow(x, y))
+            return null;
+
+        await Task.Delay(ClickSettle, cancellationToken).ConfigureAwait(false);
+        return screen.CaptureLoginWindow();
+    }
+
+    private static bool HasQr(CatWeGameLoginWindow? window) =>
+        window is { QrLink.Length: > 0, QrPng.Length: > 0 };
+
+    /// <summary>
+    ///     二维码内容与上次不同才报（算新的验证, 不单独清旧的）; 连续几轮看不到才报已清除
+    /// </summary>
+    private void ObserveQr(CatWeGameLoginWindow? window)
+    {
+        if (HasQr(window))
+        {
+            qrMisses = 0;
+
+            if (string.Equals(window!.QrLink, qrLink, StringComparison.Ordinal))
+                return;
+
+            qrLink = window.QrLink;
+            qrId   = $"q-{++qrSeq}";
+
+            // 二维码内容就是一次性的登录凭据, 不能进日志
+            redactor.RegisterSecret(qrLink);
+            Log.Information("[CatHost] WeGame 登录窗口上有新的二维码 ({ChallengeId})", qrId);
+            reporter.WeGameChallenge(new CatWeGameChallenge(CatWeGameChallengeKinds.QRCODE, qrId, Convert.ToBase64String(window.QrPng!), qrLink, QrExpiresInSeconds));
+            return;
+        }
+
+        if (qrId == null || ++qrMisses < MISSES_TO_CLEAR)
+            return;
+
+        Log.Information("[CatHost] WeGame 登录窗口上的二维码不在了 ({ChallengeId})", qrId);
+        reporter.WeGameChallengeCleared(qrId);
+        qrId     = null;
+        qrLink   = null;
+        qrMisses = 0;
+    }
+
+    /// <summary>
+    ///     设备验证窗口: 出现或换了内容就报; 点过「确定」后窗口不在了算通过, 等够时间还在或换了内容算没通过
+    /// </summary>
+    private void ObserveSms()
+    {
+        lock (gate)
+        {
+            var prompt = screen.FindSmsPrompt();
+
+            if (prompt != null)
+            {
+                smsMisses = 0;
+
+                if (smsId != null && IsSamePrompt(prompt, smsPrompt))
+                {
+                    if (smsConfirmTicks > 0 && --smsConfirmTicks == 0)
+                    {
+                        Log.Information("[CatHost] 点了确定后设备验证窗口还在, 没有通过 ({ChallengeId})", smsId);
+                        reporter.WeGameSmsResult(smsId, false);
+                    }
+
+                    return;
+                }
+
+                // 点了确定后换了一串新内容: 上一条没通过
+                if (smsId != null && smsConfirmTicks > 0)
+                    reporter.WeGameSmsResult(smsId, false);
+
+                smsConfirmTicks = 0;
+                smsPrompt       = prompt;
+                smsId           = $"s-{++smsSeq}";
+
+                redactor.RegisterSecret(prompt.Code);
+                Log.Information("[CatHost] 出现了设备验证窗口 ({ChallengeId})", smsId);
+                reporter.WeGameChallenge(new CatWeGameChallenge(CatWeGameChallengeKinds.SMS, smsId, Code: prompt.Code, Phone: prompt.Phone, Text: prompt.Text));
+                return;
+            }
+
+            if (smsId == null)
+                return;
+
+            // 点过确定后窗口不在了就是通过; 没点过的（员工自己处理的）多看一轮, 免得把重绘当成消失
+            if (smsConfirmTicks == 0 && ++smsMisses < MISSES_TO_CLEAR)
+                return;
+
+            Log.Information("[CatHost] 设备验证窗口不在了 ({ChallengeId})", smsId);
+            reporter.WeGameChallengeCleared(smsId);
+            ResetSms();
+        }
+    }
+
+    private static bool IsSamePrompt(CatWeGameSmsPrompt current, CatWeGameSmsPrompt? previous) =>
+        previous != null                                                 &&
+        string.Equals(current.Code, previous.Code, StringComparison.Ordinal) &&
+        string.Equals(current.Phone, previous.Phone, StringComparison.Ordinal);
+
+    private void ResetSms()
+    {
+        smsId           = null;
+        smsPrompt       = null;
+        smsMisses       = 0;
+        smsConfirmTicks = 0;
+    }
+
+    private void ClearAll()
+    {
+        if (qrId != null)
+        {
+            reporter.WeGameChallengeCleared(qrId);
+            qrId   = null;
+            qrLink = null;
+        }
+
+        lock (gate)
+        {
+            if (smsId == null)
+                return;
+
+            reporter.WeGameChallengeCleared(smsId);
+            ResetSms();
+        }
+    }
+}

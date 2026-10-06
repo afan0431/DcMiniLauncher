@@ -129,6 +129,143 @@ public sealed class CatSimulatedGameRunnerTests
         Assert.Equal(["stage:preparing", "stage:waitingWeGameLogin", "failed:cancelled"], reporter.Entries);
     }
 
+    [Theory]
+    [InlineData(CatWeGameScan.Qq)]
+    [InlineData(CatWeGameScan.WeChat)]
+    public async Task Run_WeGameScan_SendsAFakeQrChallenge_AndClearsItBeforeContinuing(CatWeGameScan scan)
+    {
+        var reporter = new RecordingReporter();
+        var run      = runner.RunAsync(WeGameScanRequest("acc", scan), reporter, CancellationToken.None);
+
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        using (var placeholder = Process.GetProcessById(reporter.Pid!.Value))
+            placeholder.Kill();
+
+        await run.WaitAsync(Timeout);
+        Assert.Equal
+        (
+            [
+                "stage:preparing", "stage:waitingWeGameLogin", "challenge:qrcode:q-1", "cleared:q-1", "stage:preparing",
+                "stage:starting", "started", "stage:running", "exited"
+            ],
+            reporter.Entries
+        );
+
+        var challenge = Assert.Single(reporter.Challenges);
+        Assert.Equal(CatSimulatedGameRunner.SIMULATED_QR_LINK, challenge.Link);
+        Assert.Equal(120, challenge.ExpiresInSeconds);
+
+        // image 是一张真的 PNG
+        Assert.Equal([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], Convert.FromBase64String(challenge.Image!).Take(8).ToArray());
+    }
+
+    [Fact]
+    public async Task Run_WeGameScan_ScanFailAccount_SendsSwitchFailedInsteadOfQr()
+    {
+        var reporter = new RecordingReporter();
+        var run      = runner.RunAsync(WeGameScanRequest("scanfail:acc", CatWeGameScan.WeChat), reporter, CancellationToken.None);
+
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        using (var placeholder = Process.GetProcessById(reporter.Pid!.Value))
+            placeholder.Kill();
+
+        await run.WaitAsync(Timeout);
+        Assert.Equal
+        (
+            ["stage:preparing", "stage:waitingWeGameLogin", "scanSwitchFailed:weChat", "stage:preparing", "stage:starting", "started", "stage:running", "exited"],
+            reporter.Entries
+        );
+    }
+
+    [Fact]
+    public async Task Run_WeGameScan_SmsAccount_WaitsForConfirmSms()
+    {
+        var reporter = new RecordingReporter();
+        var run      = runner.RunAsync(WeGameScanRequest("sms:acc", CatWeGameScan.Qq), reporter, CancellationToken.None);
+
+        // 还没到短信那一步: 没有可确认的
+        Assert.Equal(CatCodes.NOT_RUNNING, runner.ConfirmWeGameSms("s-1").Code);
+
+        var deadline = DateTime.UtcNow + Timeout;
+
+        while (!reporter.Entries.Contains("challenge:sms:s-1") && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+
+        // 没收到确认之前一直停在这里
+        await Task.Delay(200);
+        Assert.Equal(["stage:preparing", "stage:waitingWeGameLogin", "challenge:qrcode:q-1", "cleared:q-1", "challenge:sms:s-1"], reporter.Entries);
+        Assert.Equal("1069070069", reporter.Challenges.Last().Phone);
+
+        Assert.Equal(CatCodes.NOT_RUNNING, runner.ConfirmWeGameSms("s-2").Code);
+        Assert.True(runner.ConfirmWeGameSms("s-1").Accepted);
+
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        using (var placeholder = Process.GetProcessById(reporter.Pid!.Value))
+            placeholder.Kill();
+
+        await run.WaitAsync(Timeout);
+        Assert.Equal
+        (
+            [
+                "stage:preparing", "stage:waitingWeGameLogin", "challenge:qrcode:q-1", "cleared:q-1", "challenge:sms:s-1", "cleared:s-1", "stage:preparing",
+                "stage:starting", "started", "stage:running", "exited"
+            ],
+            reporter.Entries
+        );
+    }
+
+    [Fact]
+    public async Task Run_WeGameScan_CloseWhileChallengeIsOpen_ClearsIt_AndReportsCancelled()
+    {
+        var waiting  = new CatSimulatedGameRunner { StepDelay = TimeSpan.FromMilliseconds(10), WeGameLoginDelay = TimeSpan.FromMilliseconds(200) };
+        var reporter = new RecordingReporter();
+        var run      = waiting.RunAsync(WeGameScanRequest("sms:acc", CatWeGameScan.Qq), reporter, CancellationToken.None);
+
+        var deadline = DateTime.UtcNow + Timeout;
+
+        while (!reporter.Entries.Contains("challenge:sms:s-1") && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+
+        await waiting.CloseAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(CatLaunchHost.EXIT_LAUNCH_FAILED, await run.WaitAsync(Timeout));
+        Assert.Equal
+        (
+            ["stage:preparing", "stage:waitingWeGameLogin", "challenge:qrcode:q-1", "cleared:q-1", "challenge:sms:s-1", "cleared:s-1", "failed:cancelled"],
+            reporter.Entries
+        );
+    }
+
+    [Fact]
+    public async Task Run_WeGameScanPrefixes_WithoutWeGameScan_ChangeNothing()
+    {
+        var reporter = new RecordingReporter();
+        var run = runner.RunAsync
+        (
+            new CatLaunchRequest("op", "sms:acc", false, null, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true),
+            reporter,
+            CancellationToken.None
+        );
+
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        using (var placeholder = Process.GetProcessById(reporter.Pid!.Value))
+            placeholder.Kill();
+
+        await run.WaitAsync(Timeout);
+        Assert.Equal
+        (
+            ["stage:preparing", "stage:waitingWeGameLogin", "stage:preparing", "stage:starting", "started", "stage:running", "exited"],
+            reporter.Entries
+        );
+    }
+
+    private static CatLaunchRequest WeGameScanRequest(string account, CatWeGameScan scan) =>
+        new("op", account, false, null, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true, WeGameScan: scan);
+
     [Fact]
     public async Task Run_International_EmitsSameEventsAsShengqu_AndNeverPrintsPassword()
     {

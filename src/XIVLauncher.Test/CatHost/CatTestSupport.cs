@@ -182,6 +182,15 @@ internal sealed class FakeGameRunner : ICatGameRunner
         Closed.TrySetResult();
         return Task.CompletedTask;
     }
+
+    /// <summary>收到的 weGame.confirmSms 的编号</summary>
+    public List<string> ConfirmedSms { get; } = [];
+
+    public CatAcceptResult ConfirmWeGameSms(string challengeId)
+    {
+        ConfirmedSms.Add(challengeId);
+        return challengeId == "s-1" ? CatAcceptResult.Ok() : CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "这条短信验证已经不在了");
+    }
 }
 
 /// <summary>
@@ -248,6 +257,24 @@ internal sealed class RecordingReporter : ICatLaunchReporter
 
     public void Log(string level, string message) =>
         Messages.Enqueue(message);
+
+    /// <summary>报出来的验证, 按顺序</summary>
+    public ConcurrentQueue<CatWeGameChallenge> Challenges { get; } = new();
+
+    public void WeGameChallenge(CatWeGameChallenge challenge)
+    {
+        Challenges.Enqueue(challenge);
+        Entries.Enqueue($"challenge:{challenge.Kind}:{challenge.ChallengeId}");
+    }
+
+    public void WeGameChallengeCleared(string challengeId) =>
+        Entries.Enqueue($"cleared:{challengeId}");
+
+    public void WeGameScanSwitchFailed(string scan) =>
+        Entries.Enqueue($"scanSwitchFailed:{scan}");
+
+    public void WeGameSmsResult(string challengeId, bool passed) =>
+        Entries.Enqueue($"smsResult:{challengeId}:{(passed ? "passed" : "notPassed")}");
 }
 
 internal static class CatTestNames

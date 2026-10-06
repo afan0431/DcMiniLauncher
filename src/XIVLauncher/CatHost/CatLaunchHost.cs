@@ -21,7 +21,8 @@ public sealed record CatLaunchRequest
     XIVAccountType Platform                  = XIVAccountType.Sdo,
     bool           IsInternational           = false,
     CatSecret?     Password                  = null,
-    bool           WeGameLogin               = false
+    bool           WeGameLogin               = false,
+    CatWeGameScan? WeGameScan                = null
 )
 {
     /// <summary>是否为 WeGame 版国服的号</summary>
@@ -68,6 +69,18 @@ public interface ICatLaunchReporter
 
     /// <summary>脱敏后的日志</summary>
     void Log(string level, string message);
+
+    /// <summary>等 WeGame 登录期间出现了要客户配合的验证（二维码或设备验证短信）</summary>
+    void WeGameChallenge(CatWeGameChallenge challenge);
+
+    /// <summary>那项验证已经不在了（客户已完成、员工自己处理了、或等登录结束）</summary>
+    void WeGameChallengeCleared(string challengeId);
+
+    /// <summary>自动切到扫码页没有成功, 要员工在 WeGame 窗口里手动切; scan 见 <see cref="CatWeGameScans" /></summary>
+    void WeGameScanSwitchFailed(string scan);
+
+    /// <summary>点了设备验证的「确定」之后的结果（目前只报没通过; 通过时那项验证直接消失）</summary>
+    void WeGameSmsResult(string challengeId, bool passed);
 }
 
 /// <summary>
@@ -95,6 +108,14 @@ public interface ICatGameRunner
     ///     游戏还没起来时取消启动。之后 <see cref="RunAsync" /> 照常收尾（补报 Minion 停机、发 game.exited 或 launch.failed）。
     /// </summary>
     Task CloseAsync(TimeSpan gracefulTimeout);
+
+    /// <summary>
+    ///     客户说设备验证的短信已经发了: 点验证窗口的「确定」。立即返回是否点了, 结果经
+    ///     <see cref="ICatLaunchReporter.WeGameSmsResult" /> 或 <see cref="ICatLaunchReporter.WeGameChallengeCleared" /> 报告。
+    ///     不在等 WeGame 登录的启动器一律回 notRunning。
+    /// </summary>
+    CatAcceptResult ConfirmWeGameSms(string challengeId) =>
+        CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证");
 }
 
 /// <summary>
@@ -201,6 +222,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             "inject" => Task.FromResult<object?>(Inject(Deserialize<CatInjectParams>(parameters))),
             "status" => Task.FromResult<object?>(GetStatus()),
             "close"  => Task.FromResult<object?>(Close(Deserialize<CatCloseParams>(parameters))),
+            "weGame.confirmSms" => Task.FromResult<object?>(ConfirmWeGameSms(Deserialize<CatWeGameConfirmSmsParams>(parameters))),
             _        => throw new CatRpcException(CatRpcException.METHOD_NOT_FOUND, $"未知方法: {method}")
         };
 
@@ -244,6 +266,12 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (weGameLogin && channel != CatPlatform.WeGame)
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"weGameLogin 只能用于 platform 为 {CatPlatforms.WE_GAME} 的号");
 
+        if (!CatWeGameScans.TryParse(parameters.WeGameScan, out var weGameScan))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"weGameScan 只能是 {CatWeGameScans.QQ} 或 {CatWeGameScans.WE_CHAT}");
+
+        if (weGameScan != null && !weGameLogin)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "weGameScan 只能和 weGameLogin 一起用");
+
         CatLaunchRequest accepted;
         ICatGameRunner   selected;
 
@@ -267,7 +295,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 channel == CatPlatform.WeGame ? XIVAccountType.WeGame : XIVAccountType.Sdo,
                 isInternational,
                 isInternational ? new CatSecret(parameters.Password!) : null,
-                weGameLogin
+                weGameLogin,
+                weGameScan
             );
             selected = runnerFactory(accepted);
             runner   = selected;
@@ -276,14 +305,15 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         Serilog.Log.Information
         (
-            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s, 就地登录 WeGame={WeGameLogin}",
+            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s, 就地登录 WeGame={WeGameLogin}, 自动切扫码页={WeGameScan}",
             accepted.OperationId,
             CatPlatforms.DisplayName(accepted.Channel),
             accepted.AccountName,
             accepted.Dalamud,
             accepted.Minion ? $"{accepted.CardFingerprint}/{accepted.Variant}" : "否",
             accepted.CrashDialogTimeoutSeconds,
-            accepted.WeGameLogin
+            accepted.WeGameLogin,
+            accepted.WeGameScan is { } scan ? CatWeGameScans.Name(scan) : "否"
         );
 
         _ = Task.Run(() => RunLifecycleAsync(selected, accepted));
@@ -403,6 +433,29 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     }
 
     /// <summary>
+    ///     客户说设备验证的短信已经发了: 交给启动器去点验证窗口的「确定」, 立即回是否点了
+    /// </summary>
+    public CatAcceptResult ConfirmWeGameSms(CatWeGameConfirmSmsParams? parameters)
+    {
+        if (string.IsNullOrWhiteSpace(parameters?.ChallengeId))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "challengeId 不能为空");
+
+        ICatGameRunner? current;
+
+        lock (stateLock)
+        {
+            if (closeRequested || runnerFaulted || stage is CatStages.EXITED or CatStages.FAILED)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证");
+
+            current = runner;
+        }
+
+        return current == null
+                   ? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证")
+                   : current.ConfirmWeGameSms(parameters.ChallengeId.Trim());
+    }
+
+    /// <summary>
     ///     当前状态
     /// </summary>
     public CatStatusResult GetStatus()
@@ -506,6 +559,37 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     /// <inheritdoc />
     public void Log(string level, string message) =>
         Publish("launcher.log", new { level, message = Redact(message) });
+
+    /// <inheritdoc />
+    public void WeGameChallenge(CatWeGameChallenge challenge) =>
+        Publish
+        (
+            "weGame.challenge",
+            new
+            {
+                operationId      = OperationId,
+                kind             = challenge.Kind,
+                challengeId      = challenge.ChallengeId,
+                image            = challenge.Image,
+                link             = challenge.Link,
+                expiresInSeconds = challenge.ExpiresInSeconds,
+                code             = challenge.Code,
+                phone            = challenge.Phone,
+                text             = challenge.Text
+            }
+        );
+
+    /// <inheritdoc />
+    public void WeGameChallengeCleared(string challengeId) =>
+        Publish("weGame.challengeCleared", new { operationId = OperationId, challengeId });
+
+    /// <inheritdoc />
+    public void WeGameScanSwitchFailed(string scan) =>
+        Publish("weGame.scanSwitchFailed", new { operationId = OperationId, scan });
+
+    /// <inheritdoc />
+    public void WeGameSmsResult(string challengeId, bool passed) =>
+        Publish("weGame.smsResult", new { operationId = OperationId, challengeId, passed });
 
     #endregion
 

@@ -80,11 +80,30 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
     /// </summary>
     private const string LOGIN_IN_UI_HINT = "请在这台电脑的 DcMiniLauncher 界面版里用 WeGame 方式重新登录一次";
 
+    /// <summary>等登录结束后最多等观察器多久收尾</summary>
+    private static readonly TimeSpan WatcherStopTimeout = TimeSpan.FromSeconds(5);
+
     private string? capturedUserName;
     private string? capturedToken;
 
+    private volatile CatWeGameChallengeWatcher? watcher;
+
     /// <summary>拉起 WeGame 后等员工登录的上限</summary>
     public TimeSpan LoginTimeout { get; init; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    ///     等登录期间用它看 WeGame 的窗口, 把要客户配合的验证报给工作台（见 <see cref="CatWeGameChallengeWatcher" />）; 为 null 时不看
+    /// </summary>
+    public ICatWeGameScreen? Screen { get; init; }
+
+    /// <summary>等登录期间多久看一次窗口; 不设用观察器自己的间隔</summary>
+    public TimeSpan? WatchInterval { get; init; }
+
+    /// <summary>
+    ///     客户说设备验证的短信已经发了; 不在等登录时回 notRunning
+    /// </summary>
+    public CatAcceptResult ConfirmSms(string challengeId) =>
+        watcher?.ConfirmSms(challengeId) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证");
 
     /// <summary>
     ///     找上号请求指的那一行: 账号库里 WeGame 行的账号名是 WeGame 给的用户号, 请求带的通常是客户的 QQ 号或手机号,
@@ -227,8 +246,11 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
 
         WeGameCaptureResult captured;
 
+        using (var watching = new CancellationTokenSource())
         using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
         {
+            var watch = Task.CompletedTask;
+
             timeout.CancelAfter(LoginTimeout);
 
             try
@@ -237,7 +259,11 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
                            (
                                sdologinDir,
                                StopWeGameClient,
-                               () => reporter.Stage(CatStages.WAITING_WE_GAME_LOGIN),
+                               () =>
+                               {
+                                   reporter.Stage(CatStages.WAITING_WE_GAME_LOGIN);
+                                   watch = StartWatcher(request, reporter, watching.Token);
+                               },
                                timeout.Token
                            ).ConfigureAwait(false);
             }
@@ -265,6 +291,11 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
             {
                 Log.Error(ex, "[CatHost] 拉起 WeGame 等登录时出错");
                 throw new CatLaunchException(CatCodes.LAUNCH_FAILED, $"拉起 WeGame 等登录时出错: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                // 不管是取到了、超时还是被取消, 都先让观察器停下并把没清的验证报成已清除
+                await StopWatcherAsync(watching, watch).ConfigureAwait(false);
             }
         }
 
@@ -328,6 +359,39 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
         capturedUserName = saved.UserName;
         capturedToken    = captured.Token;
         return saved;
+    }
+
+    /// <summary>
+    ///     WeGame 已拉起: 开始看它的窗口（没给 <see cref="Screen" /> 时不看）
+    /// </summary>
+    private Task StartWatcher(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        if (Screen == null)
+            return Task.CompletedTask;
+
+        var created = WatchInterval is { } interval
+                          ? new CatWeGameChallengeWatcher(Screen, reporter, redactor, request.WeGameScan) { Interval = interval, ClickSettle = interval }
+                          : new CatWeGameChallengeWatcher(Screen, reporter, redactor, request.WeGameScan);
+
+        watcher = created;
+        return Task.Run(() => created.RunAsync(cancellationToken), CancellationToken.None);
+    }
+
+    private async Task StopWatcherAsync(CancellationTokenSource watching, Task watch)
+    {
+        watcher = null;
+
+        try
+        {
+            await watching.CancelAsync().ConfigureAwait(false);
+
+            if (await Task.WhenAny(watch, Task.Delay(WatcherStopTimeout)).ConfigureAwait(false) != watch)
+                Log.Warning("[CatHost] 看 WeGame 窗口的观察器没有按时停下");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 停止看 WeGame 窗口时出错");
+        }
     }
 
     private void StopWeGameClient()

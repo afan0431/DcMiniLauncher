@@ -14,6 +14,11 @@ namespace XIVLauncher.CatHost;
 ///         <item><c>crash:dialog</c>: 运行一会儿后崩溃, 崩溃对话框没人选 → game.crashed, 等待超时后 game.exited{reason:"crashDialogTimeout"}</item>
 ///         <item>minion.cardFingerprint 为 <c>0000000000000000</c>: 发 launch.failed{minionCardNotFound}</item>
 ///         <item>WeGame 号带了 weGameLogin: 先进 waitingWeGameLogin 阶段停一会儿（当作员工在 WeGame 里登录）, 回到 preparing 后照常继续; 期间 close 则发 launch.failed{cancelled}</item>
+///         <item>
+///             再带了 weGameScan: 停的这段时间里发一条假的二维码验证（weGame.challenge kind=qrcode）, 结束前发 weGame.challengeCleared。
+///             账号名以 <c>scanfail:</c> 开头: 不发二维码, 改发 weGame.scanSwitchFailed。
+///             账号名以 <c>sms:</c> 开头: 二维码之后再发一条设备验证短信（kind=sms）, 一直等到收到 weGame.confirmSms 才发 weGame.challengeCleared 并继续
+///         </item>
 ///         <item>占位进程被结束时发 game.exited; close 时结束占位进程并发 game.exited{reason:"closed"}; 随后本进程退出</item>
 ///     </list>
 /// </summary>
@@ -37,11 +42,28 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     /// <summary>崩溃对话框没人选的模拟</summary>
     public const string CRASH_DIALOG = "dialog";
 
+    /// <summary>模拟自动切扫码页失败的前缀</summary>
+    public const string SCAN_FAIL_PREFIX = "scanfail:";
+
+    /// <summary>模拟扫码后还要设备验证短信的前缀</summary>
+    public const string SMS_PREFIX = "sms:";
+
+    /// <summary>模拟的二维码内容（占位链接, 扫了没有任何效果）</summary>
+    public const string SIMULATED_QR_LINK = "https://example.invalid/wegame-simulated-qrcode";
+
+    /// <summary>模拟的二维码验证编号</summary>
+    public const string SIMULATED_QR_CHALLENGE_ID = "q-1";
+
+    /// <summary>模拟的设备验证编号</summary>
+    public const string SIMULATED_SMS_CHALLENGE_ID = "s-1";
+
     private readonly CancellationTokenSource closeCts = new();
     private readonly object                  stateLock = new();
 
     private Process? placeholder;
     private bool     closeRequested;
+
+    private TaskCompletionSource? smsConfirmed;
 
     /// <summary>每个阶段之间的停顿</summary>
     public TimeSpan StepDelay { get; init; } = TimeSpan.FromMilliseconds(300);
@@ -98,6 +120,21 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     }
 
     /// <inheritdoc />
+    public CatAcceptResult ConfirmWeGameSms(string challengeId)
+    {
+        TaskCompletionSource? pending;
+
+        lock (stateLock)
+            pending = smsConfirmed;
+
+        if (pending == null || challengeId != SIMULATED_SMS_CHALLENGE_ID)
+            return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证（模拟）");
+
+        pending.TrySetResult();
+        return CatAcceptResult.Ok();
+    }
+
+    /// <inheritdoc />
     public Task CloseAsync(TimeSpan gracefulTimeout)
     {
         Process? current;
@@ -125,7 +162,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         if (request is { IsWeGame: true, WeGameLogin: true })
         {
             reporter.Stage(CatStages.WAITING_WE_GAME_LOGIN);
-            await Task.Delay(WeGameLoginDelay, token).ConfigureAwait(false);
+            await WaitForWeGameLoginAsync(request, reporter, token).ConfigureAwait(false);
             reporter.Stage(CatStages.PREPARING);
         }
 
@@ -215,6 +252,88 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         reporter.Exited(process.Id, exitCode, closed ? CatExitReasons.CLOSED : null);
         process.Dispose();
         return CatHostRuntime.EXIT_OK;
+    }
+
+    /// <summary>
+    ///     模拟等员工或客户在 WeGame 里登录的那段时间; 带了 weGameScan 时按账号名前缀发假的验证通知
+    /// </summary>
+    private async Task WaitForWeGameLoginAsync(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken token)
+    {
+        if (request.WeGameScan is not { } scan)
+        {
+            await Task.Delay(WeGameLoginDelay, token).ConfigureAwait(false);
+            return;
+        }
+
+        if (request.AccountName.StartsWith(SCAN_FAIL_PREFIX, StringComparison.Ordinal))
+        {
+            reporter.WeGameScanSwitchFailed(CatWeGameScans.Name(scan));
+            await Task.Delay(WeGameLoginDelay, token).ConfigureAwait(false);
+            return;
+        }
+
+        var     quarter = WeGameLoginDelay / 4;
+        string? open    = null;
+
+        try
+        {
+            await Task.Delay(quarter, token).ConfigureAwait(false);
+
+            open = SIMULATED_QR_CHALLENGE_ID;
+            reporter.WeGameChallenge
+            (
+                new CatWeGameChallenge
+                (
+                    CatWeGameChallengeKinds.QRCODE,
+                    SIMULATED_QR_CHALLENGE_ID,
+                    Convert.ToBase64String(new CatZxingQrCodec().EncodePng(SIMULATED_QR_LINK)),
+                    SIMULATED_QR_LINK,
+                    120
+                )
+            );
+
+            await Task.Delay(quarter * 2, token).ConfigureAwait(false);
+
+            reporter.WeGameChallengeCleared(SIMULATED_QR_CHALLENGE_ID);
+            open = null;
+
+            if (request.AccountName.StartsWith(SMS_PREFIX, StringComparison.Ordinal))
+            {
+                var confirmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+                lock (stateLock)
+                    smsConfirmed = confirmed;
+
+                open = SIMULATED_SMS_CHALLENGE_ID;
+                reporter.WeGameChallenge
+                (
+                    new CatWeGameChallenge
+                    (
+                        CatWeGameChallengeKinds.SMS,
+                        SIMULATED_SMS_CHALLENGE_ID,
+                        Code: "SIMULATED01",
+                        Phone: "1069070069",
+                        Text: "设备环境发生变更，需进行验证。请编辑手机短信：SIMULATED01 发送到号码：1069070069（模拟）"
+                    )
+                );
+
+                await confirmed.Task.WaitAsync(token).ConfigureAwait(false);
+
+                reporter.WeGameChallengeCleared(SIMULATED_SMS_CHALLENGE_ID);
+                open = null;
+            }
+
+            await Task.Delay(quarter, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (stateLock)
+                smsConfirmed = null;
+
+            // 等的途中被 close 取消: 没清的验证也报成已清除, 与真实启动一致
+            if (open != null)
+                reporter.WeGameChallengeCleared(open);
+        }
     }
 
     private async Task<Process> StartGameAsync(CatLaunchRequest request, int? restartedFromPid, string? failAgent, ICatLaunchReporter reporter, CancellationToken token)

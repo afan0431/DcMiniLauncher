@@ -94,6 +94,7 @@
         <PackageReference Include="SharedMemory"/>
         <PackageReference Include="CommunityToolkit.Mvvm"/>
         <PackageReference Include="Velopack"/>
+        <PackageReference Include="ZXing.Net"/>
     </ItemGroup>
 
     <ItemGroup>

@@ -167,6 +167,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             await CatGameCloser.CloseAsync(process.UnderlyingProcess, gracefulTimeout).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
+    public CatAcceptResult ConfirmWeGameSms(string challengeId) =>
+        weGameLogin?.ConfirmSms(challengeId) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证");
+
     /// <summary>
     ///     游戏起来后出了意外异常: 不再守护（崩溃重启、跨区刷新）, 但照样等游戏结束、补报 Minion 停机, 再发 game.exited。期间 close 仍可用。
     /// </summary>
@@ -338,7 +342,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     {
         var store = new CatWeGameAccountStore(accountManager);
 
-        weGameLogin = new CatWeGameLoginCapture(new CatWeGameLoginRealEnvironment(() => App.Settings.WeGamePath?.FullName), store, redactor);
+        weGameLogin = new CatWeGameLoginCapture(new CatWeGameLoginRealEnvironment(() => App.Settings.WeGamePath?.FullName), store, redactor)
+        {
+            Screen = new CatWeGameRealScreen(new CatZxingQrCodec())
+        };
         weGameRow   = await weGameLogin.FindRowAsync(request, reporter, cancellationToken).ConfigureAwait(false);
 
         return store.GetAccount(weGameRow);
