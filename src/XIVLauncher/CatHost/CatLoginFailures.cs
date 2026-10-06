@@ -82,6 +82,26 @@ public static class CatLoginFailures
                   or (int)LoginExceptionCode.CaptchaVerificationCanceled;
 
     /// <summary>
+    ///     用已存的 WeGame 令牌登录失败后要不要清掉这枚令牌: 只在盛趣明确说这枚令牌不行（第三方验证失败）时清。
+    ///     界面版是盛趣返回任何错误码都清, 因为它清完会马上重新取令牌; 无界面清完没人重新取, 所以繁忙、风控等一律不清
+    /// </summary>
+    public static bool ShouldClearWeGameToken(Exception exception) =>
+        exception is LoginException { ErrorCode: (int)LoginExceptionCode.ThirdPartyVerificationFailed };
+
+    /// <summary>
+    ///     用已存的 WeGame 令牌登录失败时报哪个失败码: WeGame 号没有密码兜底, 令牌被拒就只能回界面版重新登录;
+    ///     不认识的盛趣返回码（可能是繁忙、限流）按启动失败报
+    /// </summary>
+    public static string ToWeGameLoginCode(Exception exception) =>
+        Classify(exception) switch
+        {
+            CatLoginFailureKind.Network     => CatCodes.NETWORK_ERROR,
+            CatLoginFailureKind.RiskControl => CatCodes.RISK_CONTROL,
+            CatLoginFailureKind.Rejected    => CatCodes.AUTHORIZATION_REQUIRED,
+            _                               => CatCodes.LAUNCH_FAILED
+        };
+
+    /// <summary>
     ///     给日志和失败消息用的简述: 盛趣返回码 + 消息
     /// </summary>
     public static string Describe(Exception exception)

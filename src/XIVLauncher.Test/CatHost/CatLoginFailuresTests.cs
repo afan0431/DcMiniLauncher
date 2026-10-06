@@ -59,6 +59,37 @@ public sealed class CatLoginFailuresTests
         Assert.Contains("-10999999", CatLoginFailures.Describe(new InvalidOperationException("包装", new LoginException(-10999999, "繁忙"))));
 
     [Fact]
+    public void WeGameToken_IsClearedOnlyWhenSdoAnswersNo()
+    {
+        // 只有盛趣明确说这枚令牌不行才清: 无界面清完没人重新取令牌
+        Assert.True(CatLoginFailures.ShouldClearWeGameToken(new LoginException((int)LoginExceptionCode.ThirdPartyVerificationFailed, "第三方验证失败")));
+        Assert.True(CatLoginFailures.ShouldClearWeGameToken(new LoginException(-10742165, "第三方验证失败")));
+
+        Assert.False(CatLoginFailures.ShouldClearWeGameToken(new LoginException(-10999999, "繁忙")));
+        Assert.False(CatLoginFailures.ShouldClearWeGameToken(new LoginException((int)LoginExceptionCode.RiskEnvironment, "要客户验证")));
+        Assert.False(CatLoginFailures.ShouldClearWeGameToken(new LoginException((int)LoginExceptionCode.OutdatedLoginInfo, "登录过期")));
+        Assert.False(CatLoginFailures.ShouldClearWeGameToken(new InvalidOperationException("包装", new LoginException(-10742165, "第三方验证失败"))));
+        Assert.False(CatLoginFailures.ShouldClearWeGameToken(new HttpRequestException("连接失败")));
+        Assert.False(CatLoginFailures.ShouldClearWeGameToken(new OAuthLoginException("getGuid 失败")));
+        Assert.False(CatLoginFailures.ShouldClearWeGameToken(new Newtonsoft.Json.JsonReaderException("回包不是 JSON")));
+    }
+
+    [Fact]
+    public void ToWeGameLoginCode_MapsFailures()
+    {
+        // 令牌被拒: 只能回界面版重新登录; 不认识的返回码（可能是繁忙）不算被拒, 按启动失败报
+        Assert.Equal(CatCodes.AUTHORIZATION_REQUIRED, CatLoginFailures.ToWeGameLoginCode(new LoginException((int)LoginExceptionCode.ThirdPartyVerificationFailed, "第三方验证失败")));
+        Assert.Equal(CatCodes.AUTHORIZATION_REQUIRED, CatLoginFailures.ToWeGameLoginCode(new LoginException((int)LoginExceptionCode.OutdatedLoginInfo, "登录过期")));
+        Assert.Equal(CatCodes.LAUNCH_FAILED, CatLoginFailures.ToWeGameLoginCode(new LoginException(-10999999, "繁忙")));
+
+        Assert.Equal(CatCodes.RISK_CONTROL, CatLoginFailures.ToWeGameLoginCode(new LoginException((int)LoginExceptionCode.RiskEnvironment, "要客户验证")));
+        Assert.Equal(CatCodes.NETWORK_ERROR, CatLoginFailures.ToWeGameLoginCode(new HttpRequestException("连接失败")));
+        Assert.Equal(CatCodes.NETWORK_ERROR, CatLoginFailures.ToWeGameLoginCode(new TaskCanceledException("超时")));
+        Assert.Equal(CatCodes.LAUNCH_FAILED, CatLoginFailures.ToWeGameLoginCode(new OAuthLoginException("getGuid 失败")));
+        Assert.Equal(CatCodes.LAUNCH_FAILED, CatLoginFailures.ToWeGameLoginCode(new NullReferenceException()));
+    }
+
+    [Fact]
     public void ToCode_MapsKinds()
     {
         Assert.Equal(CatCodes.NETWORK_ERROR, CatLoginFailures.ToCode(CatLoginFailureKind.Network, CatCodes.AUTHORIZATION_REQUIRED));

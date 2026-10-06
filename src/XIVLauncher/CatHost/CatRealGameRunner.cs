@@ -34,8 +34,24 @@ public sealed class CatLaunchException(string code, string message) : Exception(
     public string Code { get; } = code;
 }
 
+/// <summary>在账号库里找 WeGame 号的结果</summary>
+public enum CatWeGameAccountMatch
+{
+    /// <summary>没有对得上的行</summary>
+    None,
+
+    /// <summary>账号名（WeGame 给的用户号）完全相同</summary>
+    ByName,
+
+    /// <summary>恰好一行的备注里写着请求的号</summary>
+    ByNote,
+
+    /// <summary>不止一行的备注里写着请求的号, 不知道该用哪一行</summary>
+    AmbiguousNote
+}
+
 /// <summary>
-///     无界面启动核心: 与界面路径（GameLaunchFlow.StartGameAndCompanionApp）同样的步骤, 但不读界面状态、不弹任何框,
+///     无界面启动核心:与界面路径（GameLaunchFlow.StartGameAndCompanionApp）同样的步骤, 但不读界面状态、不弹任何框,
 ///     所有原本弹框的地方改为发事件 / 返回失败码。本进程只服务一个账号, 跨区会话也只属于这一个号。
 /// </summary>
 public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensureInitialized) : ICatGameRunner
@@ -51,6 +67,12 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     private readonly HashSet<int>        cleanedPids         = [];
     private readonly object              closeLock           = new();
 
+    /// <summary>
+    ///     WeGame 号没有可用令牌时给工作室员工看的处理办法（消息里不说「令牌」这类内部词）:
+    ///     无界面模式不唤起 WeGame 客户端, 令牌只能由界面版登录时存下
+    /// </summary>
+    private const string WE_GAME_LOGIN_IN_UI_HINT = "请在这台电脑的 DcMiniLauncher 界面版里用 WeGame 方式重新登录一次";
+
     /// <summary>选 Minion 行并写预占记录时持有, 防止同一张卡的号同时启动时选到同一行</summary>
     private const string MINION_SELECT_MUTEX_NAME = @"Local\DcMiniLauncher-MinionSelect";
 
@@ -65,6 +87,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     private GameLaunchContext      context        = null!;
     private DCTravelRuntimeService? dcTravel;
     private string?                quickKey;
+    private string?                weGameToken;
     private FFXIVProcess?          currentProcess;
     private int                    lastPid;
     private int?                   lastExitCode;
@@ -228,17 +251,34 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         accountManager = App.AccountManager;
 
         if (accountManager.CurrentCredType == CredType.WindowsHello)
-            throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "账号库使用 Windows Hello 加密, 无人值守时无法解密已保存的凭证");
+        {
+            throw new CatLaunchException
+            (
+                CatCodes.AUTHORIZATION_REQUIRED,
+                request.IsWeGame
+                    ? "账号库使用 Windows Hello 加密, 无人值守时读不出已保存的登录信息"
+                    : "账号库使用 Windows Hello 加密, 无人值守时无法解密已保存的凭证"
+            );
+        }
 
-        account = accountManager.FindAccount(request.AccountName, XIVAccountType.Sdo)
-                  ?? throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "DcMiniLauncher 账号库里没有这个号, 需要先授权");
+        // 盛趣号与 WeGame 号在账号库里是不同的行（账号名可以相同）, 按请求的渠道找
+        account = request.IsWeGame
+                      ? FindWeGameAccount()
+                      : accountManager.FindAccount(request.AccountName, XIVAccountType.Sdo)
+                        ?? throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "DcMiniLauncher 账号库里没有这个号, 需要先授权");
 
         // 其它进程可能刚更新过这个号的凭证和设备, 启动前从数据库刷新这一行
         accountManager.RefreshFromDatabase(account);
 
-        gamePath = App.Settings.GetGamePath(XIVAccountType.Sdo) is { Exists: true } path
+        gamePath = App.Settings.GetGamePath(request.Platform) is { Exists: true } path
                        ? path
-                       : throw new CatLaunchException(CatCodes.INVALID_GAME_PATH, "DcMiniLauncher 设置里的国服游戏目录无效");
+                       : throw new CatLaunchException
+                         (
+                             CatCodes.INVALID_GAME_PATH,
+                             request.IsWeGame
+                                 ? "DcMiniLauncher 设置里的 WeGame 版游戏目录无效, 请在界面版「设置」里重新选择"
+                                 : "DcMiniLauncher 设置里的国服游戏目录无效"
+                         );
 
         await CheckGameUpdateAsync(cancellationToken).ConfigureAwait(false);
 
@@ -249,7 +289,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
 
         device = CatDeviceProfiles.Resolve(accountManager, account, out var isPerAccount)
-                 ?? throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "这个号开了独立设备, 但账号库里找不到它的设备信息, 需要重新授权");
+                 ?? throw new CatLaunchException
+                 (
+                     CatCodes.AUTHORIZATION_REQUIRED,
+                     request.IsWeGame
+                         ? "这个号开了独立设备, 但账号库里找不到它的设备信息, 请在 DcMiniLauncher 界面版里重新设置这个号的设备"
+                         : "这个号开了独立设备, 但账号库里找不到它的设备信息, 需要重新授权"
+                 );
 
         if (!isPerAccount)
             reporter.Log("warning", "这个号在账号库里用的是共享设备, 不是独立设备");
@@ -279,13 +325,43 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         var loginResult = await LoginWithSavedCredentialAsync(reporter, cancellationToken).ConfigureAwait(false);
 
-        context = new GameLaunchContext(loginResult, area, areas, XIVAccountType.Sdo);
+        context = new GameLaunchContext(loginResult, area, areas, request.Platform);
 
-        if (!string.IsNullOrEmpty(quickKey))
+        if (CanRefreshByLogin)
             dcTravel.ConfigureQuickLoginRefresh(RefreshSessionIdByQuickLoginAsync);
 
         context.DcTravelPort = await dcTravel.StartAsync().ConfigureAwait(false);
         Log.Information("[CatHost] 跨区会话已建立, 端口 {Port}, 大区 {Area}", context.DcTravelPort, area.AreaName);
+    }
+
+    /// <summary>
+    ///     找 WeGame 号那一行: 账号库里 WeGame 行的账号名是 WeGame 给的用户号, 上号请求带的通常是客户填的 QQ 号或手机号,
+    ///     所以按账号名找不到时再按备注找。之后登录、设备、令牌都用找到的这一行。
+    /// </summary>
+    private XIVAccount FindWeGameAccount()
+    {
+        var rows = accountManager.Accounts.Where(x => x.AccountType == XIVAccountType.WeGame).ToArray();
+        var row  = ResolveWeGameAccount(rows, request.AccountName, x => x.UserName, x => x.UserDefinedName, out var match);
+
+        switch (match)
+        {
+            case CatWeGameAccountMatch.ByName:
+                return row!;
+
+            case CatWeGameAccountMatch.ByNote:
+                Log.Information("[CatHost] 按备注找到 WeGame 号: 请求的号={Requested}, 账号库里的账号名={UserName}", request.AccountName, row!.UserName);
+                return row;
+
+            case CatWeGameAccountMatch.AmbiguousNote:
+                throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, $"DcMiniLauncher 里有多个 WeGame 号的备注写着 {request.AccountName}，请只留一个");
+
+            default:
+                throw new CatLaunchException
+                (
+                    CatCodes.AUTHORIZATION_REQUIRED,
+                    $"DcMiniLauncher 账号库里没有这个 WeGame 号：先在这台电脑的 DcMiniLauncher 界面版里登录一次，并把这个号的备注填上客户的 QQ 号或手机号（{request.AccountName}）"
+                );
+        }
     }
 
     private async Task CheckGameUpdateAsync(CancellationToken cancellationToken)
@@ -392,9 +468,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     /// <summary>
     ///     用账号库里保存的凭证登录, 尽量少登录盛趣: 快速登录凭证优先; 网络错误不换密码（报 networkError 可重试）;
     ///     要客户验证时报 riskControl; 只有凭证被拒且有密码才用密码登录一次; 其余报 authorizationRequired。
+    ///     WeGame 号另走 <see cref="LoginWithSavedWeGameTokenAsync" />。
     /// </summary>
     private async Task<LoginResult> LoginWithSavedCredentialAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
+        if (request.IsWeGame)
+            return await LoginWithSavedWeGameTokenAsync(cancellationToken).ConfigureAwait(false);
+
         var secretsAvailable = !accountManager.HasUnavailableSecrets(account);
         Exception? lastError = null;
 
@@ -518,6 +598,103 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         );
     }
 
+    /// <summary>
+    ///     WeGame 号: 只用界面版登录时存下的 WeGame 令牌登录（与界面版走同一个接口）。没有密码兜底, 也不唤起 WeGame 客户端重新取令牌:
+    ///     没有令牌或盛趣不认这枚令牌都报 authorizationRequired; 只有盛趣明确说令牌不行（第三方验证失败）才把已存的令牌清掉。
+    ///     登录成功不回写: 令牌本身不变, 界面版也不给 WeGame 号存盛趣的快速登录凭证。
+    /// </summary>
+    private async Task<LoginResult> LoginWithSavedWeGameTokenAsync(CancellationToken cancellationToken)
+    {
+        var savedSecret = accountManager.HasUnavailableSecrets(account) ? null : account.WeGameQuickLoginSecret;
+        var token       = string.IsNullOrEmpty(savedSecret) ? null : await accountManager.Decrypt(savedSecret).ConfigureAwait(false);
+
+        if (string.IsNullOrWhiteSpace(token))
+            throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, $"这个 WeGame 号还没在这台电脑登录过, {WE_GAME_LOGIN_IN_UI_HINT}");
+
+        redactor.Register(token);
+
+        try
+        {
+            var result = await loginClient.LoginAsync(LoginType.WeGame, CreateWeGameLoginRequest(token, true), cancellationToken).ConfigureAwait(false);
+
+            // 登录时顺带签发的盛趣快速登录凭证界面版不存, 这里也不存, 只防它进日志
+            if (!string.IsNullOrEmpty(result.OAuthLogin?.QuickLoginSecret))
+                redactor.Register(result.OAuthLogin.QuickLoginSecret);
+
+            weGameToken = token;
+            return EnsureLoginOk(result);
+        }
+        catch (CatLaunchException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            var code   = CatLoginFailures.ToWeGameLoginCode(ex);
+            var detail = CatLoginFailures.Describe(ex);
+            Log.Warning(ex, "[CatHost] 用已保存的 WeGame 令牌登录失败 ({Code}): {Detail}", code, detail);
+
+            if (CatLoginFailures.ShouldClearWeGameToken(ex))
+                ClearSavedWeGameToken(savedSecret!);
+
+            // 消息原样给工作室员工看, 不出现「令牌」这类内部说法
+            throw new CatLaunchException
+            (
+                code,
+                code switch
+                {
+                    CatCodes.NETWORK_ERROR          => $"连不上盛趣登录服务器, 稍后重试即可: {detail}",
+                    CatCodes.RISK_CONTROL           => $"盛趣要求客户验证: {detail}",
+                    CatCodes.AUTHORIZATION_REQUIRED => $"这个 WeGame 号的登录已失效, {WE_GAME_LOGIN_IN_UI_HINT}: {detail}",
+                    _                               => $"WeGame 号登录出错: {ex.GetType().Name}: {detail}"
+                }
+            );
+        }
+    }
+
+    /// <summary>
+    ///     WeGame 令牌登录的请求, 与界面版一致: 启动时那次登录带快速登录标记, 之后刷新票据时不带
+    /// </summary>
+    private LoginRequest CreateWeGameLoginRequest(string token, bool quickLoginEnabled) =>
+        new()
+        {
+            Account                 = account.UserName,
+            Secret                  = token,
+            QuickLoginEnabled       = quickLoginEnabled,
+            DeviceProfile           = device,
+            LoginSessionRefreshSink = dcTravel,
+            ShowLoginMessage        = message => Log.Information("[CatHost] 登录: {Message}", message)
+        };
+
+    /// <summary>
+    ///     清掉这个号已存的 WeGame 令牌, 界面版下次登录这个号时会重新取; 期间界面版已存了新令牌的话不动它
+    /// </summary>
+    private void ClearSavedWeGameToken(string rejectedSecret)
+    {
+        try
+        {
+            accountManager.RefreshFromDatabase(account);
+
+            if (!string.Equals(account.WeGameQuickLoginSecret, rejectedSecret, StringComparison.Ordinal))
+            {
+                Log.Information("[CatHost] 这个号的 WeGame 令牌刚被别的进程更新过, 不清");
+                return;
+            }
+
+            // 只改这个号自己那一行的 WeGame 令牌, 不动当前账号选择和设备设置
+            account.WeGameQuickLoginSecret = null;
+            accountManager.Save(account);
+            Log.Information("[CatHost] 已清掉这个号失效的 WeGame 令牌");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 清掉失效的 WeGame 令牌失败");
+        }
+    }
+
+    /// <summary>手里有没有能重新登录换票据的凭证: 盛趣号是快速登录凭证, WeGame 号是 WeGame 令牌</summary>
+    private bool CanRefreshByLogin => !string.IsNullOrEmpty(request.IsWeGame ? weGameToken : quickKey);
+
     private static LoginResult EnsureLoginOk(LoginResult result) =>
         result.State switch
         {
@@ -561,8 +738,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         try
         {
-            var result = await loginClient.LoginBySessionKey(account.UserName, quickKey!, dcTravel, device).ConfigureAwait(false);
-            await PersistQuickKeyAsync(result.OAuthLogin?.QuickLoginSecret).ConfigureAwait(false);
+            // WeGame 号没有盛趣快速登录凭证: 照界面版, 拿同一枚 WeGame 令牌再登录一次, 令牌不变所以没有要回写的
+            var result = request.IsWeGame
+                             ? await loginClient.LoginAsync(LoginType.WeGame, CreateWeGameLoginRequest(weGameToken!, false)).ConfigureAwait(false)
+                             : await loginClient.LoginBySessionKey(account.UserName, quickKey!, dcTravel, device).ConfigureAwait(false);
+
+            if (!request.IsWeGame)
+                await PersistQuickKeyAsync(result.OAuthLogin?.QuickLoginSecret).ConfigureAwait(false);
 
             var oauth = result.OAuthLogin;
 
@@ -594,7 +776,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     }
 
     /// <summary>
-    ///     起游戏前现取一次性票据: 先用 TGT 换（不算登录）; 崩溃重启时 TGT 可能已过期, 换不到再用快速登录凭证刷新一次
+    ///     起游戏前现取一次性票据: 先用 TGT 换（不算登录）; 崩溃重启时 TGT 可能已过期, 换不到再用快速登录凭证（WeGame 号用 WeGame 令牌）刷新一次
     /// </summary>
     private async Task EnsureFreshSessionIdAsync(bool isRestart)
     {
@@ -621,11 +803,11 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             }
         }
 
-        if (error != null && isRestart && !string.IsNullOrEmpty(quickKey) && CatLoginFailures.Classify(error) != CatLoginFailureKind.Network)
+        if (error != null && isRestart && CanRefreshByLogin && CatLoginFailures.Classify(error) != CatLoginFailureKind.Network)
         {
             try
             {
-                Log.Information("[CatHost] 崩溃重启: TGT 已不可用, 用快速登录凭证刷新票据");
+                Log.Information("[CatHost] 崩溃重启: TGT 已不可用, 用{Credential}刷新票据", request.IsWeGame ? " WeGame 令牌" : "快速登录凭证");
                 var sessionId = await RefreshSessionIdByQuickLoginAsync().ConfigureAwait(false);
 
                 if (!string.IsNullOrEmpty(sessionId))
@@ -637,7 +819,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "[CatHost] 用快速登录凭证刷新票据失败");
+                Log.Error(ex, "[CatHost] 用{Credential}刷新票据失败", request.IsWeGame ? " WeGame 令牌" : "快速登录凭证");
                 error = ex;
             }
         }
@@ -656,6 +838,83 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         if (string.IsNullOrEmpty(oauthLogin.SndaID))
             throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "登录异常: SNDAID 为空");
+    }
+
+    /// <summary>
+    ///     在账号库的 WeGame 行里找上号请求指的那一行: 先按账号名精确找; 找不到且请求的号是纯数字时, 再找备注里写着这个号的行
+    ///     （备注按非数字字符切成几段数字, 某一段与请求的号完全相等才算, 免得 12345 对上 123456）。
+    ///     备注对上多行时不猜, 返回 null 并标 <see cref="CatWeGameAccountMatch.AmbiguousNote" />。没有账号名的残行不参与。
+    /// </summary>
+    internal static T? ResolveWeGameAccount<T>
+    (
+        IReadOnlyList<T>          rows,
+        string?                   requestedName,
+        Func<T, string?>          nameOf,
+        Func<T, string?>          noteOf,
+        out CatWeGameAccountMatch match
+    )
+        where T : class
+    {
+        match = CatWeGameAccountMatch.None;
+
+        var requested = requestedName?.Trim();
+
+        if (string.IsNullOrEmpty(requested))
+            return null;
+
+        if (rows.FirstOrDefault(x => string.Equals(nameOf(x), requested, StringComparison.Ordinal)) is { } byName)
+        {
+            match = CatWeGameAccountMatch.ByName;
+            return byName;
+        }
+
+        if (!requested.All(char.IsAsciiDigit))
+            return null;
+
+        var byNote = rows.Where(x => !string.IsNullOrWhiteSpace(nameOf(x)) && NoteMentionsNumber(noteOf(x), requested)).ToArray();
+
+        switch (byNote.Length)
+        {
+            case 0:
+                return null;
+
+            case 1:
+                match = CatWeGameAccountMatch.ByNote;
+                return byNote[0];
+
+            default:
+                match = CatWeGameAccountMatch.AmbiguousNote;
+                return null;
+        }
+    }
+
+    /// <summary>
+    ///     备注里有没有一段连续数字正好等于 <paramref name="number" />
+    /// </summary>
+    private static bool NoteMentionsNumber(string? note, string number)
+    {
+        if (string.IsNullOrEmpty(note))
+            return false;
+
+        var start = -1;
+
+        for (var i = 0; i <= note.Length; i++)
+        {
+            if (i < note.Length && char.IsAsciiDigit(note[i]))
+            {
+                if (start < 0)
+                    start = i;
+
+                continue;
+            }
+
+            if (start >= 0 && note.AsSpan(start, i - start).SequenceEqual(number))
+                return true;
+
+            start = -1;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1111,7 +1370,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         try
         {
-            var result = await MinionAttacher.AttachAsync(minionRow, launched.UnderlyingProcess, gamePath, dalamudInjected, account.UserName, cancellationToken)
+            // 占用记录里写上号请求带的账号名（外壳认得的那个）: 按备注找到的 WeGame 号, 它与账号库里的账号名不同
+            var result = await MinionAttacher.AttachAsync(minionRow, launched.UnderlyingProcess, gamePath, dalamudInjected, request.AccountName, cancellationToken)
                                              .ConfigureAwait(false);
             ok = result.Ok;
 
@@ -1165,7 +1425,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                                ProcessStartedAt = startedAt,
                                CardFingerprint  = MinionCards.Fingerprint(row.Keycode),
                                Variant          = request.Variant ?? MinionCards.VARIANT_CN,
-                               AccountName      = account.UserName,
+                               AccountName      = request.AccountName,
                                MinionUid        = string.IsNullOrWhiteSpace(row.Uid) ? null : row.Uid.Trim(),
                                AttachedAt       = DateTimeOffset.UtcNow
                            }

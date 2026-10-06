@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Threading.Channels;
 using Serilog;
+using XIVLauncher.Common.Game;
 using XIVLauncher.Minion;
 
 namespace XIVLauncher.CatHost;
@@ -10,15 +11,19 @@ namespace XIVLauncher.CatHost;
 /// </summary>
 public sealed record CatLaunchRequest
 (
-    string  OperationId,
-    string  AccountName,
-    bool    Dalamud,
-    string? CardFingerprint,
-    string? Variant,
-    int     CrashDialogTimeoutSeconds = CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS,
-    string? AreaName                  = null
+    string         OperationId,
+    string         AccountName,
+    bool           Dalamud,
+    string?        CardFingerprint,
+    string?        Variant,
+    int            CrashDialogTimeoutSeconds = CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS,
+    string?        AreaName                  = null,
+    XIVAccountType Platform                  = XIVAccountType.Sdo
 )
 {
+    /// <summary>是否为 WeGame 版国服的号</summary>
+    public bool IsWeGame => Platform == XIVAccountType.WeGame;
+
     /// <summary>是否要挂 Minion</summary>
     public bool Minion => CardFingerprint != null;
 
@@ -198,6 +203,9 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (parameters.CrashDialogTimeoutSeconds is { } crashTimeout and (< 1 or > CatProtocol.MAX_CRASH_DIALOG_TIMEOUT_SECONDS))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"crashDialogTimeoutSeconds 必须在 1 到 {CatProtocol.MAX_CRASH_DIALOG_TIMEOUT_SECONDS} 之间");
 
+        if (!CatPlatforms.TryParse(parameters.Platform, out var platform))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"platform 只能是 {CatPlatforms.SHENGQU} 或 {CatPlatforms.WE_GAME}");
+
         CatLaunchRequest accepted;
 
         lock (stateLock)
@@ -216,15 +224,17 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 parameters.Minion?.CardFingerprint,
                 parameters.Minion?.Variant,
                 parameters.CrashDialogTimeoutSeconds ?? CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS,
-                string.IsNullOrWhiteSpace(parameters.AreaName) ? null : parameters.AreaName.Trim()
+                string.IsNullOrWhiteSpace(parameters.AreaName) ? null : parameters.AreaName.Trim(),
+                platform
             );
             request = accepted;
         }
 
         Serilog.Log.Information
         (
-            "[CatHost] 接受 launch: 操作={OperationId}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s",
+            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s",
             accepted.OperationId,
+            CatPlatforms.DisplayName(accepted.Platform),
             accepted.AccountName,
             accepted.Dalamud,
             accepted.Minion ? $"{accepted.CardFingerprint}/{accepted.Variant}" : "否",

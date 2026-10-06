@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using XIVLauncher.CatHost;
+using XIVLauncher.Common.Game;
 using Xunit;
 
 namespace XIVLauncher.Test.CatHost;
@@ -119,6 +120,118 @@ public sealed class CatRpcServerTests : IDisposable
 
         await runner.Started.Task.WaitAsync(Timeout);
         Assert.Equal(new CatLaunchRequest("op1", "acc", true, "0123456789abcdef", "global", AreaName: "豆豆柴"), runner.Request);
+    }
+
+    [Theory]
+    [InlineData("weGame")]
+    [InlineData("WEGAME")]
+    [InlineData(" wegame ")]
+    public async Task Launch_PassesWeGamePlatform_CaseInsensitive(string platform)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, platform });
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.Equal(XIVAccountType.WeGame, runner.Request!.Platform);
+        Assert.True(runner.Request.IsWeGame);
+        Assert.Equal(new CatLaunchRequest("op1", "acc", false, null, null, Platform: XIVAccountType.WeGame), runner.Request);
+    }
+
+    [Theory]
+    [InlineData("shengqu")]
+    [InlineData("ShengQu")]
+    [InlineData(null)] // 不带 platform: 按盛趣, 与加这个字段之前一样
+    public async Task Launch_ShengquOrMissingPlatform_IsSdo(string? platform)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = platform == null
+                           ? await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false })
+                           : await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, platform });
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.Equal(XIVAccountType.Sdo, runner.Request!.Platform);
+        Assert.False(runner.Request.IsWeGame);
+    }
+
+    [Theory]
+    [InlineData("steam")]
+    [InlineData("sdo")]
+    [InlineData("we game")]
+    public async Task Launch_UnknownPlatform_IsRejected(string platform)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, platform });
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+        Assert.False(host.HasLaunch);
+    }
+
+    [Theory]
+    [InlineData(null, true, XIVAccountType.Sdo)]
+    [InlineData("", true, XIVAccountType.Sdo)]
+    [InlineData("  ", true, XIVAccountType.Sdo)]
+    [InlineData("shengqu", true, XIVAccountType.Sdo)]
+    [InlineData("SHENGQU", true, XIVAccountType.Sdo)]
+    [InlineData("weGame", true, XIVAccountType.WeGame)]
+    [InlineData("wegame", true, XIVAccountType.WeGame)]
+    [InlineData("WeGame", true, XIVAccountType.WeGame)]
+    [InlineData("wegame2", false, XIVAccountType.Sdo)]
+    [InlineData("global", false, XIVAccountType.Sdo)]
+    public void Platform_TryParse(string? platform, bool expectedOk, XIVAccountType expected)
+    {
+        Assert.Equal(expectedOk, CatPlatforms.TryParse(platform, out var accountType));
+        Assert.Equal(expected, accountType);
+    }
+
+    [Theory]
+    // 账号名精确相同优先, 不看备注
+    [InlineData("10000000000000001", "10000000000000001", CatWeGameAccountMatch.ByName)]
+    [InlineData("13800001111", "13800001111", CatWeGameAccountMatch.ByName)] // 有一行的账号名就是这个号: 用它, 不管别的行备注里也写着
+    // 备注里某一段数字完全相等
+    [InlineData("123456", "10000000000000001", CatWeGameAccountMatch.ByNote)]
+    [InlineData(" 123456 ", "10000000000000001", CatWeGameAccountMatch.ByNote)]
+    [InlineData("987654321", "10000000000000002", CatWeGameAccountMatch.ByNote)] // 备注「老王 QQ987654321/手机13900002222」
+    [InlineData("13900002222", "10000000000000002", CatWeGameAccountMatch.ByNote)]
+    // 只是某段数字的一部分: 不算
+    [InlineData("12345", null, CatWeGameAccountMatch.None)]
+    [InlineData("23456", null, CatWeGameAccountMatch.None)]
+    [InlineData("1234567", null, CatWeGameAccountMatch.None)]
+    [InlineData("9876543210", null, CatWeGameAccountMatch.None)]
+    // 两行的备注都写着: 不猜
+    [InlineData("555666", null, CatWeGameAccountMatch.AmbiguousNote)]
+    // 不是纯数字的号不按备注找
+    [InlineData("老王", null, CatWeGameAccountMatch.None)]
+    [InlineData("QQ987654321", null, CatWeGameAccountMatch.None)]
+    [InlineData("123 456", null, CatWeGameAccountMatch.None)]
+    // 没有账号名的残行不参与
+    [InlineData("777888", null, CatWeGameAccountMatch.None)]
+    [InlineData("", null, CatWeGameAccountMatch.None)]
+    [InlineData(null, null, CatWeGameAccountMatch.None)]
+    public void ResolveWeGameAccount_MatchesNameThenNote(string? requested, string? expectedName, CatWeGameAccountMatch expectedMatch)
+    {
+        (string Name, string? Note)[] rows =
+        [
+            ("10000000000000001", "123456"),
+            ("10000000000000002", "老王 QQ987654321/手机13900002222"),
+            ("10000000000000003", "555666 大号"),
+            ("10000000000000004", "小号(555666)"),
+            ("10000000000000005", null),
+            ("13800001111", ""),
+            ("10000000000000006", "13800001111"),
+            ("", "777888")
+        ];
+        var boxed = rows.Select(x => Tuple.Create(x.Name, x.Note)).ToArray();
+
+        var row = CatRealGameRunner.ResolveWeGameAccount(boxed, requested, x => x.Item1, x => x.Item2, out var match);
+
+        Assert.Equal(expectedMatch, match);
+        Assert.Equal(expectedName, row?.Item1);
     }
 
     [Theory]

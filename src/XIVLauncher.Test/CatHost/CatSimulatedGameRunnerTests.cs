@@ -62,6 +62,26 @@ public sealed class CatSimulatedGameRunnerTests
     }
 
     [Fact]
+    public async Task Run_WeGamePlatform_EmitsSameEventsAsShengqu()
+    {
+        var reporter = new RecordingReporter();
+        var run = runner.RunAsync
+        (
+            new CatLaunchRequest("op", "acc", false, null, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame),
+            reporter,
+            CancellationToken.None
+        );
+
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        using (var placeholder = Process.GetProcessById(reporter.Pid!.Value))
+            placeholder.Kill();
+
+        await run.WaitAsync(Timeout);
+        Assert.Equal(["stage:preparing", "stage:starting", "started", "stage:running", "exited"], reporter.Entries);
+    }
+
+    [Fact]
     public async Task Run_MissingCard_FailsWithMinionCardNotFound_BeforeStarting()
     {
         var reporter = new RecordingReporter();

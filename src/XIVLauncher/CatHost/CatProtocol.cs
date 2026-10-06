@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using XIVLauncher.Common.Game;
 
 namespace XIVLauncher.CatHost;
 
@@ -170,6 +171,46 @@ public static class CatAgentKinds
     public const string MINION = "minion";
 }
 
+/// <summary>launch 的 platform: 号是哪个渠道的（决定用账号库里哪种行、哪个游戏目录、怎么登录）</summary>
+public static class CatPlatforms
+{
+    /// <summary>盛趣官服（缺省）</summary>
+    public const string SHENGQU = "shengqu";
+
+    /// <summary>WeGame 版国服: 只能启动已在本机界面版登录过一次的号</summary>
+    public const string WE_GAME = "weGame";
+
+    /// <summary>
+    ///     解析 platform: 没带（或为空白）按盛趣, 取值不分大小写; 不认识的取值返回 false
+    /// </summary>
+    public static bool TryParse(string? platform, out XIVAccountType accountType)
+    {
+        accountType = XIVAccountType.Sdo;
+
+        if (string.IsNullOrWhiteSpace(platform))
+            return true;
+
+        var value = platform.Trim();
+
+        if (string.Equals(value, SHENGQU, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (string.Equals(value, WE_GAME, StringComparison.OrdinalIgnoreCase))
+        {
+            accountType = XIVAccountType.WeGame;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    ///     渠道在日志和消息里的叫法
+    /// </summary>
+    public static string DisplayName(XIVAccountType accountType) =>
+        accountType == XIVAccountType.WeGame ? "WeGame" : "盛趣";
+}
+
 /// <summary>stdin 第一行握手</summary>
 public sealed record CatBootstrap(string PipeName, string Token);
 
@@ -182,8 +223,20 @@ public sealed record CatHelloResult(string ProtocolVersion, string LauncherVersi
 /// <summary>launch 里的 Minion 参数</summary>
 public sealed record CatMinionParams(string? CardFingerprint, string? Variant);
 
-/// <summary>launch 参数; areaName = 资料里的大区名（如 豆豆柴）, 账号库没记这个号的大区时用它</summary>
-public sealed record CatLaunchParams(string? OperationId, string? AccountName, bool Dalamud, CatMinionParams? Minion, int? CrashDialogTimeoutSeconds = null, string? AreaName = null);
+/// <summary>
+///     launch 参数; areaName = 资料里的大区名（如 豆豆柴）, 账号库没记这个号的大区时用它;
+///     platform = 渠道, 见 <see cref="CatPlatforms" />, 不带按盛趣
+/// </summary>
+public sealed record CatLaunchParams
+(
+    string?          OperationId,
+    string?          AccountName,
+    bool             Dalamud,
+    CatMinionParams? Minion,
+    int?             CrashDialogTimeoutSeconds = null,
+    string?          AreaName                  = null,
+    string?          Platform                  = null
+);
 
 /// <summary>inject 参数; force = 已挂着也重新挂 Minion</summary>
 public sealed record CatInjectParams(bool? Dalamud, bool? Minion, bool? Force = null);
