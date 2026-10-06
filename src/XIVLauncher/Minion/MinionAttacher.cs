@@ -37,6 +37,15 @@ public static class MinionAttacher
     /// <summary>国服 bot 注入文件, 位于 bot 目录的 <c>MinionFiles\</c> 下</summary>
     private const string DAT_NAME_CN = "FFXIVMinionCN_64.dat";
 
+    /// <summary>
+    ///     国际服 bot 注入文件, 同在 <c>MinionFiles\</c> 下。
+    ///     取证: PC3（Minion 装在 D:\MINI, 由 MINIONAPP 调 MinionLauncher_64）的 MinionLauncherInfo.txt, 2026-10-05、10-06 两次对国际服游戏
+    ///     挂载成功（Attaching Successfull）时解析到的参数（2026-10-06 取证）。同一份记录里国际服与国服只有两处不同:
+    ///     <c>datpath</c> 的文件名（这个常量）和 <c>path</c> 指向的游戏 exe（国际服是游戏目录下的 game\ffxiv_dx11.exe）;
+    ///     region 两边都是 2（Minion 侧的全局设置, 不随客户端变）, attachtype 0、productid 8、usebeta 0、datacenter 取行里的值也都相同。
+    /// </summary>
+    private const string DAT_NAME_GLOBAL = "FFXIVMinion_64.dat";
+
     private const string BOT_DIR_NAME = @"Bots\FFXIVMinion64";
 
     private const string MINION_FILES_DIR_NAME = "MinionFiles";
@@ -109,6 +118,10 @@ public static class MinionAttacher
     /// </summary>
     /// <param name="account">要挂的 Accounts.json 行</param>
     /// <param name="accountName">游戏账号名, 只写进占用记录</param>
+    /// <param name="variant">
+    ///     行类型: <see cref="MinionCards.VARIANT_CN" />（缺省, 国服）或 <see cref="MinionCards.VARIANT_GLOBAL" />（国际服）。
+    ///     只决定注入文件名和 <c>-path</c> 的候选, 其余参数两种相同
+    /// </param>
     public static async Task<MinionAttachResult> AttachAsync
     (
         MinionAccount     account,
@@ -116,7 +129,8 @@ public static class MinionAttacher
         DirectoryInfo?    gamePath,
         bool              dalamudInjected,
         string?           accountName,
-        CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default,
+        string            variant           = MinionCards.VARIANT_CN
     )
     {
         var installPath = MinionAccounts.InstallPath;
@@ -145,7 +159,7 @@ public static class MinionAttacher
         if (gameProcess.HasExited)
             return MinionAttachResult.Failed("游戏进程已退出, 没有可挂载的目标");
 
-        var result = await SpawnLauncherAsync(account, installPath, gamePath, gameProcess, cancellationToken).ConfigureAwait(false);
+        var result = await SpawnLauncherAsync(account, installPath, gamePath, gameProcess, cancellationToken, variant).ConfigureAwait(false);
 
         if (!result.Ok)
             return result;
@@ -170,7 +184,8 @@ public static class MinionAttacher
         string            installPath,
         DirectoryInfo?    gamePath,
         Process           gameProcess,
-        CancellationToken cancellationToken
+        CancellationToken cancellationToken,
+        string            variant = MinionCards.VARIANT_CN
     )
     {
         var launcherExe = MinionAccounts.GetLauncherExePath(installPath);
@@ -178,7 +193,7 @@ public static class MinionAttacher
         if (!File.Exists(launcherExe))
             return MinionAttachResult.Failed($"未找到 {launcherExe}（在「设置 → Minion」里指定 Minion 安装目录）");
 
-        if (ResolveGameExePath(account, gamePath, gameProcess) is not { } gameExePath)
+        if (ResolveGameExePath(account, gamePath, gameProcess, variant) is not { } gameExePath)
             return MinionAttachResult.Failed
             (
                 $"找不到可用的游戏 exe 给 -path 用（Accounts.json 里写的是 {account.PathToExe ?? "(空)"}, 本机不存在; " +
@@ -186,7 +201,7 @@ public static class MinionAttacher
             );
 
         var botPath = Path.Combine(installPath, BOT_DIR_NAME);
-        var datPath = Path.Combine(botPath, MINION_FILES_DIR_NAME, DAT_NAME_CN);
+        var datPath = Path.Combine(botPath, MINION_FILES_DIR_NAME, DatNameOf(variant));
 
         if (!File.Exists(datPath))
             return MinionAttachResult.Failed($"找不到 bot 文件 {datPath}");
@@ -214,12 +229,28 @@ public static class MinionAttacher
     ///     游戏由本启动器起并已登录, Minion 只负责 attach。
     ///     缺必需字段时返回 null。
     /// </summary>
-    private static List<string>? BuildArguments(MinionAccount account, string botPath, string datPath, string gameExePath, int gamePid)
+    private static List<string>? BuildArguments(MinionAccount account, string botPath, string datPath, string gameExePath, int gamePid) =>
+        BuildArguments(account, botPath, datPath, gameExePath, gamePid, App.Settings.MinionId, App.Settings.MinionPassword);
+
+    /// <summary>
+    ///     同上, Minion 论坛账号与密码由参数给（不读设置, 便于单测）。国服行与国际服行拼法相同, 区别只在调用方传进来的
+    ///     <paramref name="datPath" /> 与 <paramref name="gameExePath" />。
+    /// </summary>
+    internal static List<string>? BuildArguments
+    (
+        MinionAccount account,
+        string        botPath,
+        string        datPath,
+        string        gameExePath,
+        int           gamePid,
+        string?       minionId,
+        string?       minionPassword
+    )
     {
-        if (string.IsNullOrWhiteSpace(account.Uid)             ||
-            string.IsNullOrWhiteSpace(account.Keycode)         ||
-            string.IsNullOrWhiteSpace(App.Settings.MinionId)   ||
-            string.IsNullOrWhiteSpace(App.Settings.MinionPassword))
+        if (string.IsNullOrWhiteSpace(account.Uid)     ||
+            string.IsNullOrWhiteSpace(account.Keycode) ||
+            string.IsNullOrWhiteSpace(minionId)        ||
+            string.IsNullOrWhiteSpace(minionPassword))
             return null;
 
         return
@@ -228,11 +259,11 @@ public static class MinionAttacher
             "-attachtype=0",
             $"-productid={account.ProductId?.ToString() ?? PRODUCT_ID_CN}",
             $"-uid={account.Uid}",
-            $"-minionid={App.Settings.MinionId}",
+            $"-minionid={minionId}",
             $"-minionkey={account.Keycode}",
 
             // 明文 —— 传 Accounts.json 里加密的 KeyPassword 会 "attach 成功" 但 bot 不起（P1 实测）
-            $"-minionpass={App.Settings.MinionPassword}",
+            $"-minionpass={minionPassword}",
             "-attach=true",
             $"-attachtopid={gamePid}",
 
@@ -254,18 +285,42 @@ public static class MinionAttacher
     ///     MinionLauncher 校验不过会直接 "ERROR: Invalid Game exe path!" 退出, 根本不会 attach（2026-08-14 实测）。
     ///     优先本次启动用的游戏目录下的官方登录器（与 MINIONAPP 的配法一致）, 再退回账号里的路径, 最后用游戏进程自己的 exe。
     /// </summary>
-    private static string? ResolveGameExePath(MinionAccount account, DirectoryInfo? gamePath, Process gameProcess)
+    private static string? ResolveGameExePath(MinionAccount account, DirectoryInfo? gamePath, Process gameProcess, string variant = MinionCards.VARIANT_CN) =>
+        GameExeCandidates(account, gamePath, TryGetProcessExePath(gameProcess), variant)
+            .FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate) && File.Exists(candidate));
+
+    /// <summary>
+    ///     <c>-path</c> 的候选, 按先后取第一个真实存在的。
+    ///     国服行: 游戏目录下的盛趣登录器 → 行里的路径 → 游戏目录下的 game\ffxiv_dx11.exe → 游戏进程自己的 exe。
+    ///     国际服行（取证见 <see cref="DAT_NAME_GLOBAL" />）: MINIONAPP 传的就是国际服游戏目录下的 game\ffxiv_dx11.exe, 行里的 PathToExe 也是它;
+    ///     所以先用行里的路径, 本机不存在时用启动器这次用的国际服游戏目录兜底, 最后是游戏进程自己的 exe。国际服没有盛趣登录器, 不找它。
+    /// </summary>
+    internal static List<string?> GameExeCandidates(MinionAccount account, DirectoryInfo? gamePath, string? processExePath, string variant)
     {
-        List<string?> candidates =
+        if (variant == MinionCards.VARIANT_GLOBAL)
+        {
+            return
+            [
+                account.PathToExe,
+                gamePath == null ? null : Path.Combine(gamePath.FullName, "game", "ffxiv_dx11.exe"),
+                processExePath
+            ];
+        }
+
+        return
         [
             gamePath == null ? null : Path.Combine(gamePath.FullName, "sdo", "sdologin", "Launcher.exe"),
             account.PathToExe,
             gamePath == null ? null : Path.Combine(gamePath.FullName, "game", "ffxiv_dx11.exe"),
-            TryGetProcessExePath(gameProcess)
+            processExePath
         ];
-
-        return candidates.FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate) && File.Exists(candidate));
     }
+
+    /// <summary>
+    ///     行类型对应的 bot 注入文件名: 国际服行 <see cref="DAT_NAME_GLOBAL" />, 其余（国服）<see cref="DAT_NAME_CN" />
+    /// </summary>
+    internal static string DatNameOf(string variant) =>
+        variant == MinionCards.VARIANT_GLOBAL ? DAT_NAME_GLOBAL : DAT_NAME_CN;
 
     private static string? TryGetProcessExePath(Process gameProcess)
     {
