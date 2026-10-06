@@ -87,6 +87,12 @@ public partial class App
             return;
         }
 
+        if (CatHostMode.IsSelfUpdate)
+        {
+            await RunCatSelfUpdateAsync();
+            return;
+        }
+
         try
         {
             orchestrator   = new(Dispatcher);
@@ -143,6 +149,13 @@ public partial class App
             return;
         }
 
+        if (CatHostMode.IsSelfUpdate)
+        {
+            Log.Error(e.Exception, "[CatUpdate] 未被观察的任务异常");
+            e.SetObserved();
+            return;
+        }
+
         OnUnhandledException(sender, new UnhandledExceptionEventArgs(e.Exception, true));
     }
 
@@ -155,6 +168,14 @@ public partial class App
         if (CatHostMode.IsActive)
         {
             CatHostRuntime.HandleFatal((Exception)e.ExceptionObject);
+            return;
+        }
+
+        if (CatHostMode.IsSelfUpdate)
+        {
+            Log.Fatal((Exception)e.ExceptionObject, "[CatUpdate] 未处理的异常, 进程即将退出");
+            Log.CloseAndFlush();
+            Environment.Exit(1);
             return;
         }
 
