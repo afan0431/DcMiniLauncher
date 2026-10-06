@@ -90,13 +90,19 @@ public sealed class CatAutoEnterTests
     }
 
     [Fact]
-    public async Task UnknownName_SingleCharacter_EntersIt()
+    public async Task UnknownName_SingleCharacter_WaitsForChoiceInsteadOfGuessing()
     {
         var (game, reporter) = Setup(Chara("11", "小白"));
 
-        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget("写错的名字", "LaNuoXiYa")).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("写错的名字", "LaNuoXiYa"));
+        var run  = flow.RunAsync(CancellationToken.None);
 
-        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        await WaitUntilAsync(() => reporter.Entries.Contains("characters:choose:1"));
+        Assert.False(run.IsCompleted);
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("ENTERCHARA", StringComparison.Ordinal));
+
+        Assert.True(flow.SelectCharacter("11").Accepted);
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await run.WaitAsync(Timeout));
         Assert.Contains("character:小白@LaNuoXiYa", reporter.Entries);
     }
 

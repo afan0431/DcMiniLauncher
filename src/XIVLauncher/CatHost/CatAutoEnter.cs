@@ -281,7 +281,7 @@ public sealed class CatAutoEnter
 
     /// <summary>
     ///     按规则定要登录的角色:
-    ///     ① 指定了 contentId 且在列表里; ② 名字唯一匹配（同名多个时按原始服务器再筛）; ③ 没给名字或匹配不到, 列表里只有一个角色;
+    ///     ① 指定了 contentId 且在列表里; ② 名字唯一匹配（同名多个时按原始服务器再筛）; ③ 没给名字, 列表里只有一个角色;
     ///     其余（多个角色定不了）要人选。列表为空时两个返回值都是空。
     ///     ③ 是猜的, 所以只在列表完整（<paramref name="listComplete" />）、且不是在找上一次进的那个角色（target 带 contentId）时才用:
     ///     否则宁可让人选, 也不登录一个没人指定过的角色。
@@ -310,14 +310,8 @@ public sealed class CatAutoEnter
             if (matches.Length > 1 && !string.IsNullOrWhiteSpace(target.HomeWorld))
                 matches = matches.Where(x => WorldMatches(target.HomeWorld.Trim(), x.HomeWorldCode, WorldName(worlds, x.HomeWorldCode))).ToArray();
 
-            switch (matches.Length)
-            {
-                case 1:
-                    return (matches[0], false);
-
-                case > 1:
-                    return (null, true);
-            }
+            // 给了名字却找不到时不猜: 要找的角色可能超域在别的大区, 这个大区里剩下的那一个不是它
+            return matches.Length == 1 ? (matches[0], false) : (null, true);
         }
 
         return entries.Count == 1 && listComplete && !resuming ? (entries[0], false) : (null, true);
