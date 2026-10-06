@@ -15,7 +15,8 @@ public sealed record CatLaunchRequest
     bool    Dalamud,
     string? CardFingerprint,
     string? Variant,
-    int     CrashDialogTimeoutSeconds = CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS
+    int     CrashDialogTimeoutSeconds = CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS,
+    string? AreaName                  = null
 )
 {
     /// <summary>是否要挂 Minion</summary>
@@ -214,7 +215,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 parameters.Dalamud,
                 parameters.Minion?.CardFingerprint,
                 parameters.Minion?.Variant,
-                parameters.CrashDialogTimeoutSeconds ?? CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS
+                parameters.CrashDialogTimeoutSeconds ?? CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS,
+                string.IsNullOrWhiteSpace(parameters.AreaName) ? null : parameters.AreaName.Trim()
             );
             request = accepted;
         }

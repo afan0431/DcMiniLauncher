@@ -182,8 +182,8 @@ public sealed record CatHelloResult(string ProtocolVersion, string LauncherVersi
 /// <summary>launch 里的 Minion 参数</summary>
 public sealed record CatMinionParams(string? CardFingerprint, string? Variant);
 
-/// <summary>launch 参数</summary>
-public sealed record CatLaunchParams(string? OperationId, string? AccountName, bool Dalamud, CatMinionParams? Minion, int? CrashDialogTimeoutSeconds = null);
+/// <summary>launch 参数; areaName = 资料里的大区名（如 豆豆柴）, 账号库没记这个号的大区时用它</summary>
+public sealed record CatLaunchParams(string? OperationId, string? AccountName, bool Dalamud, CatMinionParams? Minion, int? CrashDialogTimeoutSeconds = null, string? AreaName = null);
 
 /// <summary>inject 参数; force = 已挂着也重新挂 Minion</summary>
 public sealed record CatInjectParams(bool? Dalamud, bool? Minion, bool? Force = null);

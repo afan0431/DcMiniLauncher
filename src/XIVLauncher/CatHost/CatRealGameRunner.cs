@@ -258,7 +258,22 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             reporter.Log("warning", "这个号开着「定期自动更换设备」: 无界面启动不会换设备, 但界面版到期会换, 换了就要客户重新验证; 请在 DcMiniLauncher 账号设备设置里关掉");
 
         var areas = await LoadAreasAsync(cancellationToken).ConfigureAwait(false);
-        var area  = areas.FirstOrDefault(x => string.Equals(x.AreaName, account.AreaName, StringComparison.Ordinal)) ?? areas[0];
+        var area  = ResolveArea(areas, account.AreaName, request.AreaName, x => x.AreaName, out var fromRequest);
+
+        if (area == null && request.AreaName != null)
+            throw new CatLaunchException(CatCodes.LAUNCH_FAILED, $"资料里的大区「{request.AreaName}」不在盛趣的大区列表里, 请核对任务资料");
+
+        if (area == null)
+        {
+            area = areas[0];
+            reporter.Log("warning", $"账号库和上号请求都没有这个号的大区, 按列表第一个「{area.AreaName}」启动");
+        }
+        else if (fromRequest)
+        {
+            // 账号库没记这个号的大区: 用资料里的并记下来, 之后界面版和跨区同步都以它为起点
+            account.AreaName = area.AreaName;
+            accountManager.Save(account);
+        }
 
         dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel);
 
@@ -641,6 +656,28 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         if (string.IsNullOrEmpty(oauthLogin.SndaID))
             throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "登录异常: SNDAID 为空");
+    }
+
+    /// <summary>
+    ///     选启动大区: 账号库记的优先（超域旅行后角色在别的大区, 靠它记住）, 没记或对不上时用上号请求带的; 都对不上返回 null
+    /// </summary>
+    internal static T? ResolveArea<T>(IReadOnlyList<T> areas, string? savedAreaName, string? requestedAreaName, Func<T, string?> nameOf, out bool fromRequest)
+        where T : class
+    {
+        fromRequest = false;
+
+        if (!string.IsNullOrEmpty(savedAreaName) &&
+            areas.FirstOrDefault(x => string.Equals(nameOf(x), savedAreaName, StringComparison.Ordinal)) is { } saved)
+            return saved;
+
+        if (!string.IsNullOrEmpty(requestedAreaName) &&
+            areas.FirstOrDefault(x => string.Equals(nameOf(x), requestedAreaName, StringComparison.Ordinal)) is { } requested)
+        {
+            fromRequest = true;
+            return requested;
+        }
+
+        return null;
     }
 
     private void SyncAreaFromDcTravel(string areaName)

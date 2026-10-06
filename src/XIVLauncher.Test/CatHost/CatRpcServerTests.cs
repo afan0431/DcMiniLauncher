@@ -109,7 +109,7 @@ public sealed class CatRpcServerTests : IDisposable
         var first = await client.RequestAsync
         (
             "launch",
-            new { operationId = "op1", accountName = "acc", dalamud = true, minion = new { cardFingerprint = "0123456789abcdef", variant = "global" } }
+            new { operationId = "op1", accountName = "acc", dalamud = true, minion = new { cardFingerprint = "0123456789abcdef", variant = "global" }, areaName = " 豆豆柴 " }
         );
         var second = await client.RequestAsync("launch", new { operationId = "op2", accountName = "acc", dalamud = false });
 
@@ -118,7 +118,23 @@ public sealed class CatRpcServerTests : IDisposable
         Assert.Equal("alreadyLaunched", second["result"]!["code"]!.GetValue<string>());
 
         await runner.Started.Task.WaitAsync(Timeout);
-        Assert.Equal(new CatLaunchRequest("op1", "acc", true, "0123456789abcdef", "global"), runner.Request);
+        Assert.Equal(new CatLaunchRequest("op1", "acc", true, "0123456789abcdef", "global", AreaName: "豆豆柴"), runner.Request);
+    }
+
+    [Theory]
+    [InlineData("猫小胖", "豆豆柴", "猫小胖", false)] // 账号库记的优先: 超域旅行后角色在别的大区
+    [InlineData(null, "豆豆柴", "豆豆柴", true)]     // 账号库没记: 用资料里的
+    [InlineData("不存在", "豆豆柴", "豆豆柴", true)] // 账号库记的对不上: 用资料里的
+    [InlineData(null, "不存在", null, false)]        // 资料里的对不上: 不悄悄取第一个
+    [InlineData(null, null, null, false)]
+    public void ResolveArea_PrefersSavedThenRequested(string? saved, string? requested, string? expected, bool expectedFromRequest)
+    {
+        string[] areas = ["陆行鸟", "莫古力", "猫小胖", "豆豆柴"];
+
+        var area = CatRealGameRunner.ResolveArea(areas, saved, requested, x => x, out var fromRequest);
+
+        Assert.Equal(expected, area);
+        Assert.Equal(expectedFromRequest, fromRequest);
     }
 
     [Fact]
