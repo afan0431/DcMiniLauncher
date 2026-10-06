@@ -46,6 +46,9 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
     public partial string WeGamePath { get; set; } = string.Empty;
 
     [ObservableProperty]
+    public partial string InternationalGamePath { get; set; } = string.Empty;
+
+    [ObservableProperty]
     public partial bool AskBeforePatching { get; set; }
 
     [ObservableProperty]
@@ -321,6 +324,7 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
         GamePath   = App.Settings.GamePath?.FullName ?? string.Empty;
         PatchPath  = patchPath.FullName;
         WeGamePath = App.Settings.WeGamePath?.FullName ?? string.Empty;
+        InternationalGamePath = App.Settings.InternationalGamePath?.FullName ?? string.Empty;
 
         AskBeforePatching                           = App.Settings.AskBeforePatchInstall;
         ExitLauncherAfterGameExit                   = App.Settings.ExitLauncherWhenGameExit;
@@ -377,6 +381,32 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
             return false;
         }
 
+        var internationalGamePath = InternationalGamePath.Trim();
+
+        if (internationalGamePath.Length > 0)
+        {
+            var internationalError =
+                string.Equals(internationalGamePath, GamePath, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(internationalGamePath, WeGamePath, StringComparison.OrdinalIgnoreCase)
+                    ? "国际服游戏目录不能与国服游戏目录相同，请重新选择。"
+                    : string.Equals(internationalGamePath, PatchPath, StringComparison.OrdinalIgnoreCase)
+                        ? "国际服游戏目录和补丁目录不能相同，请重新选择。"
+                        : Common.Game.International.InternationalGamePath.Describe
+                            (Common.Game.International.InternationalGamePath.Check(internationalGamePath));
+
+            if (internationalError != null)
+            {
+                _dialogService.ShowMessage
+                (
+                    internationalError,
+                    "XIVLauncher 错误",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error
+                );
+                return false;
+            }
+        }
+
         var gamePath = !string.IsNullOrWhiteSpace(GamePath) ?
                            new DirectoryInfo(GamePath) :
                            null;
@@ -427,6 +457,9 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
                 settings.WeGamePath = string.IsNullOrWhiteSpace(WeGamePath) ?
                                           null :
                                           new DirectoryInfo(WeGamePath);
+                settings.InternationalGamePath = internationalGamePath.Length == 0 ?
+                                                     null :
+                                                     new DirectoryInfo(internationalGamePath);
                 settings.CredType = credTypeApplyResult.AppliedCredType;
 
                 var minionInstallPath = MinionInstallPath.Trim();

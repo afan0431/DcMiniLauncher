@@ -49,6 +49,26 @@ public sealed class LauncherSettingsV3 : IAccountSettingsStore
     }
 
     /// <summary>
+    ///     国际服（Square Enix, Windows 版）游戏安装路径: 含 boot 和 game 两个文件夹的那一层。
+    ///     只给无界面启动用; 没设置时国际服上号报「游戏目录无效」, 不影响国服。
+    /// </summary>
+    public DirectoryInfo? InternationalGamePath
+    {
+        get;
+        set => Set(ref field, value);
+    }
+
+    /// <summary>
+    ///     国际服客户端语言（0 日 / 1 英 / 2 德 / 3 法）, 缺省英语。界面上暂时没有入口, 要改就改配置文件里的这一项。
+    ///     配置文件里是别的数字时按英语。
+    /// </summary>
+    public ClientLanguage InternationalLanguage
+    {
+        get => Enum.IsDefined(field) ? field : ClientLanguage.English;
+        set => Set(ref field, Enum.IsDefined(value) ? value : ClientLanguage.English);
+    } = ClientLanguage.English;
+
+    /// <summary>
     ///     补丁文件存储路径
     /// </summary>
     public DirectoryInfo PatchPath
