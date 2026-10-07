@@ -194,6 +194,12 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     /// <summary>点了设备验证的「确定」之后, 窗口过多久还在就算没通过</summary>
     public TimeSpan SmsConfirmWait { get; init; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>还没切到扫码页时每隔多久看一轮（比平时勤, 好让窗口一出现就开始切）</summary>
+    public TimeSpan SwitchInterval { get; init; } = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>点击后每隔多久看一次有没有二维码</summary>
+    public TimeSpan ClickPoll { get; init; } = TimeSpan.FromMilliseconds(300);
+
     /// <summary>报给工作台的二维码有效期（WeGame 没有给出确切时间; 二维码刷新后会作为新的验证再报）</summary>
     public int QrExpiresInSeconds { get; init; } = 120;
 
@@ -216,7 +222,8 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
                     Log.Warning("[CatHost] 看 WeGame 窗口时出错: {Type}: {Message}", ex.GetType().Name, redactor.Redact(ex.Message));
                 }
 
-                await Task.Delay(Interval, cancellationToken).ConfigureAwait(false);
+                // 还在等登录窗口出现、还没切到扫码页时看得勤一些, 切好之后按正常间隔看
+                await Task.Delay(switchState == SwitchState.Pending ? SwitchInterval : Interval, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -344,16 +351,21 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
         if (!screen.ClickLoginWindow(x, y))
             return null;
 
-        await Task.Delay(ClickSettle, cancellationToken).ConfigureAwait(false);
+        // 二维码要联网取, 可能过一会儿才画出来: 最多等两个 ClickSettle, 期间一看到二维码就返回;
+        // 等够了仍没有才算这一页没有二维码, 免得把刚切好的扫码页又点走
+        var polls = Math.Max(1, (int)Math.Ceiling(ClickSettle.TotalMilliseconds * 2 / Math.Max(1, ClickPoll.TotalMilliseconds)));
+        CatWeGameLoginWindow? after = null;
 
-        var after = screen.CaptureLoginWindow();
+        for (var i = 0; i < polls; i++)
+        {
+            await Task.Delay(ClickPoll, cancellationToken).ConfigureAwait(false);
+            after = screen.CaptureLoginWindow();
 
-        // 二维码要联网取, 可能还没画出来: 再等一次, 免得把刚切好的扫码页又点走
-        if (after == null || HasQr(after))
-            return after;
+            if (after == null || HasQr(after))
+                return after;
+        }
 
-        await Task.Delay(ClickSettle, cancellationToken).ConfigureAwait(false);
-        return screen.CaptureLoginWindow();
+        return after;
     }
 
     private static bool HasQr(CatWeGameLoginWindow? window) =>
