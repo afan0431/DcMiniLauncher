@@ -83,9 +83,10 @@ public sealed record CatWeGameChallenge
 public sealed record CatWeGameConfirmSmsParams(string? ChallengeId);
 
 /// <summary>
-///     WeGame 登录窗口的一次截取: 宽高是窗口客户区的实际大小; 窗口上有二维码时带二维码内容和一张可以直接给客户扫的 PNG
+///     WeGame 登录窗口的一次截取: 宽高是窗口客户区的实际大小; 窗口上有二维码时带二维码内容和一张可以直接给客户扫的 PNG;
+///     PanelHash 是登录栏那一块画面的摘要（0 = 没算）, 用来看点击之后画面变没变
 /// </summary>
-public sealed record CatWeGameLoginWindow(int Width, int Height, string? QrLink = null, byte[]? QrPng = null);
+public sealed record CatWeGameLoginWindow(int Width, int Height, string? QrLink = null, byte[]? QrPng = null, long PanelHash = 0);
 
 /// <summary>
 ///     设备验证窗口的内容: 要发的短信内容、发到哪个号码、窗口原文
@@ -178,6 +179,7 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     private SwitchState switchState = scan == null ? SwitchState.Off : SwitchState.Pending;
     private int         switchRounds;
     private long        switchDoneAt;
+    private long        switchStartedAt;
     private int         resettles;
     private int         windowSeen;
 
@@ -210,6 +212,9 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
     /// <summary>切好扫码页后多久之内二维码没了算"窗口自己换了页", 要再切一次</summary>
     public TimeSpan ResettleWindow { get; init; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>登录窗口点了没反应时, 从第一轮算起最多这样重来多久; 过后照常计轮数</summary>
+    public TimeSpan SwitchPatience { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>点击后每隔多久看一次有没有二维码</summary>
     public TimeSpan ClickPoll { get; init; } = TimeSpan.FromMilliseconds(300);
@@ -293,6 +298,9 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
         }
 
         Log.Information("[CatHost] 开始切{Scan}扫码页（第 {Round} 轮）", scan == CatWeGameScan.WeChat ? "微信" : " QQ ", switchRounds + 1);
+
+        if (switchStartedAt == 0)
+            switchStartedAt = Environment.TickCount64;
 
         await SwitchRoundAsync(window, cancellationToken).ConfigureAwait(false);
     }
@@ -385,6 +393,15 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
             return;
         }
 
+        // WeGame 刚启动时窗口已经在了却还不接收点击: 这一轮点完画面一点没变就不算数, 马上再来;
+        // 但总共只这样等 SwitchPatience 这么久, 之后照常计轮数
+        if (window.PanelHash != 0 && after.PanelHash == window.PanelHash
+            && Environment.TickCount64 - switchStartedAt <= (long)SwitchPatience.TotalMilliseconds)
+        {
+            Log.Information("[CatHost] 点了之后登录窗口没有变化, 多半还没启动完, 再来一轮");
+            return;
+        }
+
         if (++switchRounds < MAX_SWITCH_ROUNDS)
             return;
 
@@ -414,6 +431,10 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
             after = CaptureWanted();
 
             if (after == null || HasQr(after))
+                return after;
+
+            // 看了三次画面还和点之前一模一样: 这一下没点动, 不用等二维码了
+            if (!brief && i >= 2 && window.PanelHash != 0 && after.PanelHash == window.PanelHash)
                 return after;
         }
 

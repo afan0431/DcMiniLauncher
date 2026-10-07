@@ -186,6 +186,26 @@ public sealed class CatWeGameChallengeWatcherTests
     }
 
     [Fact]
+    public async Task WindowThatIgnoresClicks_IsRetriedWithoutCountingRounds_UntilItResponds()
+    {
+        // WeGame 刚启动: 窗口在了但点了画面不变。不计轮数、不报切换失败; 等它开始响应后照常切好
+        var frozen = new CatWeGameLoginWindow(1210, 680, PanelHash: 7);
+        screen.Window  = frozen;
+        screen.OnClick = (_, _) => frozen;
+        var watcher = Create(CatWeGameScan.Qq);
+
+        await TickAsync(watcher, 8);
+
+        Assert.Empty(reporter.Entries);
+        Assert.True(screen.Clicks.Count > 9, "超过三轮仍在重试");
+
+        screen.OnClick = (x, y) => (x, y) == (208, 630) ? Qr(QQ_LINK) : new CatWeGameLoginWindow(1210, 680, PanelHash: 8);
+        await TickAsync(watcher, 1);
+
+        Assert.Equal(["challenge:qrcode:q-1"], reporter.Entries);
+    }
+
+    [Fact]
     public async Task Qq_QrGoneLongAfterTheSwitch_IsLeftAlone()
     {
         // 隔得久了二维码才没（员工自己换了登录方式）: 不再点

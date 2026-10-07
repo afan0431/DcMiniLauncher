@@ -126,10 +126,18 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         if (window == IntPtr.Zero || IsIconic(window) || !GetClientRect(window, out var client) || client.Right <= 0 || client.Bottom <= 0)
             return null;
 
-        var link = TryCapture(window, out var pixels, out var width, out var height) ? DecodeWithRetry(pixels, width, height) : null;
+        string? link = null;
+        long    hash = 0;
+
+        if (TryCapture(window, out var pixels, out var width, out var height))
+        {
+            var panel = CropLoginPanel(pixels, width, height, out var panelWidth, out var panelHeight);
+            hash = HashPanel(panel);
+            link = DecodePanel(panel, panelWidth, panelHeight);
+        }
 
         if (link == null)
-            return new CatWeGameLoginWindow(client.Right, client.Bottom);
+            return new CatWeGameLoginWindow(client.Right, client.Bottom, PanelHash: hash);
 
         // 同一个二维码不重复画
         if (!string.Equals(link, lastLink, StringComparison.Ordinal) || lastPng == null)
@@ -138,7 +146,7 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
             lastLink = link;
         }
 
-        return new CatWeGameLoginWindow(client.Right, client.Bottom, link, lastPng);
+        return new CatWeGameLoginWindow(client.Right, client.Bottom, link, lastPng, hash);
     }
 
     /// <inheritdoc />
@@ -196,11 +204,23 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
     ///     只识别左侧登录栏的下半截（二维码只会出现在那里, 约占整窗的六分之一）; 识别不出时放大一倍再试一次
     ///     （二维码只有一百多像素宽）。每一轮、每次点击后都要识别, 对整窗做会让切换明显变慢
     /// </summary>
-    private string? DecodeWithRetry(byte[] pixels, int width, int height)
-    {
-        var panel = CropLoginPanel(pixels, width, height, out var panelWidth, out var panelHeight);
+    private string? DecodePanel(byte[] panel, int panelWidth, int panelHeight) =>
+        codec.Decode(panel, panelWidth, panelHeight) ?? codec.Decode(Upscale(panel, panelWidth, panelHeight, 2), panelWidth * 2, panelHeight * 2);
 
-        return codec.Decode(panel, panelWidth, panelHeight) ?? codec.Decode(Upscale(panel, panelWidth, panelHeight, 2), panelWidth * 2, panelHeight * 2);
+    /// <summary>
+    ///     登录栏那一块画面的摘要（FNV-1a, 不为 0）: 两次截取相同就是画面没变
+    /// </summary>
+    internal static long HashPanel(byte[] panel)
+    {
+        var hash = 14695981039346656037UL;
+
+        foreach (var value in panel)
+        {
+            hash ^= value;
+            hash *= 1099511628211UL;
+        }
+
+        return hash == 0 ? 1 : unchecked((long)hash);
     }
 
     /// <summary>
