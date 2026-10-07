@@ -952,8 +952,15 @@ public sealed class CatAutoEnter
     private void ReportEntered(CatModuleReplies.WhoAmI who)
     {
         var known       = knownEntries.FirstOrDefault(x => x.ContentId == who.ContentId);
-        var currentCode = FirstNonEmpty(who.WorldCode, worldCodes.GetValueOrDefault(who.WorldId), known?.CurrentWorldCode);
-        var homeCode    = FirstNonEmpty(who.HomeWorldCode, worldCodes.GetValueOrDefault(who.HomeWorldId), known?.HomeWorldCode);
+        // 世界以 Id 为准, 名字从选角列表记下的对照里取。模块在游戏内读到的两个世界名不能直接用:
+        // 实机（2026-10-07, 超域中的角色）home=1201 而 homeName 读出来是当前所在的服务器, 和 worldName 一样。
+        var currentCode = FirstNonEmpty(worldCodes.GetValueOrDefault(who.WorldId), known?.CurrentWorldCode, who.WorldCode);
+        var homeCode    = FirstNonEmpty
+        (
+            worldCodes.GetValueOrDefault(who.HomeWorldId),
+            known?.HomeWorldCode,
+            who.HomeWorldId == who.WorldId ? currentCode : null
+        );
 
         lock (stateLock)
             enteredContentId = who.ContentId;

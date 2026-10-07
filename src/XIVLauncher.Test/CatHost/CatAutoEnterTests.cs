@@ -1068,7 +1068,7 @@ public sealed class CatAutoEnterTests
 
                     return Where == "ingame" && current != null
                                ? $"OK loaded=1 name={current.Name} cid={current.ContentId} world={current.CurrentWorldId} home={current.HomeWorldId} " +
-                                 $"worldName={current.CurrentWorldCode} homeName={current.HomeWorldCode} loggedIn=1 inZone=1"
+                                 $"worldName={current.CurrentWorldCode} homeName={current.CurrentWorldCode} loggedIn=1 inZone=1"
                                : "OK loaded=0 name= cid= world= home= worldName= homeName= loggedIn=0 inZone=0";
             }
 
