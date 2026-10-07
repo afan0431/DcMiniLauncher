@@ -84,9 +84,34 @@ public sealed record CatWeGameConfirmSmsParams(string? ChallengeId);
 
 /// <summary>
 ///     WeGame 登录窗口的一次截取: 宽高是窗口客户区的实际大小; 窗口上有二维码时带二维码内容和一张可以直接给客户扫的 PNG;
-///     PanelHash 是登录栏那一块画面的摘要（0 = 没算）, 用来看点击之后画面变没变
+///     PanelThumb 是登录栏那一块画面缩成的小图（每格一个亮度, null = 没算）, 用来看画面稳没稳、点击之后变没变;
+///     TabsVisible = QQ / 微信两个页签画出来了没有（WeGame 刚启动的头两三秒窗口在但里面还是空的）
 /// </summary>
-public sealed record CatWeGameLoginWindow(int Width, int Height, string? QrLink = null, byte[]? QrPng = null, long PanelHash = 0);
+public sealed record CatWeGameLoginWindow(int Width, int Height, string? QrLink = null, byte[]? QrPng = null, byte[]? PanelThumb = null, bool TabsVisible = true)
+{
+    /// <summary>两格亮度差在这以内算一样（登录栏是半透明的, 后面的动态背景会让画面有很轻微的浮动）</summary>
+    public const int THUMB_TOLERANCE = 10;
+
+    /// <summary>
+    ///     两次截取的登录栏画面是不是一样; 有一边没算小图时返回 null（分不清）
+    /// </summary>
+    public static bool? SamePanel(CatWeGameLoginWindow? left, CatWeGameLoginWindow? right)
+    {
+        if (left?.PanelThumb is not { } a || right?.PanelThumb is not { } b)
+            return null;
+
+        if (a.Length != b.Length)
+            return false;
+
+        for (var i = 0; i < a.Length; i++)
+        {
+            if (Math.Abs(a[i] - b[i]) > THUMB_TOLERANCE)
+                return false;
+        }
+
+        return true;
+    }
+}
 
 /// <summary>
 ///     设备验证窗口的内容: 要发的短信内容、发到哪个号码、窗口原文
@@ -180,6 +205,7 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     private int         switchRounds;
     private long        switchDoneAt;
     private long        switchStartedAt;
+    private CatWeGameLoginWindow? pendingWindow;
     private int         resettles;
     private int         windowSeen;
 
@@ -212,6 +238,11 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
     /// <summary>切好扫码页后多久之内二维码没了算"窗口自己换了页", 要再切一次</summary>
     public TimeSpan ResettleWindow { get; init; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    ///     页签出来后连着几轮画面一样才开始点。启动时上次那一页会闪过约半秒, 按每轮半秒看, 要三轮才不会把它当成稳了
+    /// </summary>
+    public int SettleTicks { get; init; } = 3;
 
     /// <summary>登录窗口点了没反应时, 从第一轮算起最多这样重来多久; 过后照常计轮数</summary>
     public TimeSpan SwitchPatience { get; init; } = TimeSpan.FromSeconds(30);
@@ -290,10 +321,28 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
             return;
         }
 
-        // 窗口刚出现时可能还没画完, 连着两轮都在才开始点
-        if (++windowSeen < 2)
+        // WeGame 刚启动的头几秒: 窗口在但里面是空的, 接着页签出来、内容还要再跳一两次（会先闪一下上次那一页）。
+        // 这时点了不起作用。等页签画出来、且连着两轮画面一样了才开始点
+        var settled = window.TabsVisible && CatWeGameLoginWindow.SamePanel(pendingWindow, window) != false;
+        pendingWindow = window;
+
+        if (!window.TabsVisible)
         {
-            Log.Information("[CatHost] WeGame 登录窗口出现了");
+            windowSeen = 0;
+            return;
+        }
+
+        if (!settled)
+        {
+            windowSeen = 1;
+            return;
+        }
+
+        if (++windowSeen < SettleTicks)
+        {
+            if (windowSeen == 1)
+                Log.Information("[CatHost] WeGame 登录窗口的页签出来了, 等画面稳下来");
+
             return;
         }
 
@@ -395,7 +444,7 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
         // WeGame 刚启动时窗口已经在了却还不接收点击: 这一轮点完画面一点没变就不算数, 马上再来;
         // 但总共只这样等 SwitchPatience 这么久, 之后照常计轮数
-        if (window.PanelHash != 0 && after.PanelHash == window.PanelHash
+        if (CatWeGameLoginWindow.SamePanel(window, after) == true
             && Environment.TickCount64 - switchStartedAt <= (long)SwitchPatience.TotalMilliseconds)
         {
             Log.Information("[CatHost] 点了之后登录窗口没有变化, 多半还没启动完, 再来一轮");
@@ -434,7 +483,7 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
                 return after;
 
             // 看了三次画面还和点之前一模一样: 这一下没点动, 不用等二维码了
-            if (!brief && i >= 2 && window.PanelHash != 0 && after.PanelHash == window.PanelHash)
+            if (!brief && i >= 2 && CatWeGameLoginWindow.SamePanel(window, after) == true)
                 return after;
         }
 

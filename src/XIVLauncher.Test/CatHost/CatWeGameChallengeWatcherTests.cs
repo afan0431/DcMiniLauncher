@@ -189,7 +189,7 @@ public sealed class CatWeGameChallengeWatcherTests
     public async Task WindowThatIgnoresClicks_IsRetriedWithoutCountingRounds_UntilItResponds()
     {
         // WeGame 刚启动: 窗口在了但点了画面不变。不计轮数、不报切换失败; 等它开始响应后照常切好
-        var frozen = new CatWeGameLoginWindow(1210, 680, PanelHash: 7);
+        var frozen = new CatWeGameLoginWindow(1210, 680, PanelThumb: [10, 10, 200, 10]);
         screen.Window  = frozen;
         screen.OnClick = (_, _) => frozen;
         var watcher = Create(CatWeGameScan.Qq);
@@ -199,7 +199,7 @@ public sealed class CatWeGameChallengeWatcherTests
         Assert.Empty(reporter.Entries);
         Assert.True(screen.Clicks.Count > 9, "超过三轮仍在重试");
 
-        screen.OnClick = (x, y) => (x, y) == (208, 630) ? Qr(QQ_LINK) : new CatWeGameLoginWindow(1210, 680, PanelHash: 8);
+        screen.OnClick = (x, y) => (x, y) == (208, 630) ? Qr(QQ_LINK) : new CatWeGameLoginWindow(1210, 680, PanelThumb: [10, 200, 10, 10]);
         await TickAsync(watcher, 1);
 
         Assert.Equal(["challenge:qrcode:q-1"], reporter.Entries);
@@ -211,7 +211,7 @@ public sealed class CatWeGameChallengeWatcherTests
         // 隔得久了二维码才没（员工自己换了登录方式）: 不再点
         screen.Window  = Page();
         screen.OnClick = (x, y) => (x, y) == (208, 630) ? Qr(QQ_LINK) : Page();
-        var watcher = new CatWeGameChallengeWatcher(screen, reporter, redactor, CatWeGameScan.Qq) { ClickSettle = TimeSpan.Zero, ResettleWindow = TimeSpan.FromMilliseconds(-1) };
+        var watcher = new CatWeGameChallengeWatcher(screen, reporter, redactor, CatWeGameScan.Qq) { ClickSettle = TimeSpan.Zero, SettleTicks = 2, ResettleWindow = TimeSpan.FromMilliseconds(-1) };
 
         await TickAsync(watcher, 2);
         Assert.Equal(3, screen.Clicks.Count);
@@ -755,7 +755,7 @@ public sealed class CatWeGameChallengeWatcherTests
     #endregion
 
     private CatWeGameChallengeWatcher Create(CatWeGameScan? scan) =>
-        new(screen, reporter, redactor, scan) { ClickSettle = TimeSpan.Zero };
+        new(screen, reporter, redactor, scan) { ClickSettle = TimeSpan.Zero, SettleTicks = 2 };
 
     private CatWeGameLoginCapture CreateCapture(ICatWeGameLoginEnvironment environment) =>
         new(environment, new EmptyStore(), redactor) { Screen = screen, WatchInterval = TimeSpan.FromMilliseconds(10) };

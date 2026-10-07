@@ -126,18 +126,20 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         if (window == IntPtr.Zero || IsIconic(window) || !GetClientRect(window, out var client) || client.Right <= 0 || client.Bottom <= 0)
             return null;
 
-        string? link = null;
-        long    hash = 0;
+        string? link  = null;
+        byte[]? thumb = null;
+        var     tabs  = true;
 
         if (TryCapture(window, out var pixels, out var width, out var height))
         {
             var panel = CropLoginPanel(pixels, width, height, out var panelWidth, out var panelHeight);
-            hash = HashPanel(panel);
-            link = DecodePanel(panel, panelWidth, panelHeight);
+            thumb = ThumbOf(panel, panelWidth, panelHeight);
+            tabs  = TabsVisible(panel, panelWidth, panelHeight);
+            link  = DecodePanel(panel, panelWidth, panelHeight);
         }
 
         if (link == null)
-            return new CatWeGameLoginWindow(client.Right, client.Bottom, PanelHash: hash);
+            return new CatWeGameLoginWindow(client.Right, client.Bottom, PanelThumb: thumb, TabsVisible: tabs);
 
         // 同一个二维码不重复画
         if (!string.Equals(link, lastLink, StringComparison.Ordinal) || lastPng == null)
@@ -146,7 +148,7 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
             lastLink = link;
         }
 
-        return new CatWeGameLoginWindow(client.Right, client.Bottom, link, lastPng, hash);
+        return new CatWeGameLoginWindow(client.Right, client.Bottom, link, lastPng, thumb, tabs);
     }
 
     /// <inheritdoc />
@@ -207,20 +209,68 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
     private string? DecodePanel(byte[] panel, int panelWidth, int panelHeight) =>
         codec.Decode(panel, panelWidth, panelHeight) ?? codec.Decode(Upscale(panel, panelWidth, panelHeight, 2), panelWidth * 2, panelHeight * 2);
 
-    /// <summary>
-    ///     登录栏那一块画面的摘要（FNV-1a, 不为 0）: 两次截取相同就是画面没变
-    /// </summary>
-    internal static long HashPanel(byte[] panel)
-    {
-        var hash = 14695981039346656037UL;
+    /// <summary>缩成小图时每格的边长（像素）</summary>
+    private const int THUMB_CELL = 10;
 
-        foreach (var value in panel)
+    /// <summary>
+    ///     把登录栏那一块缩成小图: 每 10×10 像素一格, 存这一格的平均亮度。比较两张小图就知道画面变没变,
+    ///     又不会被半透明登录栏后面动态背景的轻微浮动干扰
+    /// </summary>
+    internal static byte[] ThumbOf(byte[] panel, int panelWidth, int panelHeight)
+    {
+        var columns = Math.Max(1, panelWidth / THUMB_CELL);
+        var rows    = Math.Max(1, panelHeight / THUMB_CELL);
+        var thumb   = new byte[columns * rows];
+
+        for (var row = 0; row < rows; row++)
         {
-            hash ^= value;
-            hash *= 1099511628211UL;
+            for (var column = 0; column < columns; column++)
+            {
+                var sum   = 0;
+                var count = 0;
+
+                for (var y = row * THUMB_CELL; y < Math.Min(panelHeight, (row + 1) * THUMB_CELL); y++)
+                {
+                    var offset = (y * panelWidth + column * THUMB_CELL) * 4;
+
+                    for (var x = 0; x < THUMB_CELL && column * THUMB_CELL + x < panelWidth; x++, offset += 4)
+                    {
+                        sum += (panel[offset] + panel[offset + 1] * 2 + panel[offset + 2]) / 4;
+                        count++;
+                    }
+                }
+
+                thumb[row * columns + column] = (byte)(count == 0 ? 0 : sum / count);
+            }
         }
 
-        return hash == 0 ? 1 : unchecked((long)hash);
+        return thumb;
+    }
+
+    /// <summary>
+    ///     QQ / 微信两个页签画出来了没有: 页签在登录栏最上面那一条（按 1210×680 量是横向 98–202、纵向 264–290,
+    ///     裁出的登录栏从纵向 230 起算）, 画出来后里面有浅色的图标; 还没画出来时这一条是一片暗色
+    /// </summary>
+    internal static bool TabsVisible(byte[] panel, int panelWidth, int panelHeight)
+    {
+        var left   = panelWidth * 98 / 300;
+        var right  = Math.Min(panelWidth, panelWidth * 202 / 300);
+        var top    = panelHeight * 34 / 450;
+        var bottom = Math.Min(panelHeight, panelHeight * 60 / 450);
+        var bright = 0;
+
+        for (var y = top; y < bottom; y++)
+        {
+            var offset = (y * panelWidth + left) * 4;
+
+            for (var x = left; x < right; x++, offset += 4)
+            {
+                if ((panel[offset] + panel[offset + 1] * 2 + panel[offset + 2]) / 4 > 110)
+                    bright++;
+            }
+        }
+
+        return bright >= Math.Max(12, (right - left) * (bottom - top) / 60);
     }
 
     /// <summary>
