@@ -156,6 +156,22 @@ public sealed class CatAutoEnterTests
     }
 
     [Fact]
+    public async Task TargetNotInThisLobby_GoesToItsHomeAreaInsteadOfAsking()
+    {
+        // 账号库记的大区是上次超域留下的: 这个大厅里只有一个做客的角色, 要找的角色在它的原始大区
+        var (game, reporter) = Setup(Chara("11", "访客", "BaiYinXiang", "LaNuoXiYa", 16));
+        game.Characters[AREA_THIRD] = [Chara("12", "小紫", "ZiShuiZhanQiao")];
+
+        var flow    = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小紫", "ZiShuiZhanQiao"));
+        var outcome = await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.Equal([AREA_THIRD], game.Switched);
+        Assert.Equal("12", flow.EnteredContentId);
+        Assert.DoesNotContain(reporter.Entries, x => x.StartsWith("characters:choose", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task TargetTravellingInAnotherArea_SwitchesLobbyOnce_ThenEnters()
     {
         var travelling = Chara("11", "小白", "LaNuoXiYa", "BaiYinXiang", 16);

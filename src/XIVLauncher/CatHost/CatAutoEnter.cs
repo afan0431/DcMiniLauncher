@@ -396,6 +396,18 @@ public sealed class CatAutoEnter
             if (followedTarget && (entry == null || entry.ContentId != wanted.ContentId))
                 throw new StopException(CatAutoEnterStopCodes.SWITCH_AREA_FAILED, $"换到 {game.CurrentAreaName} 后选角列表里没有要登录的角色");
 
+            // 给了名字、这个大厅的列表里却没有它: 先去它原始服务器所在的大区找（账号库记的大区可能是上次超域留下的）。
+            // 原始大区的列表里一定有它 —— 超域出去了也在, 只是带「超域中」的标记, 后面会再跟过去。
+            if (needsChoice && !followedTarget && HomeAreaOfMissing(entries, wanted) is { } homeArea && visitedAreas.Add(homeArea))
+            {
+                Log.Information("[CatAutoEnter] {Area} 的选角列表里没有 {Name}, 去它的原始大区 {Home} 找", game.CurrentAreaName, wanted.Name, homeArea);
+
+                if (!await SwitchAreaAsync(homeArea, cancellationToken).ConfigureAwait(false))
+                    break;
+
+                continue;
+            }
+
             if (!needsChoice)
                 reporter.Characters(false, entries.Select(ToInfo).ToArray());
             else
@@ -1014,6 +1026,24 @@ public sealed class CatAutoEnter
                     );
 
         return string.Equals(world.AreaName, game.CurrentAreaName, StringComparison.Ordinal) ? null : world.AreaName;
+    }
+
+    /// <summary>
+    ///     要找的角色（给了名字和原始服务器）不在这份列表里时, 返回它原始服务器所在的大区; 列表里有同名的、没给全、或查不到大区时返回 null
+    /// </summary>
+    private string? HomeAreaOfMissing(IReadOnlyList<CharaSelectReader.Entry> entries, CatAutoEnterTarget wanted)
+    {
+        if (string.IsNullOrWhiteSpace(wanted.Name) || string.IsNullOrWhiteSpace(wanted.HomeWorld))
+            return null;
+
+        var name = wanted.Name.Trim();
+
+        if (entries.Any(x => string.Equals(x.Name, name, StringComparison.Ordinal)))
+            return null;
+
+        var home = wanted.HomeWorld.Trim();
+
+        return worlds.FirstOrDefault(x => WorldMatches(home, x.Code, x.Name))?.AreaName;
     }
 
     private void Remember(IReadOnlyList<CharaSelectReader.Entry> entries)
