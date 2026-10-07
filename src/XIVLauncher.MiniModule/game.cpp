@@ -2870,6 +2870,9 @@ bool GameResolve()
     g_getAddonByName      = ScanText(offsets::GET_ADDON_BY_NAME_SIG);
     g_getComponentButton  = ScanText(offsets::GET_COMPONENT_BUTTON_SIG);
     g_processChatBoxEntry = ScanText(offsets::PROCESS_CHATBOX_ENTRY_SIG);
+
+    if (g_processChatBoxEntry == 0)
+        g_processChatBoxEntry = ScanTextRaw(offsets::PROCESS_CHATBOX_ENTRY_HOOKED_SIG);
     g_utf8Ctor            = ScanText(offsets::UTF8_CTOR_SIG);
     g_utf8Dtor            = ScanText(offsets::UTF8_DTOR_SIG);
     g_fireCallbackInt     = ScanText(offsets::FIRE_CALLBACK_INT_SIG);

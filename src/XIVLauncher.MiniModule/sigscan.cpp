@@ -154,6 +154,24 @@ uintptr_t ScanText(const char* signature)
     return reinterpret_cast<uintptr_t>(hit);
 }
 
+// 不跟进 E8/E9 的 ScanText: 特征码以通配符开头（函数头被别人改写过）时用, 命中处就是结果
+uintptr_t ScanTextRaw(const char* signature)
+{
+    Pattern pattern;
+    if (!ParsePattern(signature, pattern))
+    {
+        LogF("[sigscan] 特征码语法错误: %s", signature);
+        return 0;
+    }
+
+    uint8_t* hit = ScanRaw(pattern);
+
+    if (hit == nullptr)
+        LogF("[sigscan] 未命中: %s", signature);
+
+    return reinterpret_cast<uintptr_t>(hit);
+}
+
 // CS 的 StaticAddress: 命中+offset 处是一条 RIP 相对寻址的 rel32
 uintptr_t ScanStaticAddress(const char* signature, int offset)
 {

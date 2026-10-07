@@ -272,6 +272,11 @@ namespace offsets
     //
     // UIModule::ProcessChatBoxEntry —— Client/UI/UIModule.cs:125
     inline constexpr const char* PROCESS_CHATBOX_ENTRY_SIG  = "48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC 20 48 8B F2 48 8B F9 45 84 C9";
+    // Dalamud 会钩这个函数: 函数头 10 个字节被改成 `jmp [abs]` + 3 个 nop（2026-10-07 实机: FF 24 25 .. 90 90 90),
+    // 模块比 Dalamud 的钩子晚注入时上面那条就不命中。备用: 前 10 字节通配, 后面的部分在 2026.09.15 的 exe 里唯一。
+    // 经函数头调用会先进 Dalamud 的钩子再到原函数, 和游戏自己调用一样。
+    inline constexpr const char* PROCESS_CHATBOX_ENTRY_HOOKED_SIG =
+        "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 57 48 83 EC 20 48 8B F2 48 8B F9 45 84 C9 74 ?? 48 81 C1 ?? ?? 00 00";
     // Utf8String::Ctor / Dtor —— Client/System/String/Utf8String.cs:104,110
     inline constexpr const char* UTF8_CTOR_SIG              = "E8 ?? ?? ?? ?? F7 C3";
     inline constexpr const char* UTF8_DTOR_SIG              = "E8 ?? ?? ?? ?? C7 44 F5";
