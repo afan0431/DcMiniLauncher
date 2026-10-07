@@ -206,6 +206,34 @@ public sealed class CatWeGameChallengeWatcherTests
     }
 
     [Fact]
+    public async Task ExpiredQr_IsRefreshedByClickingIt_AndTheNewOneIsReported()
+    {
+        screen.Window  = Qr(QQ_LINK);
+        screen.OnClick = (_, _) => Qr(QQ_LINK);
+        var watcher = Create(CatWeGameScan.Qq);
+        await TickAsync(watcher, 2);
+        var clicks = screen.Clicks.Count;
+
+        // 失效: 变暗的那张不带内容; 点正中的刷新图标后出新码, 直接作为新的一条报, 中间不撤
+        screen.Window  = new CatWeGameLoginWindow(1210, 680, QrExpired: true);
+        screen.OnClick = (x, y) => (x, y) == (150, 379) ? Qr(QQ_LINK + "2") : new CatWeGameLoginWindow(1210, 680, QrExpired: true);
+        await TickAsync(watcher, 1);
+
+        Assert.Equal((150, 379), screen.Clicks.Last());
+        Assert.Equal(clicks + 1, screen.Clicks.Count);
+        Assert.Equal(["challenge:qrcode:q-1", "challenge:qrcode:q-2"], reporter.Entries);
+    }
+
+    [Fact]
+    public async Task ExpiredQr_WithoutScanRequested_IsNeverClicked()
+    {
+        screen.Window = new CatWeGameLoginWindow(1210, 680, QrExpired: true);
+        await TickAsync(Create(null), 4);
+
+        Assert.Empty(screen.Clicks);
+    }
+
+    [Fact]
     public async Task Qq_QrGoneLongAfterTheSwitch_IsLeftAlone()
     {
         // 隔得久了二维码才没（员工自己换了登录方式）: 不再点

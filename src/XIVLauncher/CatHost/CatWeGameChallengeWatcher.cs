@@ -85,9 +85,10 @@ public sealed record CatWeGameConfirmSmsParams(string? ChallengeId);
 /// <summary>
 ///     WeGame 登录窗口的一次截取: 宽高是窗口客户区的实际大小; 窗口上有二维码时带二维码内容和一张可以直接给客户扫的 PNG;
 ///     PanelThumb 是登录栏那一块画面缩成的小图（每格一个亮度, null = 没算）, 用来看画面稳没稳、点击之后变没变;
-///     TabsVisible = QQ / 微信两个页签画出来了没有（WeGame 刚启动的头两三秒窗口在但里面还是空的）
+///     TabsVisible = QQ / 微信两个页签画出来了没有（WeGame 刚启动的头两三秒窗口在但里面还是空的）;
+///     QrExpired = 窗口上的二维码已经失效（变暗、中间一个刷新图标, 要点一下才出新的）, 这时不带二维码内容
 /// </summary>
-public sealed record CatWeGameLoginWindow(int Width, int Height, string? QrLink = null, byte[]? QrPng = null, byte[]? PanelThumb = null, bool TabsVisible = true)
+public sealed record CatWeGameLoginWindow(int Width, int Height, string? QrLink = null, byte[]? QrPng = null, byte[]? PanelThumb = null, bool TabsVisible = true, bool QrExpired = false)
 {
     /// <summary>两格亮度差在这以内算一样（登录栏是半透明的, 后面的动态背景会让画面有很轻微的浮动）</summary>
     public const int THUMB_TOLERANCE = 10;
@@ -185,6 +186,15 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     /// </summary>
     internal static readonly (int X, int Y) QqPasswordEntry = (150, 630);
 
+    /// <summary>QQ 二维码失效后中间的刷新图标（二维码的正中）</summary>
+    internal static readonly (int X, int Y) QqQrRefresh = (150, 379);
+
+    /// <summary>微信二维码的正中: 失效后刷新图标的位置</summary>
+    internal static readonly (int X, int Y) WeChatQrRefresh = (150, 390);
+
+    /// <summary>二维码失效后最多自动刷新几次（等登录总共 10 分钟, 一张约 2 分钟）</summary>
+    public const int MAX_QR_REFRESHES = 10;
+
     /// <summary>微信页停在快捷登录时的「使用其他头像、昵称或账号」</summary>
     internal static readonly (int X, int Y) WeChatOtherAccount = (150, 483);
 
@@ -206,6 +216,7 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     private long        switchDoneAt;
     private long        switchStartedAt;
     private CatWeGameLoginWindow? pendingWindow;
+    private int         qrRefreshes;
     private int         resettles;
     private int         windowSeen;
 
@@ -297,6 +308,14 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
         if (switchState != SwitchState.Pending)
         {
+            // 二维码约 2 分钟失效, 失效后要点中间的刷新图标才出新的: 要了自动切换的就替员工点, 新码作为新的一条报给客户
+            if (window is { QrExpired: true } && scan != null && qrRefreshes < MAX_QR_REFRESHES)
+            {
+                qrRefreshes++;
+                Log.Information("[CatHost] WeGame 登录窗口上的二维码失效了, 点刷新（第 {Count} 次）", qrRefreshes);
+                window = await ClickAndCaptureAsync(window, scan == CatWeGameScan.WeChat ? WeChatQrRefresh : QqQrRefresh, false, cancellationToken).ConfigureAwait(false);
+            }
+
             ObserveQr(window);
 
             // WeGame 刚启动时登录窗口会自己再跳一次页（比如跳到本机微信的快捷登录）, 把刚切好的扫码页换掉:

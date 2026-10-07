@@ -126,9 +126,10 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         if (window == IntPtr.Zero || IsIconic(window) || !GetClientRect(window, out var client) || client.Right <= 0 || client.Bottom <= 0)
             return null;
 
-        string? link  = null;
-        byte[]? thumb = null;
-        var     tabs  = true;
+        string? link    = null;
+        byte[]? thumb   = null;
+        var     tabs    = true;
+        var     expired = false;
 
         if (TryCapture(window, out var pixels, out var width, out var height))
         {
@@ -136,10 +137,17 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
             thumb = ThumbOf(panel, panelWidth, panelHeight);
             tabs  = TabsVisible(panel, panelWidth, panelHeight);
             link  = DecodePanel(panel, panelWidth, panelHeight);
+
+            // 失效后那张变暗的图本身也识别得出内容（是一条固定的链接, 不是登录码）: 按亮度认, 不当作二维码
+            if (link != null && QrDimmed(panel, panelWidth, panelHeight))
+            {
+                link    = null;
+                expired = true;
+            }
         }
 
         if (link == null)
-            return new CatWeGameLoginWindow(client.Right, client.Bottom, PanelThumb: thumb, TabsVisible: tabs);
+            return new CatWeGameLoginWindow(client.Right, client.Bottom, PanelThumb: thumb, TabsVisible: tabs, QrExpired: expired);
 
         // 同一个二维码不重复画
         if (!string.Equals(link, lastLink, StringComparison.Ordinal) || lastPng == null)
@@ -208,6 +216,46 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
     /// </summary>
     private string? DecodePanel(byte[] panel, int panelWidth, int panelHeight) =>
         codec.Decode(panel, panelWidth, panelHeight) ?? codec.Decode(Upscale(panel, panelWidth, panelHeight, 2), panelWidth * 2, panelHeight * 2);
+
+    /// <summary>
+    ///     二维码那一块是不是变暗了: 正常二维码的白底亮度接近 255, 失效后整张压到 50 上下（只有中间的刷新图标还亮）。
+    ///     看二维码所在范围（按 300×450 的登录栏量是横向 85–215、纵向 80–215）里第 90 百分位的亮度
+    /// </summary>
+    internal static bool QrDimmed(byte[] panel, int panelWidth, int panelHeight)
+    {
+        var left   = panelWidth * 85 / 300;
+        var right  = Math.Min(panelWidth, panelWidth * 215 / 300);
+        var top    = panelHeight * 80 / 450;
+        var bottom = Math.Min(panelHeight, panelHeight * 215 / 450);
+        var counts = new int[256];
+        var total  = 0;
+
+        for (var y = top; y < bottom; y++)
+        {
+            var offset = (y * panelWidth + left) * 4;
+
+            for (var x = left; x < right; x++, offset += 4)
+            {
+                counts[(panel[offset] + panel[offset + 1] * 2 + panel[offset + 2]) / 4]++;
+                total++;
+            }
+        }
+
+        if (total == 0)
+            return false;
+
+        var above = 0;
+
+        for (var level = 255; level >= 0; level--)
+        {
+            above += counts[level];
+
+            if (above * 10 >= total)
+                return level < 128;
+        }
+
+        return true;
+    }
 
     /// <summary>缩成小图时每格的边长（像素）</summary>
     private const int THUMB_CELL = 10;
