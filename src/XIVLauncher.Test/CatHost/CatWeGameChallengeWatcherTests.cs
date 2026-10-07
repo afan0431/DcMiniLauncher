@@ -161,7 +161,24 @@ public sealed class CatWeGameChallengeWatcherTests
         Assert.Equal([(125, 277), (208, 630)], screen.Clicks);
         Assert.Equal(["challenge:qrcode:q-1"], reporter.Entries);
 
-        // 切好之后不再点, 哪怕二维码后来没了
+        // 切好后不久二维码没了而登录窗口还在（WeGame 启动完自己换了页）: 再切一次, 换页后的二维码作为新的一条报
+        screen.Window = Page();
+        await TickAsync(watcher, 5);
+        Assert.Equal([(125, 277), (208, 630), (125, 277), (208, 630)], screen.Clicks);
+        Assert.Equal(["challenge:qrcode:q-1", "cleared:q-1"], reporter.Entries.Take(2));
+    }
+
+    [Fact]
+    public async Task Qq_QrGoneLongAfterTheSwitch_IsLeftAlone()
+    {
+        // 隔得久了二维码才没（员工自己换了登录方式）: 不再点
+        screen.Window  = Page();
+        screen.OnClick = (x, y) => (x, y) == (208, 630) ? Qr(QQ_LINK) : Page();
+        var watcher = new CatWeGameChallengeWatcher(screen, reporter, redactor, CatWeGameScan.Qq) { ClickSettle = TimeSpan.Zero, ResettleWindow = TimeSpan.FromMilliseconds(-1) };
+
+        await TickAsync(watcher, 2);
+        Assert.Equal(2, screen.Clicks.Count);
+
         screen.Window = Page();
         await TickAsync(watcher, 5);
         Assert.Equal(2, screen.Clicks.Count);
