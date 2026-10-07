@@ -287,7 +287,12 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
         // 窗口刚出现时可能还没画完, 连着两轮都在才开始点
         if (++windowSeen < 2)
+        {
+            Log.Information("[CatHost] WeGame 登录窗口出现了");
             return;
+        }
+
+        Log.Information("[CatHost] 开始切{Scan}扫码页（第 {Round} 轮）", scan == CatWeGameScan.WeChat ? "微信" : " QQ ", switchRounds + 1);
 
         await SwitchRoundAsync(window, cancellationToken).ConfigureAwait(false);
     }
@@ -394,6 +399,8 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
         if (!screen.ClickLoginWindow(x, y))
             return null;
+
+        Log.Information("[CatHost] 点了登录窗口 ({X}, {Y})", x, y);
 
         // 二维码要联网取, 可能过一会儿才画出来: 最多等两个 ClickSettle, 期间一看到二维码就返回;
         // 等够了仍没有才算这一页没有二维码, 免得把刚切好的扫码页又点走
