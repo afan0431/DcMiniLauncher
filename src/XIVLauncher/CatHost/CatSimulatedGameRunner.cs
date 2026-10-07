@@ -20,7 +20,7 @@ namespace XIVLauncher.CatHost;
 ///             账号名以 <c>sms:</c> 开头: 二维码之后再发一条设备验证短信（kind=sms）, 一直等到收到 weGame.confirmSms 才发 weGame.challengeCleared 并继续
 ///         </item>
 ///         <item>
-///             launch 带了 autoEnter（国际服除外）: running 之后按真实顺序发自动进入角色的事件, Minion 推迟到之后才挂。账号名前缀决定走哪种:
+///             launch 带了 autoEnter（国际服除外）: running 之后按真实顺序发自动进入角色的事件; 带 Minion 的照常在 running 之前挂好。账号名前缀决定走哪种:
 ///             其它任何账号名 = 单角色直进（enteringLobby → game.characters → enteringWorld → game.character → inWorld）;
 ///             <c>chars:</c> = 三个角色等人选（awaitingCharacterChoice → game.characters{needsChoice} → 收到 selectCharacter 后继续进入）;
 ///             <c>travel:</c> = 角色超域在别的大区（game.characters → switchingArea → game.characters → enteringWorld → game.character → inWorld）;
@@ -446,8 +446,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
                     reporter.Agent(CatAgentKinds.DALAMUD, true);
             }
 
-            // 自动进入角色时 Minion 推迟到编排结束后再挂
-            if (request.Minion && !request.AutoEnter)
+            if (request.Minion)
                 await AttachMinionAsync(failAgent, reporter, token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (closeCts.IsCancellationRequested)
@@ -458,7 +457,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         reporter.Stage(CatStages.RUNNING);
 
         if (request.AutoEnter)
-            autoEnterTask = RunAutoEnterAsync(request, process, failAgent, reporter, token);
+            autoEnterTask = RunAutoEnterAsync(request, process, reporter, token);
 
         return process;
     }
@@ -477,7 +476,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     /// <summary>
     ///     模拟自动进入角色: 按账号名前缀发与真实编排同样顺序的事件; 占位进程一结束就停, 不再发任何事件
     /// </summary>
-    private async Task RunAutoEnterAsync(CatLaunchRequest request, Process process, string? failAgent, ICatLaunchReporter reporter, CancellationToken token)
+    private async Task RunAutoEnterAsync(CatLaunchRequest request, Process process, ICatLaunchReporter reporter, CancellationToken token)
     {
         using var alive = CancellationTokenSource.CreateLinkedTokenSource(token);
         var exited = process.WaitForExitAsync(alive.Token);
@@ -586,15 +585,6 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
                 reporter.Character(entered);
                 Stage(CatStages.IN_WORLD);
-            }
-
-            if (request.Minion)
-            {
-                await StepAsync().ConfigureAwait(false);
-                await AttachMinionAsync(failAgent, reporter, alive.Token).ConfigureAwait(false);
-
-                if (!process.HasExited)
-                    reporter.Stage(LastAutoEnterStage ?? CatStages.RUNNING);
             }
         }
         catch (OperationCanceledException)

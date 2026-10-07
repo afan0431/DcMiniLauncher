@@ -1078,8 +1078,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 reporter.Agent(CatAgentKinds.DALAMUD, loaded, loaded ? null : CatCodes.DALAMUD_UNAVAILABLE, loaded ? null : "游戏进程里没有等到 Dalamud 加载");
             }
 
-            // 自动进入角色时 Minion 推迟到编排结束后再挂（见 StartAutoEnter）, 免得 Minion 自己的登录脚本和编排抢同一个界面
-            if (request.Minion && !request.AutoEnter)
+            // Minion 在自动进入角色的编排开始之前挂好, 带不带 autoEnter 时机都一样
+            if (request.Minion)
             {
                 await AttachMinionAsync(launched, dalamudOk, reporter, startToken).ConfigureAwait(false);
 
@@ -1106,18 +1106,18 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             reporter.Stage(CatStages.RUNNING);
 
             if (request.AutoEnter)
-                StartAutoEnter(launched, dalamudOk, reporter, startToken);
+                StartAutoEnter(launched, reporter, startToken);
         }
 
         return (launched, dalamudOk, companionAppManager);
     }
 
     /// <summary>
-    ///     在后台自动进入角色（不挡崩溃守护）: 编排 → 带 Minion 的这时才挂 Minion → 之后隔一段时间看一次当前角色。
+    ///     在后台自动进入角色（不挡崩溃守护）: 编排 → 之后隔一段时间看一次当前角色。带 Minion 的在调用之前已经挂好。
     ///     等人选角色、排队都可能很久, 所以不在启动流程里等; 游戏进程收尾时取消。
     ///     崩溃重启后的新进程接着登录上一次实际进的那个角色。
     /// </summary>
-    private void StartAutoEnter(FFXIVProcess launched, bool dalamudInjected, ICatLaunchReporter reporter, CancellationToken startToken)
+    private void StartAutoEnter(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken startToken)
     {
         var process      = launched.UnderlyingProcess;
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(startToken);
@@ -1137,16 +1137,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                     {
                         try
                         {
-                            var outcome = await flow.RunAsync(token).ConfigureAwait(false);
-
-                            if (request.Minion && outcome != CatAutoEnterOutcome.Cancelled && !process.HasExited && !IsCloseRequested)
-                            {
-                                await AttachMinionAsync(launched, dalamudInjected, reporter, token).ConfigureAwait(false);
-
-                                if (!process.HasExited && !IsCloseRequested)
-                                    reporter.Stage(flow.CurrentStage ?? CatStages.RUNNING);
-                            }
-
+                            await flow.RunAsync(token).ConfigureAwait(false);
                             await flow.ObserveAsync(token).ConfigureAwait(false);
                         }
                         catch (OperationCanceledException)

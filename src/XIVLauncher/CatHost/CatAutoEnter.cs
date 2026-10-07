@@ -1142,7 +1142,7 @@ public sealed class CatAutoEnter
         {
             game.Release();
 
-            // 游戏崩溃或被关掉时管道比进程先断: 等一下再看进程还在不在, 别把「游戏没了」报成模块失效（那样还会接着去挂 Minion）
+            // 游戏崩溃或被关掉时管道比进程先断: 等一下再看进程还在不在, 别把「游戏没了」报成模块失效
             if (!game.HasExited)
                 await game.DelayAsync(timings.ExitGrace, cancellationToken).ConfigureAwait(false);
 
