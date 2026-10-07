@@ -193,10 +193,32 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
     }
 
     /// <summary>
-    ///     先对整窗识别; 识别不出时放大一倍再试一次（登录窗口上的二维码只有一百多像素宽）
+    ///     只识别左侧登录栏的下半截（二维码只会出现在那里, 约占整窗的六分之一）; 识别不出时放大一倍再试一次
+    ///     （二维码只有一百多像素宽）。每一轮、每次点击后都要识别, 对整窗做会让切换明显变慢
     /// </summary>
-    private string? DecodeWithRetry(byte[] pixels, int width, int height) =>
-        codec.Decode(pixels, width, height) ?? codec.Decode(Upscale(pixels, width, height, 2), width * 2, height * 2);
+    private string? DecodeWithRetry(byte[] pixels, int width, int height)
+    {
+        var panel = CropLoginPanel(pixels, width, height, out var panelWidth, out var panelHeight);
+
+        return codec.Decode(panel, panelWidth, panelHeight) ?? codec.Decode(Upscale(panel, panelWidth, panelHeight, 2), panelWidth * 2, panelHeight * 2);
+    }
+
+    /// <summary>
+    ///     裁出左侧登录栏从页签往下的部分: 按 1210×680 量是横向 0–300、纵向 230–680, 按窗口实际大小换算
+    /// </summary>
+    internal static byte[] CropLoginPanel(byte[] bgra, int width, int height, out int panelWidth, out int panelHeight)
+    {
+        panelWidth = Math.Clamp((int)Math.Round(width * 300d / 1210), 1, width);
+        var top    = Math.Clamp((int)Math.Round(height * 230d / 680), 0, height - 1);
+        panelHeight = height - top;
+
+        var panel = new byte[panelWidth * panelHeight * 4];
+
+        for (var y = 0; y < panelHeight; y++)
+            Buffer.BlockCopy(bgra, ((top + y) * width) * 4, panel, y * panelWidth * 4, panelWidth * 4);
+
+        return panel;
+    }
 
     private static IntPtr FindLoginWindow()
     {
