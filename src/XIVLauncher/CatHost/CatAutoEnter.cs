@@ -486,7 +486,7 @@ public sealed class CatAutoEnter
                         // 大厅排队: 不点、不限时
                         case OkKind.Queue:
                             queueing = true;
-                            ReportQueue(lobby.Queue);
+                            ReportQueue(QueuePosition(lobby));
                             game.Release();
                             await DelayAsync(timings.QueuePoll, cancellationToken).ConfigureAwait(false);
                             continue;
@@ -777,7 +777,7 @@ public sealed class CatAutoEnter
                     case OkKind.Queue:
                         queueing  = true;
                         confirmed = true;
-                        ReportQueue(lobby.Queue);
+                        ReportQueue(QueuePosition(lobby));
                         game.Release();
                         await DelayAsync(timings.QueuePoll, cancellationToken).ConfigureAwait(false);
                         continue;
@@ -809,6 +809,9 @@ public sealed class CatAutoEnter
                 }
                 else if (lobby.YesNoText.Length == 0)
                     refusal = "读不到确认框的文字";
+                else if (!lobby.YesNoText.Contains(entry.Name, StringComparison.Ordinal))
+                    // 登录确认框的文字里带角色名（实机 2026-10-07:「要以 <角色名> 登录吗？」）; 不带的不是它, 不点
+                    refusal = "确认框上不是这个角色的名字";
                 else
                 {
                     var reply = await SendAsync($"DIALOG YES {entry.ContentId}", "点登录确认框的「是」", cancellationToken).ConfigureAwait(false);
@@ -914,6 +917,20 @@ public sealed class CatAutoEnter
         }
 
         reporter.Stage(stage);
+    }
+
+    /// <summary>
+    ///     排队名次: 模块读到的数优先; 读不到时从提示文字里取（实机 2026-10-07: 国服排队时那个数一直是 0,
+    ///     文字是「…（当前排队人数：17人）」）
+    /// </summary>
+    internal static int QueuePosition(CatModuleReplies.LobbyState lobby)
+    {
+        if (lobby.Queue > 0)
+            return lobby.Queue;
+
+        var match = Regex.Match(lobby.OkText, @"排队人数\s*[:：]\s*(\d+)");
+
+        return match.Success && int.TryParse(match.Groups[1].Value, out var count) ? count : 0;
     }
 
     private void ReportQueue(int queue)

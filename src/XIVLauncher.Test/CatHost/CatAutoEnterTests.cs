@@ -319,6 +319,34 @@ public sealed class CatAutoEnterTests
     }
 
     [Fact]
+    public async Task ConfirmThatDoesNotNameTheCharacter_IsNeverAnswered()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.ConfirmText = "要以小黑登录吗？";
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("DIALOG YES", StringComparison.Ordinal));
+        Assert.Contains(reporter.Messages, x => x.Contains("确认框上不是这个角色的名字", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void QueuePosition_FallsBackToThePromptText()
+    {
+        var real = CatModuleReplies.ParseLobbyState
+        (
+            "OK where=charaselect world=1201 worldIndex=2 selectedIndex=0 hovered=11 locked=0 stage=1 uiStage=2 queue=0 dialogId=35 yesno=0 ok=1 dialogue=0 loading=0 listWorld=1201" +
+            "\nD\tSelectOk\t35\t1\t1\t当前服务器繁忙，需要排队进行登录，请耐心等待。 （当前排队人数：17人）" +
+            "\nT 当前服务器繁忙，需要排队进行登录，请耐心等待。 （当前排队人数：17人）"
+        )!;
+
+        Assert.Equal(17, CatAutoEnter.QueuePosition(real));
+        Assert.Equal(7, CatAutoEnter.QueuePosition(real with { Queue = 7 }));
+        Assert.Equal(0, CatAutoEnter.QueuePosition(real with { OkText = "当前服务器繁忙，需要排队进行登录，请耐心等待。" }));
+    }
+
+    [Fact]
     public async Task ConfirmWhoseTextCannotBeRead_IsNeverAnswered()
     {
         var (game, reporter) = Setup(Chara("11", "小白"));
@@ -907,7 +935,7 @@ public sealed class CatAutoEnterTests
         public string? Hovered { get; set; }
 
         /// <summary>点角色后弹出的确认框文字</summary>
-        public string ConfirmText { get; set; } = "要以该角色登录吗？";
+        public string? ConfirmText { get; set; }
 
         /// <summary>CHARAS 首行报的读不准的条目数</summary>
         public int InvalidEntries { get; set; }
@@ -1081,7 +1109,7 @@ public sealed class CatAutoEnterTests
 
                     if (ShowConfirm)
                     {
-                        Text  = ConfirmText;
+                        Text  = ConfirmText ?? $"要以{entry.Name}登录吗？";
                         YesNo = true;
                     }
 
