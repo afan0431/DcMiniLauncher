@@ -251,7 +251,7 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     {
         ObserveSms();
 
-        var window = screen.CaptureLoginWindow();
+        var window = CaptureWanted();
 
         if (switchState != SwitchState.Pending)
         {
@@ -381,13 +381,43 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
         for (var i = 0; i < polls; i++)
         {
             await Task.Delay(ClickPoll, cancellationToken).ConfigureAwait(false);
-            after = screen.CaptureLoginWindow();
+            after = CaptureWanted();
 
             if (after == null || HasQr(after))
                 return after;
         }
 
         return after;
+    }
+
+    /// <summary>
+    ///     截一次登录窗口。要切到某种扫码页时, 窗口上若是另一种的二维码（WeGame 刚启动会先闪一下上次用的那一页）,
+    ///     当作没有二维码: 不拿它当"切好了", 也不报给客户。放弃自动切换后不再区分。
+    /// </summary>
+    private CatWeGameLoginWindow? CaptureWanted()
+    {
+        var window = screen.CaptureLoginWindow();
+
+        if (window == null || scan == null || switchState == SwitchState.GaveUp || !HasQr(window))
+            return window;
+
+        return QrAppOf(window.QrLink!) is { } app && app != scan ? window with { QrLink = null, QrPng = null } : window;
+    }
+
+    /// <summary>
+    ///     二维码是给哪个 App 扫的: 按链接的主机名认, 认不出返回 null
+    /// </summary>
+    internal static CatWeGameScan? QrAppOf(string link)
+    {
+        if (!Uri.TryCreate(link, UriKind.Absolute, out var uri))
+            return null;
+
+        var host = uri.Host;
+
+        if (host.Equals("weixin.qq.com", StringComparison.OrdinalIgnoreCase) || host.EndsWith(".weixin.qq.com", StringComparison.OrdinalIgnoreCase))
+            return CatWeGameScan.WeChat;
+
+        return host.Equals("qq.com", StringComparison.OrdinalIgnoreCase) || host.EndsWith(".qq.com", StringComparison.OrdinalIgnoreCase) ? CatWeGameScan.Qq : null;
     }
 
     private static bool HasQr(CatWeGameLoginWindow? window) =>

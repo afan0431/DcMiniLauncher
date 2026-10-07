@@ -169,6 +169,23 @@ public sealed class CatWeGameChallengeWatcherTests
     }
 
     [Fact]
+    public async Task Qq_AnotherAppsQrOnTheWindow_IsNotTakenAsSwitched_NorReported()
+    {
+        // WeGame 刚启动先闪一下上次用的微信二维码: 点了 QQ 页签窗口还没反应, 看到的仍是微信的码
+        screen.Window  = Qr(WECHAT_LINK);
+        screen.OnClick = (x, y) => (x, y) == (208, 630) ? Qr(QQ_LINK) : Qr(WECHAT_LINK);
+        var watcher = Create(CatWeGameScan.Qq);
+
+        await TickAsync(watcher, 2);
+
+        Assert.Equal([(125, 277), (208, 630)], screen.Clicks);
+        Assert.Equal(["challenge:qrcode:q-1"], reporter.Entries);
+        Assert.Equal(CatWeGameScan.WeChat, CatWeGameChallengeWatcher.QrAppOf(WECHAT_LINK));
+        Assert.Equal(CatWeGameScan.Qq, CatWeGameChallengeWatcher.QrAppOf(QQ_LINK));
+        Assert.Null(CatWeGameChallengeWatcher.QrAppOf("https://example.invalid/x"));
+    }
+
+    [Fact]
     public async Task Qq_QrGoneLongAfterTheSwitch_IsLeftAlone()
     {
         // 隔得久了二维码才没（员工自己换了登录方式）: 不再点
