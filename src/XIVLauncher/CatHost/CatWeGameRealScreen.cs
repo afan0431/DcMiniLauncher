@@ -115,9 +115,6 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
 
     private const int BITMAP_INFO_HEADER_SIZE = 40;
 
-    /// <summary>按下与抬起之间隔多久</summary>
-    private static readonly TimeSpan ClickHold = TimeSpan.FromMilliseconds(60);
-
     private string? lastLink;
     private byte[]? lastPng;
 
@@ -154,12 +151,11 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
 
         var position = PackPoint(x, y);
 
-        if (!PostMessageW(window, WM_MOUSEMOVE, IntPtr.Zero, position) ||
-            !PostMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, position))
-            return false;
-
-        Thread.Sleep(ClickHold);
-        return PostMessageW(window, WM_LBUTTONUP, IntPtr.Zero, position);
+        // 三条消息连着发, 中间不能停: 真正的鼠标不在窗口上, 一停窗口就收到"鼠标离开",
+        // 页签还能点动, 但底部"QQ 扫码登录"这类文字链接的按下状态会被取消, 点了没反应（实机验证过）
+        return PostMessageW(window, WM_MOUSEMOVE, IntPtr.Zero, position)
+               && PostMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, position)
+               && PostMessageW(window, WM_LBUTTONUP, IntPtr.Zero, position);
     }
 
     /// <inheritdoc />
