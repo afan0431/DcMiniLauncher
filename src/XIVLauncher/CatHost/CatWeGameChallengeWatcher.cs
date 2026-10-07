@@ -196,8 +196,8 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     /// <summary>QQ 二维码失效后中间的刷新图标（二维码的正中）</summary>
     internal static readonly (int X, int Y) QqQrRefresh = (150, 379);
 
-    /// <summary>微信二维码的正中: 失效后刷新图标的位置</summary>
-    internal static readonly (int X, int Y) WeChatQrRefresh = (150, 390);
+    /// <summary>微信二维码失效后中间的刷新图标（二维码的正中, 实机量到）</summary>
+    internal static readonly (int X, int Y) WeChatQrRefresh = (150, 381);
 
     /// <summary>二维码失效后最多自动刷新几次（等登录总共 10 分钟, 一张约 2 分钟）</summary>
     public const int MAX_QR_REFRESHES = 10;

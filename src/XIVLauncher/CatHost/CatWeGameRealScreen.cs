@@ -150,6 +150,9 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
                 link    = null;
                 expired = true;
             }
+            // 微信的二维码失效后是另一种样子: 白底还在, 码被糊掉、识别不出, 中间一个刷新图标
+            else if (link == null && QrBlurred(panel, panelWidth, panelHeight))
+                expired = true;
         }
 
         if (link == null)
@@ -275,6 +278,36 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         }
 
         return true;
+    }
+
+    /// <summary>
+    ///     二维码那一块是不是一张糊掉的白卡片（微信二维码失效后的样子）: 看二维码正中那一块
+    ///     （按 300×450 的登录栏量是横向 105–195、纵向 110–200）里亮的像素占多少。实机量到: 糊掉的占 0.84,
+    ///     正常的二维码 0.4 上下（黑白各半）, 快捷登录的头像页 0.2, 其余页面接近 0
+    /// </summary>
+    internal static bool QrBlurred(byte[] panel, int panelWidth, int panelHeight)
+    {
+        var left   = panelWidth * 105 / 300;
+        var right  = Math.Min(panelWidth, panelWidth * 195 / 300);
+        var top    = panelHeight * 110 / 450;
+        var bottom = Math.Min(panelHeight, panelHeight * 200 / 450);
+        var bright = 0;
+        var total  = 0;
+
+        for (var y = top; y < bottom; y++)
+        {
+            var offset = (y * panelWidth + left) * 4;
+
+            for (var x = left; x < right; x++, offset += 4)
+            {
+                if ((panel[offset] + panel[offset + 1] * 2 + panel[offset + 2]) / 4 > 150)
+                    bright++;
+
+                total++;
+            }
+        }
+
+        return total > 0 && bright * 100 >= total * 65;
     }
 
     /// <summary>缩成小图时每格的边长（像素）</summary>
