@@ -125,6 +125,13 @@ public sealed record CatWeGameSmsPrompt(string Code, string Phone, string Text);
 public interface ICatWeGameScreen
 {
     /// <summary>
+    ///     登录窗口被最小化了就把它还原到所有窗口的最下面, 不给焦点（最小化的窗口截不到画面, 二维码就看不到、刷新不了）;
+    ///     返回这次有没有还原。只在要了自动切到扫码页的上号里调用
+    /// </summary>
+    bool RestoreMinimizedLoginWindow() =>
+        false;
+
+    /// <summary>
     ///     截取 WeGame 登录窗口并识别上面的二维码; 没有登录窗口（没出现、已登录、最小化）时返回 null
     /// </summary>
     CatWeGameLoginWindow? CaptureLoginWindow();
@@ -303,6 +310,10 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     internal async Task TickAsync(CancellationToken cancellationToken)
     {
         ObserveSms();
+
+        // 员工把挡事的 WeGame 窗口最小化了: 垫到别的窗口后面去, 这样还能接着看二维码、失效了接着刷新
+        if (scan != null && screen.RestoreMinimizedLoginWindow())
+            Log.Information("[CatHost] WeGame 登录窗口被最小化了, 已还原到其它窗口后面");
 
         var window = CaptureWanted();
 

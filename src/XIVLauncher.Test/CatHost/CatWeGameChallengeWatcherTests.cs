@@ -225,6 +225,18 @@ public sealed class CatWeGameChallengeWatcherTests
     }
 
     [Fact]
+    public async Task MinimizedLoginWindow_IsRestored_OnlyWhenScanWasRequested()
+    {
+        screen.Window    = Page();
+        screen.Minimized = true;
+        await TickAsync(Create(null), 3);
+        Assert.Equal(0, screen.Restores);
+
+        await TickAsync(Create(CatWeGameScan.Qq), 1);
+        Assert.Equal(1, screen.Restores);
+    }
+
+    [Fact]
     public async Task ExpiredQr_WithoutScanRequested_IsNeverClicked()
     {
         screen.Window = new CatWeGameLoginWindow(1210, 680, QrExpired: true);
@@ -834,6 +846,21 @@ public sealed class CatWeGameChallengeWatcherTests
         private CatWeGameLoginWindow? window;
         private CatWeGameSmsPrompt?   sms;
         private int                   captureCount;
+
+        /// <summary>登录窗口是不是处在最小化; 调还原后变回 false</summary>
+        public bool Minimized { get; set; }
+
+        public int Restores { get; private set; }
+
+        public bool RestoreMinimizedLoginWindow()
+        {
+            if (!Minimized)
+                return false;
+
+            Minimized = false;
+            Restores++;
+            return true;
+        }
 
         public CatWeGameLoginWindow? Window
         {

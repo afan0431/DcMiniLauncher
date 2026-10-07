@@ -112,6 +112,12 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
     private const uint WM_LBUTTONDOWN       = 0x0201;
     private const uint WM_LBUTTONUP         = 0x0202;
     private const int  MK_LBUTTON           = 0x0001;
+    private const int  SW_SHOWNOACTIVATE    = 4;
+    private const uint SWP_NOSIZE           = 0x0001;
+    private const uint SWP_NOMOVE           = 0x0002;
+    private const uint SWP_NOACTIVATE       = 0x0010;
+
+    private static readonly IntPtr HWND_BOTTOM = 1;
 
     private const int BITMAP_INFO_HEADER_SIZE = 40;
 
@@ -157,6 +163,20 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         }
 
         return new CatWeGameLoginWindow(client.Right, client.Bottom, link, lastPng, thumb, tabs);
+    }
+
+    /// <inheritdoc />
+    public bool RestoreMinimizedLoginWindow()
+    {
+        var window = FindLoginWindow();
+
+        if (window == IntPtr.Zero || !IsIconic(window))
+            return false;
+
+        // 还原但不激活, 再放到最底层: 不打断员工手上正在用的窗口（实机验证过还原后前台窗口不变、能截到完整画面）
+        ShowWindow(window, SW_SHOWNOACTIVATE);
+        SetWindowPos(window, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+        return true;
     }
 
     /// <inheritdoc />
@@ -489,6 +509,12 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
 
     [DllImport("user32.dll")]
     private static extern bool IsIconic(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr window, int command);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetClassNameW(IntPtr window, StringBuilder className, int maxCount);
