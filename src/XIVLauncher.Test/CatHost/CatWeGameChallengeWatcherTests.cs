@@ -158,13 +158,13 @@ public sealed class CatWeGameChallengeWatcherTests
         Assert.Empty(screen.Clicks);
 
         await TickAsync(watcher, 1);
-        Assert.Equal([(125, 277), (208, 630)], screen.Clicks);
+        Assert.Equal([(125, 277), (150, 630), (208, 630)], screen.Clicks);
         Assert.Equal(["challenge:qrcode:q-1"], reporter.Entries);
 
         // 切好后不久二维码没了而登录窗口还在（WeGame 启动完自己换了页）: 再切一次, 换页后的二维码作为新的一条报
         screen.Window = Page();
         await TickAsync(watcher, 5);
-        Assert.Equal([(125, 277), (208, 630), (125, 277), (208, 630)], screen.Clicks);
+        Assert.Equal([(125, 277), (150, 630), (208, 630), (125, 277), (150, 630), (208, 630)], screen.Clicks);
         Assert.Equal(["challenge:qrcode:q-1", "cleared:q-1"], reporter.Entries.Take(2));
     }
 
@@ -178,7 +178,7 @@ public sealed class CatWeGameChallengeWatcherTests
 
         await TickAsync(watcher, 2);
 
-        Assert.Equal([(125, 277), (208, 630)], screen.Clicks);
+        Assert.Equal([(125, 277), (150, 630), (208, 630)], screen.Clicks);
         Assert.Equal(["challenge:qrcode:q-1"], reporter.Entries);
         Assert.Equal(CatWeGameScan.WeChat, CatWeGameChallengeWatcher.QrAppOf(WECHAT_LINK));
         Assert.Equal(CatWeGameScan.Qq, CatWeGameChallengeWatcher.QrAppOf(QQ_LINK));
@@ -194,11 +194,11 @@ public sealed class CatWeGameChallengeWatcherTests
         var watcher = new CatWeGameChallengeWatcher(screen, reporter, redactor, CatWeGameScan.Qq) { ClickSettle = TimeSpan.Zero, ResettleWindow = TimeSpan.FromMilliseconds(-1) };
 
         await TickAsync(watcher, 2);
-        Assert.Equal(2, screen.Clicks.Count);
+        Assert.Equal(3, screen.Clicks.Count);
 
         screen.Window = Page();
         await TickAsync(watcher, 5);
-        Assert.Equal(2, screen.Clicks.Count);
+        Assert.Equal(3, screen.Clicks.Count);
         Assert.Equal(["challenge:qrcode:q-1", "cleared:q-1"], reporter.Entries);
     }
 
@@ -262,7 +262,7 @@ public sealed class CatWeGameChallengeWatcherTests
 
         await TickAsync(Create(CatWeGameScan.Qq), 2);
 
-        Assert.Equal([(250, 416), (416, 945)], screen.Clicks);
+        Assert.Equal([(250, 416), (300, 945), (416, 945)], screen.Clicks);
         Assert.Equal((125, 277), CatWeGameChallengeWatcher.Scale((125, 277), 1210, 680));
         Assert.Equal((63, 139), CatWeGameChallengeWatcher.Scale((125, 277), 605, 340));
     }
@@ -277,7 +277,7 @@ public sealed class CatWeGameChallengeWatcherTests
 
         Assert.Equal
         (
-            [(125, 277), (208, 630), (125, 277), (208, 630), (125, 277), (208, 630)],
+            [(125, 277), (150, 630), (208, 630), (125, 277), (150, 630), (208, 630), (125, 277), (150, 630), (208, 630)],
             screen.Clicks
         );
         Assert.Equal(["scanSwitchFailed:qq"], reporter.Entries);
@@ -286,7 +286,7 @@ public sealed class CatWeGameChallengeWatcherTests
         screen.Window = Qr(QQ_LINK);
         await TickAsync(watcher, 2);
 
-        Assert.Equal(6, screen.Clicks.Count);
+        Assert.Equal(9, screen.Clicks.Count);
         Assert.Equal(["scanSwitchFailed:qq", "challenge:qrcode:q-1"], reporter.Entries);
     }
 
@@ -548,7 +548,7 @@ public sealed class CatWeGameChallengeWatcherTests
         environment.Result.TrySetResult(new WeGameCaptureResult("10000000000000001", "captured-token-AAAA"));
         await run.WaitAsync(Timeout);
 
-        Assert.Equal([(125, 277), (208, 630)], screen.Clicks);
+        Assert.Equal([(125, 277), (150, 630), (208, 630)], screen.Clicks);
     }
 
     [Fact]

@@ -150,8 +150,14 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     /// <summary>微信页签</summary>
     internal static readonly (int X, int Y) WeChatTab = (175, 277);
 
-    /// <summary>QQ 页底部的「QQ 扫码登录」; 已经在扫码页时同一位置是「QQ 账号密码登录」, 所以有二维码就不能再点</summary>
+    /// <summary>QQ 账号密码页底部右侧的「QQ 扫码登录」</summary>
     internal static readonly (int X, int Y) QqScanEntry = (208, 630);
+
+    /// <summary>
+    ///     QQ 页底部正中的「QQ 账号密码登录」: 快捷安全登录页和扫码页上都有, 点了到账号密码页; 账号密码页上这个位置是空的。
+    ///     QQ 页会停在快捷安全登录、账号密码、扫码三种之一, 只有账号密码页上有「QQ 扫码登录」, 所以先点它再点扫码入口, 从哪一页出发都到扫码页
+    /// </summary>
+    internal static readonly (int X, int Y) QqPasswordEntry = (150, 630);
 
     /// <summary>微信页停在快捷登录时的「使用其他头像、昵称或账号」</summary>
     internal static readonly (int X, int Y) WeChatOtherAccount = (150, 483);
@@ -337,10 +343,26 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     private async Task SwitchRoundAsync(CatWeGameLoginWindow window, CancellationToken cancellationToken)
     {
         var isWeChat = scan == CatWeGameScan.WeChat;
-        var after    = await ClickAndCaptureAsync(window, isWeChat ? WeChatTab : QqTab, cancellationToken).ConfigureAwait(false);
+        CatWeGameLoginWindow? after;
 
-        if (after != null && !HasQr(after))
-            after = await ClickAndCaptureAsync(after, isWeChat ? WeChatOtherAccount : QqScanEntry, cancellationToken).ConfigureAwait(false);
+        if (isWeChat)
+        {
+            after = await ClickAndCaptureAsync(window, WeChatTab, false, cancellationToken).ConfigureAwait(false);
+
+            if (after != null && !HasQr(after))
+                after = await ClickAndCaptureAsync(after, WeChatOtherAccount, false, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            // 点完页签稍等一下: 已经是扫码页且二维码出来了就停; 否则先到账号密码页, 再点扫码入口
+            after = await ClickAndCaptureAsync(window, QqTab, true, cancellationToken).ConfigureAwait(false);
+
+            if (after != null && !HasQr(after))
+                after = await ClickAndCaptureAsync(after, QqPasswordEntry, true, cancellationToken).ConfigureAwait(false);
+
+            if (after != null && !HasQr(after))
+                after = await ClickAndCaptureAsync(after, QqScanEntry, false, cancellationToken).ConfigureAwait(false);
+        }
 
         // 点的时候登录窗口没了（员工自己登录了、窗口被关了）: 这一轮不算
         if (after == null)
@@ -366,7 +388,7 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
         reporter.WeGameScanSwitchFailed(CatWeGameScans.Name(scan!.Value));
     }
 
-    private async Task<CatWeGameLoginWindow?> ClickAndCaptureAsync(CatWeGameLoginWindow window, (int X, int Y) point, CancellationToken cancellationToken)
+    private async Task<CatWeGameLoginWindow?> ClickAndCaptureAsync(CatWeGameLoginWindow window, (int X, int Y) point, bool brief, CancellationToken cancellationToken)
     {
         var (x, y) = Scale(point, window.Width, window.Height);
 
@@ -375,7 +397,8 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
         // 二维码要联网取, 可能过一会儿才画出来: 最多等两个 ClickSettle, 期间一看到二维码就返回;
         // 等够了仍没有才算这一页没有二维码, 免得把刚切好的扫码页又点走
-        var polls = Math.Max(1, (int)Math.Ceiling(ClickSettle.TotalMilliseconds * 2 / Math.Max(1, ClickPoll.TotalMilliseconds)));
+        // brief: 只是换页的一步, 不指望这一下就出二维码, 看两次就继续
+        var polls = brief ? 2 : Math.Max(1, (int)Math.Ceiling(ClickSettle.TotalMilliseconds * 2 / Math.Max(1, ClickPoll.TotalMilliseconds)));
         CatWeGameLoginWindow? after = null;
 
         for (var i = 0; i < polls; i++)
