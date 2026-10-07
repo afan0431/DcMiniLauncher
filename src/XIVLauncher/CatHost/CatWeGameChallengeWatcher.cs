@@ -428,7 +428,9 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
         if (isWeChat)
         {
-            after = await ClickAndCaptureAsync(window, WeChatTab, false, cancellationToken).ConfigureAwait(false);
+            // 点完页签稍等一下: 已经是扫码页且二维码出来了就停; 否则点「使用其他头像、昵称或账号」。
+            // 这个位置在扫码页上是二维码说明和「快捷登录」之间的空白, 点了无效果, 所以不用先等够时间确认没有二维码
+            after = await ClickAndCaptureAsync(window, WeChatTab, true, cancellationToken).ConfigureAwait(false);
 
             if (after != null && !HasQr(after))
                 after = await ClickAndCaptureAsync(after, WeChatOtherAccount, false, cancellationToken).ConfigureAwait(false);
