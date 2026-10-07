@@ -138,6 +138,9 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     /// <summary>自动切扫码页最多试几轮</summary>
     public const int MAX_SWITCH_ROUNDS = 3;
 
+    /// <summary>切好后窗口自己换页时最多再切几次</summary>
+    public const int MAX_RESETTLES = 2;
+
     /// <summary>连续几轮看不到才算验证已经不在了（窗口重绘的瞬间会识别不到）</summary>
     public const int MISSES_TO_CLEAR = 2;
 
@@ -168,6 +171,8 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
     private SwitchState switchState = scan == null ? SwitchState.Off : SwitchState.Pending;
     private int         switchRounds;
+    private long        switchDoneAt;
+    private int         resettles;
     private int         windowSeen;
 
     private enum SwitchState
@@ -196,6 +201,9 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
     /// <summary>还没切到扫码页时每隔多久看一轮（比平时勤, 好让窗口一出现就开始切）</summary>
     public TimeSpan SwitchInterval { get; init; } = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>切好扫码页后多久之内二维码没了算"窗口自己换了页", 要再切一次</summary>
+    public TimeSpan ResettleWindow { get; init; } = TimeSpan.FromSeconds(20);
 
     /// <summary>点击后每隔多久看一次有没有二维码</summary>
     public TimeSpan ClickPoll { get; init; } = TimeSpan.FromMilliseconds(300);
@@ -248,6 +256,19 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
         if (switchState != SwitchState.Pending)
         {
             ObserveQr(window);
+
+            // WeGame 刚启动时登录窗口会自己再跳一次页（比如跳到本机微信的快捷登录）, 把刚切好的扫码页换掉:
+            // 切好后不久二维码就没了而登录窗口还在, 再切一次。隔得久的不管, 那多半是员工自己换了登录方式
+            if (switchState == SwitchState.Done && window != null && qrId == null && resettles < MAX_RESETTLES
+                && Environment.TickCount64 - switchDoneAt <= (long)ResettleWindow.TotalMilliseconds)
+            {
+                resettles++;
+                switchState  = SwitchState.Pending;
+                switchRounds = 0;
+                windowSeen   = 0;
+                Log.Information("[CatHost] WeGame 登录窗口切好后又自己换了页, 再切一次");
+            }
+
             return;
         }
 
@@ -330,7 +351,8 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
         if (HasQr(after))
         {
-            switchState = SwitchState.Done;
+            switchState  = SwitchState.Done;
+            switchDoneAt = Environment.TickCount64;
             Log.Information("[CatHost] WeGame 登录窗口已切到{Scan}扫码页（第 {Round} 轮）", isWeChat ? "微信" : " QQ ", switchRounds + 1);
             ObserveQr(after);
             return;
