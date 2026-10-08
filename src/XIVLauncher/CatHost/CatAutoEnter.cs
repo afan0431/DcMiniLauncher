@@ -396,7 +396,7 @@ public sealed class CatAutoEnter
             if (followedTarget && (entry == null || entry.ContentId != wanted.ContentId))
                 throw new StopException(CatAutoEnterStopCodes.SWITCH_AREA_FAILED, $"换到 {game.CurrentAreaName} 后选角列表里没有要登录的角色");
 
-            // 给了名字、这个大厅的列表里却没有它: 先去它原始服务器所在的大区找（账号库记的大区可能是上次超域留下的）。
+            // 给了名字、这个大厅的列表里却没有它: 先去它原始服务器所在的大区找（启动大区可能不是它原始服务器所在的大区）。
             // 原始大区的列表里一定有它 —— 超域出去了也在, 只是带「超域中」的标记, 后面会再跟过去。
             if (needsChoice && !followedTarget && HomeAreaOfMissing(entries, wanted) is { } homeArea && visitedAreas.Add(homeArea))
             {

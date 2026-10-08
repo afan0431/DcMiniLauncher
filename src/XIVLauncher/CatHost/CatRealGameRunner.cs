@@ -322,7 +322,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         var areas = await LoadAreasAsync(cancellationToken).ConfigureAwait(false);
         var area  = ResolveArea(areas, account.AreaName, request.AreaName, x => x.AreaName, out var fromRequest);
 
-        if (area == null && request.AreaName != null)
+        if (area == null && fromRequest)
             throw new CatLaunchException(CatCodes.LAUNCH_FAILED, $"资料里的大区「{request.AreaName}」不在盛趣的大区列表里, 请核对任务资料");
 
         if (area == null)
@@ -330,9 +330,12 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             area = areas[0];
             reporter.Log("warning", $"账号库和上号请求都没有这个号的大区, 按列表第一个「{area.AreaName}」启动");
         }
-        else if (fromRequest)
+        else if (fromRequest && !string.Equals(account.AreaName, area.AreaName, StringComparison.Ordinal))
         {
-            // 账号库没记这个号的大区: 用资料里的并记下来, 之后界面版和跨区同步都以它为起点
+            // 账号库记的和资料不一样（或没记）: 按资料启动并记下来, 界面版和跨区同步都以它为起点
+            if (!string.IsNullOrEmpty(account.AreaName))
+                Log.Information("[CatHost] 账号库记的大区是 {Saved}, 按资料里的 {Area} 启动", account.AreaName, area.AreaName);
+
             account.AreaName = area.AreaName;
             accountManager.Save(account);
         }
@@ -871,25 +874,21 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     }
 
     /// <summary>
-    ///     选启动大区: 账号库记的优先（超域旅行后角色在别的大区, 靠它记住）, 没记或对不上时用上号请求带的; 都对不上返回 null
+    ///     选启动大区: 上号请求带的（任务资料）优先; 请求没带时用账号库记的; 请求带了却对不上, 或都没有时返回 null。
+    ///     账号库记的是游戏里最后一次换到的大区（标题画面选大区、超域都会改它）, 不代表角色所在的大区;
+    ///     角色超域在别的大区时由自动进入按选角列表的「超域中」标记跟过去
     /// </summary>
     internal static T? ResolveArea<T>(IReadOnlyList<T> areas, string? savedAreaName, string? requestedAreaName, Func<T, string?> nameOf, out bool fromRequest)
         where T : class
     {
-        fromRequest = false;
+        fromRequest = !string.IsNullOrEmpty(requestedAreaName);
 
-        if (!string.IsNullOrEmpty(savedAreaName) &&
-            areas.FirstOrDefault(x => string.Equals(nameOf(x), savedAreaName, StringComparison.Ordinal)) is { } saved)
-            return saved;
+        if (fromRequest)
+            return areas.FirstOrDefault(x => string.Equals(nameOf(x), requestedAreaName, StringComparison.Ordinal));
 
-        if (!string.IsNullOrEmpty(requestedAreaName) &&
-            areas.FirstOrDefault(x => string.Equals(nameOf(x), requestedAreaName, StringComparison.Ordinal)) is { } requested)
-        {
-            fromRequest = true;
-            return requested;
-        }
-
-        return null;
+        return string.IsNullOrEmpty(savedAreaName)
+                   ? null
+                   : areas.FirstOrDefault(x => string.Equals(nameOf(x), savedAreaName, StringComparison.Ordinal));
     }
 
     private void SyncAreaFromDcTravel(string areaName)

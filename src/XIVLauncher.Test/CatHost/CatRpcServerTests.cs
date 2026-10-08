@@ -597,12 +597,16 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Theory]
-    [InlineData("猫小胖", "豆豆柴", "猫小胖", false)] // 账号库记的优先: 超域旅行后角色在别的大区
-    [InlineData(null, "豆豆柴", "豆豆柴", true)]     // 账号库没记: 用资料里的
-    [InlineData("不存在", "豆豆柴", "豆豆柴", true)] // 账号库记的对不上: 用资料里的
-    [InlineData(null, "不存在", null, false)]        // 资料里的对不上: 不悄悄取第一个
+    [InlineData("陆行鸟", "豆豆柴", "豆豆柴", true)]   // 资料优先: 账号库记的是游戏里最后换到的大区
+    [InlineData(null, "豆豆柴", "豆豆柴", true)]       // 账号库没记: 用资料里的
+    [InlineData("不存在", "豆豆柴", "豆豆柴", true)]   // 账号库记的对不上: 用资料里的
+    [InlineData("猫小胖", "不存在", null, true)]       // 资料里的对不上: 不退回账号库记的, 也不悄悄取第一个
+    [InlineData(null, "不存在", null, true)]
+    [InlineData("猫小胖", null, "猫小胖", false)]      // 请求没带大区: 用账号库记的
+    [InlineData("猫小胖", "", "猫小胖", false)]
+    [InlineData("不存在", null, null, false)]
     [InlineData(null, null, null, false)]
-    public void ResolveArea_PrefersSavedThenRequested(string? saved, string? requested, string? expected, bool expectedFromRequest)
+    public void ResolveArea_PrefersRequestedThenSaved(string? saved, string? requested, string? expected, bool expectedFromRequest)
     {
         string[] areas = ["陆行鸟", "莫古力", "猫小胖", "豆豆柴"];
 
