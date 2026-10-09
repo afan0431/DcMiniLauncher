@@ -464,6 +464,18 @@ public sealed record CatAdoptParams
     CatMinionParams? Minion                    = null
 );
 
+/// <summary>
+///     handoff（交接停止）: 不带参数。外壳按类型名探测启动器支不支持交接停止（同版起 --cat-self-update 也用退出码报结果）
+/// </summary>
+public static class CatHandOff
+{
+    /// <summary>方法名</summary>
+    public const string METHOD = "handoff";
+
+    /// <summary>交接成功后发的事件, 载荷 { operationId, pid, processStartedAt }; 之后进程以 <see cref="CatHostRuntime.EXIT_HANDED_OFF" /> 退出</summary>
+    public const string EVENT = "game.handedOff";
+}
+
 /// <summary>inject 参数; force = 已挂着也重新挂 Minion</summary>
 public sealed record CatInjectParams(bool? Dalamud, bool? Minion, bool? Force = null);
 

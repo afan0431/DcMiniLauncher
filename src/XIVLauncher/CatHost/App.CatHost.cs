@@ -58,10 +58,11 @@ public partial class App
     /// <summary>
     ///     无界面更新入口（<c>--cat-self-update</c>）: 检查、下载并安装启动器更新后退出, 不显示窗口、不重启启动器。
     ///     由 Cat 工作台在后台调用 —— 自动上号的电脑上没人打开启动器窗口, 界面版启动时的更新检查轮不到。
+    ///     退出码见 <see cref="CatSelfUpdateExitCodes" />。
     /// </summary>
     private static async Task RunCatSelfUpdateAsync()
     {
-        var exitCode = 0;
+        var exitCode = CatSelfUpdateExitCodes.FAILED;
 
         try
         {
@@ -78,12 +79,13 @@ public partial class App
             VelopackApp.Build().SetAutoApplyOnStartup(false).Run();
 
             var outcome = await UpdateOrchestrator.RunSilentAsync().ConfigureAwait(false);
-            Log.Information("[CatUpdate] 结果: {Outcome}", outcome);
+            exitCode = CatSelfUpdateExitCodes.From(outcome);
+            Log.Information("[CatUpdate] 结果: {Outcome}（退出码 {ExitCode}）", outcome, exitCode);
         }
         catch (Exception ex)
         {
             Log.Error(ex, "[CatUpdate] 无界面更新失败");
-            exitCode = 1;
+            exitCode = CatSelfUpdateExitCodes.FAILED;
         }
 
         await Log.CloseAndFlushAsync().ConfigureAwait(false);

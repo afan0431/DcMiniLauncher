@@ -23,6 +23,43 @@ public static class InGameTravelJobs
 {
     private static readonly ConcurrentDictionary<int, InGameTravelStatus> JOBS = new();
 
+    /// <summary>开始一次换大区与交接停止互斥: 两边都在这把锁里查、改</summary>
+    private static readonly object Gate = new();
+
+    /// <summary>守护进程正在交接停止的客户端: 不再接新的换大区（进程马上退出, 做到一半会被拦腰截断）</summary>
+    private static readonly HashSet<int> HELD = [];
+
+    /// <summary>
+    ///     交接停止: 这个客户端不再接新的换大区。已经有一次在进行时不挡, 返回 false（交接要等它结束）
+    /// </summary>
+    public static bool TryHold(int pid)
+    {
+        lock (Gate)
+        {
+            if (IsRunning(pid))
+                return false;
+
+            HELD.Add(pid);
+            return true;
+        }
+    }
+
+    /// <summary>交接停止没成: 这个客户端照常接换大区</summary>
+    public static void Release(int pid)
+    {
+        lock (Gate)
+            HELD.Remove(pid);
+    }
+
+    /// <summary>
+    ///     开始一次换大区; 已有一次在进行、或守护进程正在交接停止时返回 null
+    /// </summary>
+    public static InGameTravelStatus? TryBegin(int pid, string target)
+    {
+        lock (Gate)
+            return HELD.Contains(pid) || IsRunning(pid) ? null : Begin(pid, target);
+    }
+
     public static InGameTravelStatus Begin(int pid, string target)
     {
         var status = new InGameTravelStatus

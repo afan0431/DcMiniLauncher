@@ -17,6 +17,9 @@ public static class CatHostRuntime
     /// <summary>规定时间内没有收到 launch</summary>
     public const int EXIT_NO_LAUNCH = 4;
 
+    /// <summary>已交接停止（handoff）: 游戏照常在跑, 守护记录留着, 等下一个进程 adopt; 已发 game.handedOff</summary>
+    public const int EXIT_HANDED_OFF = 6;
+
     /// <summary>未处理异常</summary>
     public const int EXIT_UNHANDLED = 70;
 
