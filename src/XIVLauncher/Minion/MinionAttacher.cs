@@ -14,11 +14,14 @@ namespace XIVLauncher.Minion;
 ///     MinionLauncher 会在 bot 起不来时照样自报 "Attaching Successfull"（见 research/probe-P1）。
 ///     唯一判据是游戏内 overlay / 新的 bot 日志。
 /// </summary>
-public sealed record MinionAttachResult(bool Ok, string? Error)
+public sealed record MinionAttachResult(bool Ok, string? Error, bool LauncherCrashed = false)
 {
     public static MinionAttachResult Succeeded() => new(true, null);
 
     public static MinionAttachResult Failed(string error) => new(false, error);
+
+    /// <summary>MinionLauncher 以访问冲突 (0xC0000005) 崩溃退出, 可以重试</summary>
+    public static MinionAttachResult Crashed(string error) => new(false, error, true);
 }
 
 /// <summary>
@@ -69,6 +72,15 @@ public static class MinionAttacher
     /// <summary>MinionLauncher attach 完会自己退出; 超时视为卡住</summary>
     private static readonly TimeSpan LAUNCHER_TIMEOUT = TimeSpan.FromMinutes(3);
 
+    /// <summary>MinionLauncher 以访问冲突崩溃时再试的次数</summary>
+    private const int CRASH_RETRIES = 2;
+
+    /// <summary>两次挂载之间的间隔</summary>
+    private static readonly TimeSpan CRASH_RETRY_DELAY = TimeSpan.FromSeconds(4);
+
+    /// <summary>STATUS_ACCESS_VIOLATION (0xC0000005) 作为进程退出码</summary>
+    private const int ACCESS_VIOLATION = unchecked((int)0xC0000005);
+
     /// <summary>
     ///     把 <paramref name="minion" /> 这张卡挂到 <paramref name="gameProcess" /> 上, 成功后写占用记录。
     ///     不抛异常, 失败信息在返回值里（挂不上不该连累已经起来的游戏）。
@@ -117,8 +129,23 @@ public static class MinionAttacher
 
         var result = await SpawnLauncherAsync(minion, installPath, gamePath, gameProcess, cancellationToken).ConfigureAwait(false);
 
-        if (result.Ok)
-            WriteOccupancy(minion, gameProcess, accountName);
+        if (!result.Ok)
+            return result;
+
+        // 先落占用记录（带编号与卡号 MD5, 本进程不在时别人也能据此补报停机）, 再报结果
+        var keycodeMd5 = MinionAppStatusReporter.KeycodeMd5Hex(minion.Keycode.Reveal());
+        WriteOccupancy(minion, keycodeMd5, gameProcess, accountName);
+
+        // MINIONAPP 开着时, 它的看门狗会把「我们挂的、它没记过账的」会话当成卡死的杀掉,
+        // 所以按它自己的协议先替 bot 报一次「运行中」把计时器种上（见 MinionAppStatusReporter）; 补发在后台, 不拖慢结果
+        try
+        {
+            MinionAppStatusReporter.SeedRunningStatus(minion.Uid, keycodeMd5, minion.Fingerprint, gameProcess);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[Minion] 给 MINIONAPP 报「运行中」失败");
+        }
 
         return result;
     }
@@ -161,7 +188,31 @@ public static class MinionAttacher
             Redact(launcherExe, arguments)
         );
 
-        return await RunLauncherAsync(launcherExe, installPath, arguments, RedactorFor(minion), cancellationToken).ConfigureAwait(false);
+        var redactor = RedactorFor(minion);
+        var result   = await RunLauncherAsync(launcherExe, installPath, arguments, redactor, cancellationToken).ConfigureAwait(false);
+
+        // MinionLauncher 挂载前给每个游戏进程的句柄取名, 遇到旧版游戏内模块的同步管道会卡住并以访问冲突崩溃（时机相关）;
+        // 游戏还在就隔几秒再挂, 最多再试 CRASH_RETRIES 次
+        for (var retry = 1; retry <= CRASH_RETRIES && result.LauncherCrashed && !cancellationToken.IsCancellationRequested && !HasExited(gameProcess); retry++)
+        {
+            Log.Warning("[Minion] MinionLauncher 崩溃, {Delay}s 后第 {Retry} 次重试挂载 PID={GamePid}", CRASH_RETRY_DELAY.TotalSeconds, retry, gameProcess.Id);
+            await Task.Delay(CRASH_RETRY_DELAY, cancellationToken).ConfigureAwait(false);
+            result = await RunLauncherAsync(launcherExe, installPath, arguments, redactor, cancellationToken).ConfigureAwait(false);
+        }
+
+        return result;
+    }
+
+    private static bool HasExited(Process process)
+    {
+        try
+        {
+            return process.HasExited;
+        }
+        catch
+        {
+            return true;
+        }
     }
 
     /// <summary>
@@ -255,7 +306,7 @@ public static class MinionAttacher
         }
     }
 
-    private static void WriteOccupancy(CatMinionLaunch minion, Process gameProcess, string? accountName)
+    private static void WriteOccupancy(CatMinionLaunch minion, string? keycodeMd5, Process gameProcess, string? accountName)
     {
         try
         {
@@ -269,6 +320,7 @@ public static class MinionAttacher
                     Variant          = minion.Variant,
                     AccountName      = accountName,
                     MinionUid        = minion.Uid,
+                    KeycodeMd5       = keycodeMd5,
                     AttachedAt       = DateTimeOffset.UtcNow
                 },
                 gameProcess
@@ -359,6 +411,9 @@ public static class MinionAttacher
 
         // 正常收尾打的是 "Exiting Launcher, returning PID = <游戏PID>" —— 退出码可能就是那个 PID,
         // 所以只有负数才判失败（实测参数错误时是 -106）, 正数不当失败看。
+        if (exitCode == ACCESS_VIOLATION)
+            return MinionAttachResult.Crashed($"MinionLauncher 异常退出 (ExitCode={exitCode}), 详见日志");
+
         if (exitCode < 0)
             return MinionAttachResult.Failed($"MinionLauncher 异常退出 (ExitCode={exitCode}), 详见日志");
 

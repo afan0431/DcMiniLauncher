@@ -493,6 +493,16 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
             return;
 
         Log.Information("[CatHost] 国际服游戏进程已退出 (PID={ProcessID}, ExitCode=0x{ExitCode:X8})", process.Id, (uint)(TryGetExitCode(process) ?? 0));
+
+        try
+        {
+            // 告诉 MINIONAPP 这一行停机了, 否则它会过一分钟自己拉个新客户端
+            environment.Minion.ReportStopped(process.Id);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 补报 Minion 停机失败");
+        }
     }
 
     #endregion

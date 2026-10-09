@@ -12,12 +12,16 @@ public sealed class MinionOccupancyTests : IDisposable
     private readonly string originalDirectory = MinionOccupancy.Directory;
     private readonly string tempDirectory     = Path.Combine(Path.GetTempPath(), "cat-minion-occupancy-" + Guid.NewGuid().ToString("N"));
 
-    public MinionOccupancyTests() =>
-        MinionOccupancy.Directory = tempDirectory;
+    public MinionOccupancyTests()
+    {
+        MinionOccupancy.Directory                            = tempDirectory;
+        MinionAppStatusReporter.IsMinionAppRunningOverride = () => false;
+    }
 
     public void Dispose()
     {
-        MinionOccupancy.Directory = originalDirectory;
+        MinionOccupancy.Directory                            = originalDirectory;
+        MinionAppStatusReporter.IsMinionAppRunningOverride = null;
 
         if (Directory.Exists(tempDirectory))
             Directory.Delete(tempDirectory, true);
@@ -101,8 +105,10 @@ public sealed class MinionOccupancyTests : IDisposable
             Assert.Equal("0123456789abcdef", record.CardFingerprint);
             Assert.Equal(UID, record.MinionUid);
             Assert.Equal("seAccount", record.AccountName);
+            Assert.Equal(ExpectedKeycodeMd5, record.KeycodeMd5);
 
             var json = await File.ReadAllTextAsync(MinionOccupancy.FilePath(game.Id));
+            Assert.Contains($"\"keycodeMd5\": \"{ExpectedKeycodeMd5}\"", json);
             Assert.DoesNotContain(KEYCODE, json);
             Assert.DoesNotContain(FORUM_PASSWORD, json);
             Assert.DoesNotContain(FORUM_ID, json);
@@ -142,10 +148,38 @@ public sealed class MinionOccupancyTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task Read_OldRecordWithoutKeycodeMd5_IsNull()
+    {
+        Directory.CreateDirectory(tempDirectory);
+        await File.WriteAllTextAsync
+        (
+            MinionOccupancy.FilePath(1234),
+            """
+            {
+              "pid": 1234,
+              "processStartedAt": "2026-10-01T00:00:00.000Z",
+              "cardFingerprint": "0123456789abcdef",
+              "variant": "cn",
+              "minionUid": "0123456789abcdef0123456789abcdef",
+              "attachedAt": "2026-10-01T00:00:05.000Z"
+            }
+            """
+        );
+
+        var record = MinionOccupancy.Read(1234)!;
+
+        Assert.Equal(UID, record.MinionUid);
+        Assert.Null(record.KeycodeMd5);
+    }
+
     private const string UID            = "0123456789abcdef0123456789abcdef";
     private const string KEYCODE        = "FFXIVXFAKE2222222222222222222222";
     private const string FORUM_ID       = "fake-forum-user";
     private const string FORUM_PASSWORD = "fake-forum-pass";
+
+    /// <summary>MD5(ASCII(KEYCODE)) 的小写十六进制</summary>
+    private static readonly string ExpectedKeycodeMd5 = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(System.Text.Encoding.ASCII.GetBytes(KEYCODE))).ToLowerInvariant();
 
     private static CatMinionLaunch Card(string variant) =>
         new("0123456789abcdef", variant, new CatSecret(KEYCODE), UID, FORUM_ID, new CatSecret(FORUM_PASSWORD));

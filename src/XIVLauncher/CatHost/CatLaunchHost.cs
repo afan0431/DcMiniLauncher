@@ -473,7 +473,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     }
 
     /// <summary>
-    ///     下号: 关掉崩溃重启 → 请游戏自己关闭（超时结束进程）→ game.exited → 本进程退出。
+    ///     下号: 关掉崩溃重启 → 请游戏自己关闭（超时结束进程）→ 补报 Minion 停机 → game.exited → 本进程退出。
     ///     还没 launch 时直接退出; 启动途中则取消启动（launch.failed{cancelled}）。重复调用无副作用。
     /// </summary>
     public CatAcceptResult Close(CatCloseParams? parameters)
@@ -805,6 +805,15 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         while (CatGameCloser.IsAlive(target, startedAt))
             await Task.Delay(GuardErrorPollInterval).ConfigureAwait(false);
+
+        try
+        {
+            MinionAppStatusReporter.ReportStopped(target);
+        }
+        catch (Exception reportError)
+        {
+            Serilog.Log.Warning(reportError, "[CatHost] 补报 Minion 停机失败");
+        }
 
         bool closed;
 

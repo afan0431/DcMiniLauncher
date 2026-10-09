@@ -99,6 +99,7 @@ public static class CatMinionReservations
                 Variant          = minion.Variant,
                 AccountName      = accountName,
                 MinionUid        = minion.Uid,
+                KeycodeMd5       = MinionAppStatusReporter.KeycodeMd5Hex(minion.Keycode.Reveal()),
                 AttachedAt       = DateTimeOffset.UtcNow
             }
         );
