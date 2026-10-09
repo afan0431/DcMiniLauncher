@@ -302,7 +302,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             "inject" => Task.FromResult<object?>(Inject(Deserialize<CatInjectParams>(parameters))),
             "status" => Task.FromResult<object?>(GetStatus()),
             "close"  => Task.FromResult<object?>(Close(Deserialize<CatCloseParams>(parameters))),
-            "handoff" => HandOffBoxedAsync(cancellationToken),
+            CatHandOff.METHOD => HandOffBoxedAsync(cancellationToken),
             "weGame.confirmSms" => Task.FromResult<object?>(ConfirmWeGameSms(Deserialize<CatWeGameConfirmSmsParams>(parameters))),
             "selectCharacter" => Task.FromResult<object?>(SelectCharacter(Deserialize<CatSelectCharacterParams>(parameters))),
             _        => throw new CatRpcException(CatRpcException.METHOD_NOT_FOUND, $"未知方法: {method}")
@@ -746,7 +746,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         }
 
         Serilog.Log.Information("[CatHost] 交接停止: 游戏 {Pid} 留给下一个守护进程接管, 本进程退出", gamePid);
-        Publish("game.handedOff", new { operationId = OperationId, pid = gamePid, processStartedAt = CatProtocol.FormatTimestamp(startedAt) });
+        Publish(CatHandOff.EVENT, new { operationId = OperationId, pid = gamePid, processStartedAt = CatProtocol.FormatTimestamp(startedAt) });
 
         // game.handedOff 是本进程关于这个游戏的最后一句话: 之后启动器里残留的动静（如游戏恰好崩了）一律不再发, 归接管的进程报
         handOffCommitted = true;
