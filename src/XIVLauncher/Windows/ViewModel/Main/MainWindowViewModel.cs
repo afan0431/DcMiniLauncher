@@ -182,7 +182,7 @@ internal partial class MainWindowViewModel : ObservableObject
         );
         GameUpdateMonitor = new GameUpdateMonitorService(this);
 
-        InjectionOptions = new InjectionOptionsViewModel(Settings, new DialogService(window));
+        InjectionOptions = new InjectionOptionsViewModel(Settings);
 
         DCTravelPage = new DCTravelViewModel
         (

@@ -61,7 +61,7 @@ public sealed class CatLaunchProcessTests(ITestOutputHelper output)
             var launch = await client.RequestAsync
             (
                 "launch",
-                new { operationId = "op-e2e", accountName = "sim-account", dalamud = true, minion = new { cardFingerprint = "0123456789abcdef", variant = "cn" } }
+                new { operationId = "op-e2e", accountName = "sim-account", dalamud = true, minion = new { cardFingerprint = "0123456789abcdef", variant = "cn", keycode = "FFXIVXFAKE3333333333", uid = "0123456789abcdef0123456789abcdef", forumId = "fake-forum-user", forumPassword = "fake-forum-pass" } }
             );
             output.WriteLine($"<= launch {launch["result"]!.ToJsonString()}");
             Assert.True(launch["result"]!["accepted"]!.GetValue<bool>());

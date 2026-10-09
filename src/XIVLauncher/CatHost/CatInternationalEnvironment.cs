@@ -51,29 +51,23 @@ public interface ICatInternationalDalamudSession
     void InjectGame(int gamePid);
 }
 
-/// <summary>国际服挂 Minion 用到的操作（真实实现走与国服相同的选行、预占、挂载、停机补报）</summary>
+/// <summary>国际服挂 Minion 用到的操作（真实实现与国服共用检查、预占和占用判断, 见 <see cref="CatMinionReservations" />）</summary>
 public interface ICatInternationalMinion
 {
-    /// <summary>按请求里的卡选国际服行; 选不出时返回 null 并给出失败码与消息</summary>
-    MinionAccount? SelectRow(CatLaunchRequest request, ICatLaunchReporter reporter, int? selfPid, out (string Code, string Message) error);
+    /// <summary>起游戏前检查本机能不能挂请求里的卡; 能挂返回 null, 否则给出失败码与消息</summary>
+    (string Code, string Message)? Check(CatLaunchRequest request);
 
-    /// <summary>加跨进程锁选行并为这个游戏写预占记录</summary>
-    Task<(MinionAccount? Row, (string Code, string Message) Error, bool Reserved)> ReserveRowAsync(CatLaunchRequest request, Process process, ICatLaunchReporter reporter);
+    /// <summary>加跨进程锁检查这张卡没挂在本机别的游戏上, 并为这个游戏写预占记录</summary>
+    Task<((string Code, string Message)? Error, bool Reserved)> ReserveAsync(CatLaunchRequest request, Process process);
 
-    /// <summary>这一行挂载时会用到的敏感值（卡密、Minion 密码）, 供登记脱敏</summary>
-    IEnumerable<string?> SecretsOf(MinionAccount row);
-
-    /// <summary>挂载（国际服行）</summary>
-    Task<MinionAttachResult> AttachAsync(MinionAccount row, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken);
+    /// <summary>挂载（国际服）</summary>
+    Task<MinionAttachResult> AttachAsync(CatMinionLaunch minion, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken);
 
     /// <summary>撤掉预占</summary>
     void ReleaseReservation(int gamePid);
 
     /// <summary>占用记录里这个游戏进程是否已挂着 Minion</summary>
     bool IsAttached(Process process);
-
-    /// <summary>游戏退出后告诉 MINIONAPP 这一行停机了</summary>
-    void ReportStopped(int gamePid);
 }
 
 /// <summary>
@@ -304,138 +298,22 @@ internal sealed class CatInternationalRealEnvironment(Func<Task> ensureInitializ
 }
 
 /// <summary>
-///     国际服挂 Minion: 预占、占用判断、停机补报与国服（CatRealGameRunner）是同一套做法和同一把跨进程锁,
-///     区别是只认位于国际服游戏目录之下的行（<see cref="MinionCards.SelectInternationalRow" />）, 并按国际服行挂载（注入文件与 -path 见 <see cref="MinionAttacher" />）。
-///     这里是照国服那几段另写的一份, 没有去改国服启动器让两边共用 —— 国服路径正在生产使用, 保持它一行不动。
+///     国际服挂 Minion: 检查、预占、占用判断与国服是同一套（<see cref="CatMinionReservations" />）, 按国际服挂载（注入文件与 -path 见 <see cref="MinionAttacher" />）
 /// </summary>
 internal sealed class CatInternationalMinion : ICatInternationalMinion
 {
-    /// <summary>与国服启动器用同一把锁（CatRealGameRunner.MINION_SELECT_MUTEX_NAME）: 国服和国际服的号可能同时抢同一张卡</summary>
-    private const string MINION_SELECT_MUTEX_NAME = @"Local\DcMiniLauncher-MinionSelect";
+    public (string Code, string Message)? Check(CatLaunchRequest request) =>
+        CatMinionReservations.Check(request.MinionCard);
 
-    private static readonly TimeSpan MinionSelectMutexTimeout = TimeSpan.FromSeconds(30);
+    public Task<((string Code, string Message)? Error, bool Reserved)> ReserveAsync(CatLaunchRequest request, Process process) =>
+        CatMinionReservations.ReserveAsync(request.MinionCard, process, request.AccountName, CatInternationalGameRunner.SafeProcessStartedAt);
 
-    public MinionAccount? SelectRow(CatLaunchRequest request, ICatLaunchReporter reporter, int? selfPid, out (string Code, string Message) error)
-    {
-        error = default;
-
-        if (!request.Minion)
-        {
-            error = (CatCodes.MINION_NOT_CONFIGURED, "这次上号没有要求挂 Minion");
-            return null;
-        }
-
-        var installPath = MinionAccounts.InstallPath;
-
-        if (!MinionAccounts.IsLauncherPresent(installPath))
-        {
-            error = (CatCodes.MINION_NOT_CONFIGURED, $"找不到 {MinionAccounts.GetLauncherExePath(installPath)}, 请在 DcMiniLauncher「设置 → Minion」里指定安装目录");
-            return null;
-        }
-
-        if (string.IsNullOrWhiteSpace(App.Settings.MinionId) || string.IsNullOrWhiteSpace(App.Settings.MinionPassword))
-        {
-            error = (CatCodes.MINION_NOT_CONFIGURED, "DcMiniLauncher「设置 → Minion」里的 Minion 账号或密码没填");
-            return null;
-        }
-
-        IReadOnlyList<MinionAccount> rows;
-
-        try
-        {
-            rows = MinionAccounts.LoadAccounts(installPath);
-        }
-        catch (Exception ex)
-        {
-            error = (CatCodes.MINION_NOT_CONFIGURED, $"读取 Minion 账号文件失败: {ex.Message}");
-            return null;
-        }
-
-        var occupied = MinionOccupancy.ReadAllLive()
-                                      .Where(x => x.Pid != selfPid)
-                                      .Select(x => x.MinionUid)
-                                      .Where(uid => !string.IsNullOrWhiteSpace(uid))
-                                      .Select(uid => uid!.Trim())
-                                      .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        // 国际服行 = 游戏执行程序位于设置里的国际服游戏目录之下的行（不在国服目录下还不够, 韩服、繁中服的行也不在）
-        var selection = MinionCards.SelectInternationalRow
-        (
-            rows,
-            request.CardFingerprint!,
-            App.Settings.InternationalGamePath?.FullName,
-            MinionCards.ConfiguredCnGameRoots(),
-            occupied
-        );
-        var row = selection.Row;
-
-        Log.Information("[CatHost] 按卡 {Fingerprint} 选国际服行: {Notes}", request.CardFingerprint, string.Join(" | ", selection.Notes));
-
-        if (selection.AllOccupied)
-            reporter.Log("warning", $"卡 {request.CardFingerprint} 的国际服行都已挂在别的游戏上, 仍挂第一行, 可能把那边的 Minion 顶掉");
-
-        if (row == null)
-            error = (CatCodes.MINION_CARD_NOT_FOUND, $"这台电脑的 Minion 里找不到这张卡（{request.CardFingerprint}）给国际服用的那一行: 要在 Minion 里给这张卡加一行, 游戏程序选国际服游戏目录里的");
-
-        return row;
-    }
-
-    public async Task<(MinionAccount? Row, (string Code, string Message) Error, bool Reserved)> ReserveRowAsync(CatLaunchRequest request, Process process, ICatLaunchReporter reporter)
-    {
-        using var gate = await CrossProcessMutex.TryAcquireAsync(MINION_SELECT_MUTEX_NAME, MinionSelectMutexTimeout).ConfigureAwait(false);
-
-        var row = SelectRow(request, reporter, process.Id, out var error);
-
-        if (row == null)
-            return (null, error, false);
-
-        var startedAt = CatInternationalGameRunner.SafeProcessStartedAt(process);
-
-        // 这个游戏已有自己的记录（force 重挂）时不再写预占
-        if (MinionOccupancy.Read(process.Id) is { } existing && existing.ProcessStartedAt == startedAt)
-            return (row, default, false);
-
-        var reserved = !string.IsNullOrWhiteSpace(row.Keycode) &&
-                       MinionOccupancy.Write
-                       (
-                           new MinionOccupancyRecord
-                           {
-                               Pid              = process.Id,
-                               ProcessStartedAt = startedAt,
-                               CardFingerprint  = MinionCards.Fingerprint(row.Keycode),
-                               Variant          = MinionCards.VARIANT_GLOBAL,
-                               AccountName      = request.AccountName,
-                               MinionUid        = string.IsNullOrWhiteSpace(row.Uid) ? null : row.Uid.Trim(),
-                               AttachedAt       = DateTimeOffset.UtcNow
-                           }
-                       );
-
-        return (row, default, reserved);
-    }
-
-    public IEnumerable<string?> SecretsOf(MinionAccount row) =>
-        [row.Keycode, App.Settings.MinionPassword];
-
-    public Task<MinionAttachResult> AttachAsync(MinionAccount row, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken) =>
-        MinionAttacher.AttachAsync(row, process, gamePath, dalamudInjected, accountName, cancellationToken, MinionCards.VARIANT_GLOBAL);
+    public Task<MinionAttachResult> AttachAsync(CatMinionLaunch minion, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken) =>
+        MinionAttacher.AttachAsync(minion, process, gamePath, dalamudInjected, accountName, cancellationToken);
 
     public void ReleaseReservation(int gamePid) =>
         MinionOccupancy.Delete(gamePid);
 
-    public bool IsAttached(Process process)
-    {
-        try
-        {
-            return MinionOccupancy.Read(process.Id) is { } record &&
-                   record.ProcessStartedAt == MinionOccupancy.GetProcessStartedAt(process);
-        }
-        catch (Exception ex)
-        {
-            Log.Debug(ex, "[CatHost] 读取 Minion 占用记录失败");
-            return false;
-        }
-    }
-
-    public void ReportStopped(int gamePid) =>
-        MinionAppStatusReporter.ReportStopped(gamePid);
+    public bool IsAttached(Process process) =>
+        CatMinionReservations.IsAttached(process);
 }

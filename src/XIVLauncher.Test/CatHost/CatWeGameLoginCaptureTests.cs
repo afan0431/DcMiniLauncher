@@ -508,7 +508,7 @@ public sealed class CatWeGameLoginCaptureTests
         new(environment, store, redactor);
 
     private static CatLaunchRequest Request(bool weGameLogin) =>
-        new("op", REQUESTED, false, null, null, Platform: XIVAccountType.WeGame, WeGameLogin: weGameLogin);
+        new("op", REQUESTED, false, null, Platform: XIVAccountType.WeGame, WeGameLogin: weGameLogin);
 
     private Task<string> LoginOk(string token, CancellationToken cancellationToken)
     {

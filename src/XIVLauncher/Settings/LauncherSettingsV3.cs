@@ -255,33 +255,6 @@ public sealed class LauncherSettingsV3 : IAccountSettingsStore
     #region Minion 注入配置
 
     /// <summary>
-    ///     本次启动是否在游戏起来后挂 MinionLauncher（启动页每次现选）
-    /// </summary>
-    public bool MinionAttachEnabled
-    {
-        get;
-        set => Set(ref field, value);
-    }
-
-    /// <summary>
-    ///     本次启动使用的 Minion 分组，读自 Minion 的 Settings\Accounts.json（启动页每次现选）
-    /// </summary>
-    public string? MinionGroup
-    {
-        get;
-        set => Set(ref field, value);
-    }
-
-    /// <summary>
-    ///     本次启动使用的 Minion 账号，存 Accounts.json 里的 UID（一个分组下可能有多个账号，启动页每次现选）
-    /// </summary>
-    public string? MinionAccountUid
-    {
-        get;
-        set => Set(ref field, value);
-    }
-
-    /// <summary>
     ///     游戏窗口出现后, 等多久再挂 MinionLauncher（毫秒）。
     ///     Dalamud 是随进程创建注入的（entrypoint），Minion 只能事后 attach，两个都开时必须排在 Dalamud 之后，
     ///     故实际等待还会取 <see cref="DalamudInjectionDelayMS" /> + 一段间隔的较大者，见 <c>MinionAttacher</c>。
@@ -293,28 +266,9 @@ public sealed class LauncherSettingsV3 : IAccountSettingsStore
     } = 5000;
 
     /// <summary>
-    ///     Minion 安装目录，空则用 <see cref="Minion.MinionAccounts.DEFAULT_INSTALL_PATH" />（配置一次）
+    ///     Minion 安装目录，空则自动查找（见 <see cref="Minion.MinionInstall.InstallPath" />）
     /// </summary>
     public string? MinionInstallPath
-    {
-        get;
-        set => Set(ref field, value);
-    }
-
-    /// <summary>
-    ///     Minion 账号密码，明文 —— MinionLauncher 的 <c>-minionpass</c> 只接受明文，
-    ///     传 Accounts.json 里加密的 KeyPassword 会注入成功但 bot 不运行（配置一次）
-    /// </summary>
-    public string? MinionPassword
-    {
-        get;
-        set => Set(ref field, value);
-    }
-
-    /// <summary>
-    ///     Minion 论坛账号，对应 <c>-minionid</c>，不在 Accounts.json 里（配置一次）
-    /// </summary>
-    public string? MinionId
     {
         get;
         set => Set(ref field, value);
@@ -602,7 +556,9 @@ public sealed class LauncherSettingsV3 : IAccountSettingsStore
             settings = JsonSerializer.Deserialize<LauncherSettingsV3>(json, JsonOptions) ?? new LauncherSettingsV3();
             var migrated = settings.MigrateWeGamePath();
             settings.Attach(attachPath);
-            if (migrated)
+            if (HasRemovedFields(json))
+                settings.PurgeRemovedFields();
+            else if (migrated)
                 settings.Save();
             return true;
         }
@@ -610,6 +566,54 @@ public sealed class LauncherSettingsV3 : IAccountSettingsStore
         {
             exception = ex;
             return false;
+        }
+    }
+
+    /// <summary>
+    ///     已删除、不再保存的设置项（界面版挂 Minion 时期的开关、分组、账号与明文论坛密码）
+    /// </summary>
+    private static readonly string[] RemovedFields = ["MinionAttachEnabled", "MinionGroup", "MinionAccountUid", "MinionId", "MinionPassword"];
+
+    /// <summary>
+    ///     配置文件里是否还留着已删除的设置项
+    /// </summary>
+    private static bool HasRemovedFields(string json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+
+            return document.RootElement.ValueKind == JsonValueKind.Object &&
+                   document.RootElement.EnumerateObject().Any(property => RemovedFields.Contains(property.Name, StringComparer.OrdinalIgnoreCase));
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    ///     立即重存一次, 让已删除的设置项（含明文论坛密码）离开配置文件; 备份文件同样换成重存后的内容。
+    ///     重存失败只记日志, 不影响这次加载
+    /// </summary>
+    private void PurgeRemovedFields()
+    {
+        if (string.IsNullOrWhiteSpace(configPath))
+            return;
+
+        try
+        {
+            SaveCore();
+
+            var backupPath = GetBackupPath(configPath!);
+            if (File.Exists(backupPath))
+                File.Copy(configPath!, backupPath, true);
+
+            Log.Information("已从启动器配置中移除不再使用的 Minion 设置项");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "移除不再使用的 Minion 设置项失败: {ConfigPath}", configPath);
         }
     }
 

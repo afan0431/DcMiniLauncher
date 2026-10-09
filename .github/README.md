@@ -3,8 +3,8 @@
 基于 [AtmoOmen/FFXIVQuickLauncher](https://github.com/AtmoOmen/FFXIVQuickLauncher)（XIVLauncherCN · 橙月版，`CN` 分支）的 fork，面向国服。
 在原版功能之上增加：
 
-- **启动时选注入**：启动页直接勾选本次注入 Dalamud / Minion / 都注 / 都不注，不用进设置。
-- **挂载 Minion**：游戏起来后按所选分组与账号自动挂载，时机排在 Dalamud 之后；与 MINIONAPP 同时运行不冲突。
+- **启动时选注入**：启动页直接勾选本次是否注入 Dalamud，不用进设置。
+- **挂载 Minion**：由 Cat 工作台上号时下发卡号与论坛账号，游戏起来后自动挂载，时机排在 Dalamud 之后；本机只需设置 Minion 安装目录（可留空自动查找）。
 - **游戏内超域旅行（不依赖 Dalamud）**：启动器向游戏注入一个极小的 native 模块，在游戏内完成超域旅行 / 超域返回 / 换登录大区，客户端全程不重启。
   启动器的超域传送页面和本机 HTTP 接口都能触发。
 

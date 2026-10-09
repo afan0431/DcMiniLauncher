@@ -167,7 +167,7 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
     #region 准备
 
     /// <summary>
-    ///     不用登录就能查的都先查: 设置、账号名、游戏目录、Minion 行、杀开关、boot 版本、登录服务是否开放。返回后面登录要用的客户端。
+    ///     不用登录就能查的都先查: 设置、账号名、游戏目录、Minion 安装目录、杀开关、boot 版本、登录服务是否开放。返回后面登录要用的客户端。
     /// </summary>
     private async Task<ICatInternationalLoginClient> PrepareAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
@@ -212,8 +212,9 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
 
         if (request.Minion)
         {
-            // 起游戏前先确认这张卡在本机有对应的国际服行; 真正选哪一行在挂载前加锁再选并预占
-            _ = environment.Minion.SelectRow(request, reporter, null, out var minionError) ?? throw new CatLaunchException(minionError.Code, minionError.Message);
+            // 起游戏前先确认本机能挂 Minion; 占用检查与预占在挂载前加锁再做
+            if (environment.Minion.Check(request) is { } minionError)
+                throw new CatLaunchException(minionError.Code, minionError.Message);
         }
 
         var config = await environment.GetClientConfigAsync(cancellationToken).ConfigureAwait(false);
@@ -458,7 +459,7 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
     }
 
     /// <summary>
-    ///     游戏起来后出了意外异常: 照样等游戏结束、补报 Minion 停机, 再发 game.exited。期间 close 仍可用。
+    ///     游戏起来后出了意外异常: 照样等游戏结束再发 game.exited。期间 close 仍可用。
     /// </summary>
     private async Task<int> GuardAfterErrorAsync(Exception exception, ICatLaunchReporter reporter)
     {
@@ -492,16 +493,6 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
             return;
 
         Log.Information("[CatHost] 国际服游戏进程已退出 (PID={ProcessID}, ExitCode=0x{ExitCode:X8})", process.Id, (uint)(TryGetExitCode(process) ?? 0));
-
-        try
-        {
-            // 告诉 MINIONAPP 这一行停机了, 否则它会过一分钟自己拉个新客户端
-            environment.Minion.ReportStopped(process.Id);
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "[CatHost] 补报 Minion 停机失败");
-        }
     }
 
     #endregion
@@ -548,22 +539,23 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
         reporter.Stage(CatStages.ATTACHING_MINION);
 
         var minion = environment.Minion;
-        var (minionRow, error, reserved) = await minion.ReserveRowAsync(request, process, reporter).ConfigureAwait(false);
+        var (error, reserved) = await minion.ReserveAsync(request, process).ConfigureAwait(false);
 
-        if (minionRow == null)
+        if (error is { } failure)
         {
-            reporter.Agent(CatAgentKinds.MINION, false, error.Code, error.Message);
+            reporter.Agent(CatAgentKinds.MINION, false, failure.Code, failure.Message);
             return;
         }
 
-        foreach (var secret in minion.SecretsOf(minionRow))
-            redactor.Register(secret);
+        // 卡号和论坛密码在接受 launch 时已登记脱敏; 这里再登记一次, 不依赖调用方
+        redactor.RegisterSecret(request.MinionCard!.Keycode.Reveal());
+        redactor.RegisterSecret(request.MinionCard.ForumPassword.Reveal());
 
         var ok = false;
 
         try
         {
-            var result = await minion.AttachAsync(minionRow, process, gamePath, dalamudInjected, request.AccountName, cancellationToken).ConfigureAwait(false);
+            var result = await minion.AttachAsync(request.MinionCard, process, gamePath, dalamudInjected, request.AccountName, cancellationToken).ConfigureAwait(false);
             ok = result.Ok;
 
             if (IsCloseRequested)
@@ -583,7 +575,7 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
         }
         finally
         {
-            // 没挂上就撤掉预占, 别让这一行一直显示被占用
+            // 没挂上就撤掉预占, 别让这张卡一直显示被占用
             if (reserved && !ok)
                 minion.ReleaseReservation(process.Id);
         }

@@ -23,8 +23,7 @@ public sealed record MinionOccupancyRecord
     public string? AccountName { get; init; }
 
     /// <summary>
-    ///     Minion Accounts.json 里这一行的 UID（32 位十六进制）。游戏退出时按它给 MINIONAPP 报「停机」,
-    ///     挂载它的启动器已不在时由下一次清理或外壳补报。
+    ///     挂上的这张卡在这个 variant 下的 Minion 编号（<c>-uid</c>, 32 位十六进制）。同一编号同一时间只挂在一个游戏上
     /// </summary>
     public string? MinionUid { get; init; }
 
@@ -33,7 +32,7 @@ public sealed record MinionOccupancyRecord
 
 /// <summary>
 ///     在 <c>%ProgramData%\DcMiniLauncher\minion-&lt;pid&gt;.json</c> 记录 Minion 占用, 游戏进程退出时删除。
-///     界面启动和无界面启动挂 Minion 都经过 <see cref="MinionAttacher" />, 两种都会写。
+///     无界面启动挂 Minion 经过 <see cref="MinionAttacher" /> 时写。
 /// </summary>
 public static class MinionOccupancy
 {
@@ -133,7 +132,7 @@ public static class MinionOccupancy
     }
 
     /// <summary>
-    ///     写入记录, 游戏进程退出时给 MINIONAPP 报「停机」并删除记录
+    ///     写入记录, 游戏进程退出时删除记录
     /// </summary>
     public static void WriteAndDeleteOnExit(MinionOccupancyRecord record, Process gameProcess)
     {
@@ -156,41 +155,25 @@ public static class MinionOccupancy
                 if (Read(record.Pid) is { } current && current.ProcessStartedAt != TruncateToMilliseconds(record.ProcessStartedAt))
                     return;
 
-                MinionAppStatusReporter.ReportStopped(record.Pid, record.MinionUid);
                 Delete(record.Pid);
             }
         );
     }
 
     /// <summary>
-    ///     清掉进程已不在（或进程号已被别的进程复用）的残留记录。
-    ///     记录里有 Minion 行 UID、且这一行没有挂在别的活着的游戏上时, 先给 MINIONAPP 补报「停机」——
-    ///     挂它的启动器已经不在了, 不补报的话 MINIONAPP 会过一分钟自己把客户端拉起来。
+    ///     清掉进程已不在（或进程号已被别的进程复用）的残留记录
     /// </summary>
     public static void PruneStale()
     {
-        var records = ReadAll();
-        var stale   = records.Where(x => !IsSameProcessAlive(x.Pid, x.Record?.ProcessStartedAt)).ToList();
-
-        if (stale.Count == 0)
-            return;
-
-        var liveUids = records.Except(stale)
-                              .Select(x => x.Record?.MinionUid)
-                              .Where(uid => !string.IsNullOrWhiteSpace(uid))
-                              .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var (pid, record) in stale)
+        foreach (var (pid, record) in ReadAll())
         {
-            if (record?.MinionUid is { } uid && !liveUids.Contains(uid))
-                MinionAppStatusReporter.ReportStopped(pid, uid);
-
-            Delete(pid);
+            if (!IsSameProcessAlive(pid, record?.ProcessStartedAt))
+                Delete(pid);
         }
     }
 
     /// <summary>
-    ///     这个 Minion 行 UID 是否还挂在除 <paramref name="exceptPid" /> 以外的活着的游戏上
+    ///     这个 Minion 编号是否还挂在除 <paramref name="exceptPid" /> 以外的活着的游戏上
     /// </summary>
     public static bool IsUidAttachedElsewhere(string uid, int exceptPid) =>
         ReadAllLive().Any(x => x.Pid != exceptPid && string.Equals(x.MinionUid?.Trim(), uid.Trim(), StringComparison.OrdinalIgnoreCase));

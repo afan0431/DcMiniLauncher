@@ -3,9 +3,9 @@ using Serilog;
 namespace XIVLauncher.Update;
 
 /// <summary>
-///     界面版启动器守着游戏（等它退出, 好给 MINIONAPP 报「停机」、清占用记录、处理崩溃重启）期间持有一个命名互斥量;
-///     别的启动器据此不应用更新 —— 更新会结束安装目录下的所有进程, 守护一断, 游戏退出时就没人报「停机」,
-///     MINIONAPP 会过一分钟自己把客户端拉起来。无界面启动的同类标记见 <see cref="XIVLauncher.CatHost.CatHostPresence" />。
+///     界面版启动器守着游戏（等它退出, 好清占用记录、处理崩溃重启）期间持有一个命名互斥量;
+///     别的启动器据此不应用更新 —— 更新会结束安装目录下的所有进程, 守护一断, 崩溃就没人重启。
+///     无界面启动的同类标记见 <see cref="XIVLauncher.CatHost.CatHostPresence" />。
 ///     多个启动器各自打开同一个互斥量对象, 只持有句柄、不加锁, 最后一个放手后对象自动消失。
 /// </summary>
 public static class GameGuardPresence

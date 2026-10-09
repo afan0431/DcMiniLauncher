@@ -26,6 +26,10 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     private const string PASSWORD  = "Pw-国际服-7731!";
     private const string UNIQUE_ID = "uid9876543210fedcba9876543210fedcba";
     private const string CARD      = "0123456789abcdef";
+    private const string KEYCODE   = "FFXIVXFAKE1111111111111111111111";
+    private const string MINION_ID = "0123456789abcdef0123456789abcdef";
+    private const string FORUM_ID  = "fake-forum-user";
+    private const string FORUM_PW  = "fake-forum-pass!7";
 
     private readonly FakeGameDirectory game = new();
     private readonly FakeEnvironment   environment;
@@ -53,8 +57,7 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
             "op-intl",
             account,
             dalamud,
-            minion ? CARD : null,
-            minion ? MinionCards.VARIANT_GLOBAL : null,
+            minion ? new CatMinionLaunch(CARD, MinionCards.VARIANT_GLOBAL, new CatSecret(KEYCODE), MINION_ID, FORUM_ID, new CatSecret(FORUM_PW)) : null,
             IsInternational: true,
             Password: password == null ? null : new CatSecret(password)
         );
@@ -80,6 +83,8 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         {
             Assert.DoesNotContain(PASSWORD, message);
             Assert.DoesNotContain(UNIQUE_ID, message);
+            Assert.DoesNotContain(KEYCODE, message);
+            Assert.DoesNotContain(FORUM_PW, message);
 
             // 给员工看的话不出现内部词
             foreach (var word in new[] { "令牌", "凭证", "sid", "unique id", "UniqueId", "_STORED_" })
@@ -139,13 +144,13 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     }
 
     [Fact]
-    public async Task MinionRowMissing_FailsBeforeLogin()
+    public async Task MinionNotConfigured_FailsBeforeLogin()
     {
-        environment.FakeMinion.SelectError = (CatCodes.MINION_CARD_NOT_FOUND, "本机找不到这张卡的国际服注入行");
+        environment.FakeMinion.CheckError = (CatCodes.MINION_NOT_CONFIGURED, "找不到 Minion 安装目录");
 
         await RunToFailureAsync(Request(minion: true));
 
-        AssertFailed(CatCodes.MINION_CARD_NOT_FOUND);
+        AssertFailed(CatCodes.MINION_NOT_CONFIGURED);
         Assert.Empty(environment.Calls);
     }
 
@@ -404,8 +409,15 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         Assert.Equal(DPIAwareness.Unaware, start.DpiAwareness);
         Assert.True(environment.StartedWithDalamud);
 
-        // Minion 按国际服行挂在这个游戏上
+        // Minion 按国际服挂在这个游戏上, 用的是 launch 带来的卡号、编号和论坛账号
         Assert.Equal((environment.GameProcess!.Id, game.Root.FullName, true, ACCOUNT), environment.FakeMinion.Attached);
+        var attachedCard = environment.FakeMinion.AttachedCard!;
+        Assert.Equal(MinionCards.VARIANT_GLOBAL, attachedCard.Variant);
+        Assert.Equal(CARD, attachedCard.Fingerprint);
+        Assert.Equal(MINION_ID, attachedCard.Uid);
+        Assert.Equal(KEYCODE, attachedCard.Keycode.Reveal());
+        Assert.Equal(FORUM_ID, attachedCard.ForumId);
+        Assert.Equal(FORUM_PW, attachedCard.ForumPassword.Reveal());
 
         environment.KillGame();
         Assert.Equal(CatHostRuntime.EXIT_OK, await run.WaitAsync(Timeout));
@@ -427,12 +439,16 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
             reporter.Entries
         );
         Assert.Equal(["config", "boot", "loginStatus", "login", "gate", "dalamud", "start"], environment.Calls);
-        Assert.Equal([environment.GameProcess.Id], environment.FakeMinion.ReportedStopped);
         Assert.True(environment.Login.Disposed);
 
         AssertNothingSensitive();
         Assert.DoesNotContain(PASSWORD, logs.All);
         Assert.DoesNotContain(UNIQUE_ID, logs.All);
+        Assert.DoesNotContain(KEYCODE, logs.All);
+        Assert.DoesNotContain(FORUM_PW, logs.All);
+
+        // 卡号和论坛密码已登记脱敏
+        Assert.Equal("*** ***", redactor.Redact($"{KEYCODE} {FORUM_PW}"));
     }
 
     [Fact]
@@ -516,14 +532,14 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     }
 
     [Fact]
-    public async Task MinionRowGoneAtAttachTime_ReportsItsCode_AndGameKeepsRunning()
+    public async Task MinionCardBusyAtAttachTime_ReportsAlreadyAttached_AndGameKeepsRunning()
     {
-        environment.FakeMinion.ReserveError = (CatCodes.MINION_CARD_NOT_FOUND, "行没了");
+        environment.FakeMinion.ReserveError = (CatCodes.ALREADY_ATTACHED, "这张卡已挂在这台电脑的另一个游戏上");
         var run = NewRunner().RunAsync(Request(minion: true), reporter, CancellationToken.None);
 
         await reporter.Running.Task.WaitAsync(Timeout);
 
-        Assert.Contains($"agent:minion:{CatCodes.MINION_CARD_NOT_FOUND}", reporter.Entries);
+        Assert.Contains($"agent:minion:{CatCodes.ALREADY_ATTACHED}", reporter.Entries);
         Assert.Null(environment.FakeMinion.Attached);
 
         environment.KillGame();
@@ -854,9 +870,7 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
 
     private sealed class FakeMinionOps : ICatInternationalMinion
     {
-        private static readonly MinionAccount Row = new() { Uid = "uid-global", Keycode = "FAKEKEY0123456789FAKEKEY0123456789", PathToExe = @"D:\FFXIV\game\ffxiv_dx11.exe" };
-
-        public (string Code, string Message)? SelectError { get; set; }
+        public (string Code, string Message)? CheckError { get; set; }
 
         public (string Code, string Message)? ReserveError { get; set; }
 
@@ -864,37 +878,30 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
 
         public (int Pid, string GamePath, bool DalamudInjected, string AccountName)? Attached { get; private set; }
 
+        public CatMinionLaunch? AttachedCard { get; private set; }
+
         public int AttachCount { get; set; }
 
         public bool IsAttachedResult { get; set; }
 
         public List<int> Released { get; } = [];
 
-        public List<int> ReportedStopped { get; } = [];
+        public (string Code, string Message)? Check(CatLaunchRequest request) => CheckError;
 
-        public MinionAccount? SelectRow(CatLaunchRequest request, ICatLaunchReporter reporter, int? selfPid, out (string Code, string Message) error)
-        {
-            error = SelectError ?? default;
-            return SelectError == null ? Row : null;
-        }
+        public Task<((string Code, string Message)? Error, bool Reserved)> ReserveAsync(CatLaunchRequest request, Process process) =>
+            Task.FromResult<((string Code, string Message)?, bool)>(ReserveError == null ? (null, true) : (ReserveError, false));
 
-        public Task<(MinionAccount? Row, (string Code, string Message) Error, bool Reserved)> ReserveRowAsync(CatLaunchRequest request, Process process, ICatLaunchReporter reporter) =>
-            Task.FromResult<(MinionAccount?, (string, string), bool)>(ReserveError == null ? (Row, default, true) : (null, ReserveError.Value, false));
-
-        public IEnumerable<string?> SecretsOf(MinionAccount row) => [row.Keycode, "fake-minion-password"];
-
-        public Task<MinionAttachResult> AttachAsync(MinionAccount row, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken)
+        public Task<MinionAttachResult> AttachAsync(CatMinionLaunch minion, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken)
         {
             AttachCount++;
-            Attached = (process.Id, gamePath.FullName, dalamudInjected, accountName);
+            Attached     = (process.Id, gamePath.FullName, dalamudInjected, accountName);
+            AttachedCard = minion;
             return Task.FromResult(AttachResult);
         }
 
         public void ReleaseReservation(int gamePid) => Released.Add(gamePid);
 
         public bool IsAttached(Process process) => IsAttachedResult;
-
-        public void ReportStopped(int gamePid) => ReportedStopped.Add(gamePid);
     }
 
     #endregion

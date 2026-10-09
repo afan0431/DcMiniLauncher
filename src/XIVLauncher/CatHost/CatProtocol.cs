@@ -160,11 +160,8 @@ public static class CatCodes
     /// <summary>Dalamud 不可用</summary>
     public const string DALAMUD_UNAVAILABLE = "dalamudUnavailable";
 
-    /// <summary>Minion 安装目录、账号或密码未配置</summary>
+    /// <summary>Minion 未配置: 本机找不到 Minion 安装目录, 或 launch 没带卡号、论坛账号、论坛密码</summary>
     public const string MINION_NOT_CONFIGURED = "minionNotConfigured";
-
-    /// <summary>本机 Accounts.json 里找不到对应的卡</summary>
-    public const string MINION_CARD_NOT_FOUND = "minionCardNotFound";
 
     /// <summary>其它启动失败</summary>
     public const string LAUNCH_FAILED = "launchFailed";
@@ -193,7 +190,7 @@ public static class CatCodes
     /// <summary>上一次补注入还没结束</summary>
     public const string BUSY = "busy";
 
-    /// <summary>这张卡已挂在当前游戏上, 没有重复挂</summary>
+    /// <summary>这张卡已挂在当前游戏上, 没有重复挂; 或这张卡的这个编号已挂在本机别的游戏上, 没有挂</summary>
     public const string ALREADY_ATTACHED = "alreadyAttached";
 
     /// <summary>已收到 close, 不再接受 launch</summary>
@@ -342,8 +339,26 @@ public sealed record CatHelloParams(string? Token);
 /// <summary>hello 返回</summary>
 public sealed record CatHelloResult(string ProtocolVersion, string LauncherVersion);
 
-/// <summary>launch 里的 Minion 参数</summary>
-public sealed record CatMinionParams(string? CardFingerprint, string? Variant);
+/// <summary>
+///     launch 里的 Minion 参数: cardFingerprint = 卡指纹; variant = cn / global; keycode = 卡号;
+///     uid = 这张卡在这个 variant 下的 Minion 编号（-uid, 32 位十六进制）; forumId / forumPassword = Minion 论坛账号与密码
+/// </summary>
+public sealed record CatMinionParams
+(
+    string? CardFingerprint,
+    string? Variant,
+    string? Keycode       = null,
+    string? Uid           = null,
+    string? ForumId       = null,
+    string? ForumPassword = null
+)
+{
+    /// <summary>
+    ///     record 自动生成的 ToString 会打印所有成员, 这里只打印指纹和 variant, 卡号、编号、论坛账号和密码都不打印
+    /// </summary>
+    public override string ToString() =>
+        $"CatMinionParams {{ CardFingerprint = {CardFingerprint}, Variant = {Variant}, Keycode = ***, Uid = ***, ForumId = ***, ForumPassword = *** }}";
+}
 
 /// <summary>
 ///     launch 里的目标角色: name = 角色名, homeWorld = 原始服务器（Cat 的服务器枚举名, 如 LaNuoXiYa; 也认中文名）; 都可以不带

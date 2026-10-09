@@ -34,7 +34,7 @@ internal class UpdateOrchestrator
     internal const string GAME_GUARDED_MESSAGE = "有启动器正守着运行中的游戏, 本次先不更新启动器, 稍后再更新";
 
     /// <summary>
-    ///     有界面版启动器正守着游戏时同样不应用更新: 守护进程被结束后, 游戏退出时没人给 MINIONAPP 报「停机」
+    ///     有界面版启动器正守着游戏时同样不应用更新: 守护进程被结束后, 崩溃就没人重启
     /// </summary>
     internal static Func<bool> IsGameGuarded { get; set; } = GameGuardPresence.IsAnyRunning;
 

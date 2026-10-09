@@ -8,6 +8,9 @@ public sealed class CatSimulatedGameRunnerTests
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(15);
 
+    private static CatMinionLaunch Card(string fingerprint, string variant) =>
+        new(fingerprint, variant, new CatSecret("FFXIVXFAKE0000000000"), "0123456789abcdef0123456789abcdef", "fake-forum-user", new CatSecret("fake-forum-pass"));
+
     private readonly CatSimulatedGameRunner runner = new()
     {
         StepDelay          = TimeSpan.FromMilliseconds(10),
@@ -20,7 +23,7 @@ public sealed class CatSimulatedGameRunnerTests
     public async Task Run_EmitsEventsInRealOrder_AndExitsWhenPlaceholderIsKilled()
     {
         var reporter = new RecordingReporter();
-        var run      = runner.RunAsync(new CatLaunchRequest("op", "acc", true, "0123456789abcdef", "cn"), reporter, CancellationToken.None);
+        var run      = runner.RunAsync(new CatLaunchRequest("op", "acc", true, Card("0123456789abcdef", "cn")), reporter, CancellationToken.None);
 
         await reporter.Running.Task.WaitAsync(Timeout);
         Assert.False(run.IsCompleted);
@@ -51,7 +54,7 @@ public sealed class CatSimulatedGameRunnerTests
     public async Task Run_WithoutAgents_SkipsInjectionStages()
     {
         var reporter = new RecordingReporter();
-        var run      = runner.RunAsync(new CatLaunchRequest("op", "acc", false, null, null), reporter, CancellationToken.None);
+        var run      = runner.RunAsync(new CatLaunchRequest("op", "acc", false, null), reporter, CancellationToken.None);
 
         await reporter.Running.Task.WaitAsync(Timeout);
 
@@ -68,7 +71,7 @@ public sealed class CatSimulatedGameRunnerTests
         var reporter = new RecordingReporter();
         var run = runner.RunAsync
         (
-            new CatLaunchRequest("op", "acc", false, null, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame),
+            new CatLaunchRequest("op", "acc", false, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame),
             reporter,
             CancellationToken.None
         );
@@ -88,7 +91,7 @@ public sealed class CatSimulatedGameRunnerTests
         var reporter = new RecordingReporter();
         var run = runner.RunAsync
         (
-            new CatLaunchRequest("op", "acc", false, null, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true),
+            new CatLaunchRequest("op", "acc", false, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true),
             reporter,
             CancellationToken.None
         );
@@ -113,7 +116,7 @@ public sealed class CatSimulatedGameRunnerTests
         var reporter = new RecordingReporter();
         var run = waiting.RunAsync
         (
-            new CatLaunchRequest("op", "acc", false, null, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true),
+            new CatLaunchRequest("op", "acc", false, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true),
             reporter,
             CancellationToken.None
         );
@@ -245,7 +248,7 @@ public sealed class CatSimulatedGameRunnerTests
         var reporter = new RecordingReporter();
         var run = runner.RunAsync
         (
-            new CatLaunchRequest("op", "sms:acc", false, null, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true),
+            new CatLaunchRequest("op", "sms:acc", false, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true),
             reporter,
             CancellationToken.None
         );
@@ -264,7 +267,7 @@ public sealed class CatSimulatedGameRunnerTests
     }
 
     private static CatLaunchRequest WeGameScanRequest(string account, CatWeGameScan scan) =>
-        new("op", account, false, null, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true, WeGameScan: scan);
+        new("op", account, false, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true, WeGameScan: scan);
 
     [Fact]
     public async Task Run_International_EmitsSameEventsAsShengqu_AndNeverPrintsPassword()
@@ -273,7 +276,7 @@ public sealed class CatSimulatedGameRunnerTests
         var reporter = new RecordingReporter();
         var run = runner.RunAsync
         (
-            new CatLaunchRequest("op", "seAccount", true, "0123456789abcdef", "global", IsInternational: true, Password: new CatSecret(PASSWORD)),
+            new CatLaunchRequest("op", "seAccount", true, Card("0123456789abcdef", "global"), IsInternational: true, Password: new CatSecret(PASSWORD)),
             reporter,
             CancellationToken.None
         );
@@ -305,20 +308,20 @@ public sealed class CatSimulatedGameRunnerTests
     }
 
     [Fact]
-    public async Task Run_MissingCard_FailsWithMinionCardNotFound_BeforeStarting()
+    public async Task Run_MissingCard_FailsWithMinionNotConfigured_BeforeStarting()
     {
         var reporter = new RecordingReporter();
 
         var exitCode = await runner.RunAsync
                                    (
-                                       new CatLaunchRequest("op", "acc", false, CatSimulatedGameRunner.MISSING_CARD_FINGERPRINT, "cn"),
+                                       new CatLaunchRequest("op", "acc", false, Card(CatSimulatedGameRunner.MISSING_CARD_FINGERPRINT, "cn")),
                                        reporter,
                                        CancellationToken.None
                                    )
                                    .WaitAsync(Timeout);
 
         Assert.Equal(CatLaunchHost.EXIT_LAUNCH_FAILED, exitCode);
-        Assert.Equal(["stage:preparing", "failed:minionCardNotFound"], reporter.Entries);
+        Assert.Equal(["stage:preparing", "failed:minionNotConfigured"], reporter.Entries);
     }
 
     [Fact]
@@ -326,7 +329,7 @@ public sealed class CatSimulatedGameRunnerTests
     {
         var reporter = new RecordingReporter();
 
-        await runner.RunAsync(new CatLaunchRequest("op", "fail:authorizationRequired", true, null, null), reporter, CancellationToken.None).WaitAsync(Timeout);
+        await runner.RunAsync(new CatLaunchRequest("op", "fail:authorizationRequired", true, null), reporter, CancellationToken.None).WaitAsync(Timeout);
 
         Assert.Equal(["stage:preparing", "failed:authorizationRequired"], reporter.Entries);
     }
@@ -336,7 +339,7 @@ public sealed class CatSimulatedGameRunnerTests
     {
         var reporter = new RecordingReporter();
 
-        var exitCode = await runner.RunAsync(new CatLaunchRequest("op", "netfail", true, null, null), reporter, CancellationToken.None).WaitAsync(Timeout);
+        var exitCode = await runner.RunAsync(new CatLaunchRequest("op", "netfail", true, null), reporter, CancellationToken.None).WaitAsync(Timeout);
 
         Assert.Equal(CatLaunchHost.EXIT_LAUNCH_FAILED, exitCode);
         Assert.Equal(["stage:preparing", "failed:networkError"], reporter.Entries);
@@ -348,7 +351,7 @@ public sealed class CatSimulatedGameRunnerTests
     public async Task Run_AgentFail_ReportsAgentFailure_AndKeepsRunning(string kind, string expected)
     {
         var reporter = new RecordingReporter();
-        var run      = runner.RunAsync(new CatLaunchRequest("op", $"agentfail:{kind}", true, "0123456789abcdef", "cn"), reporter, CancellationToken.None);
+        var run      = runner.RunAsync(new CatLaunchRequest("op", $"agentfail:{kind}", true, Card("0123456789abcdef", "cn")), reporter, CancellationToken.None);
 
         await reporter.Running.Task.WaitAsync(Timeout);
         Assert.Contains(expected, reporter.Entries);
@@ -362,7 +365,7 @@ public sealed class CatSimulatedGameRunnerTests
     public async Task Run_CrashRestart_EmitsRestartedWithNewPid_ThenAgentsAgain()
     {
         var reporter = new RecordingReporter();
-        var run      = runner.RunAsync(new CatLaunchRequest("op", "crash:restart", true, null, null), reporter, CancellationToken.None);
+        var run      = runner.RunAsync(new CatLaunchRequest("op", "crash:restart", true, null), reporter, CancellationToken.None);
 
         await reporter.Restart.Task.WaitAsync(Timeout);
         await WaitUntilAsync(() => reporter.Entries.Count(x => x == "stage:running") == 2);
@@ -380,7 +383,7 @@ public sealed class CatSimulatedGameRunnerTests
     {
         var reporter = new RecordingReporter();
 
-        var exitCode = await runner.RunAsync(new CatLaunchRequest("op", "crash:dialog", true, null, null), reporter, CancellationToken.None).WaitAsync(Timeout);
+        var exitCode = await runner.RunAsync(new CatLaunchRequest("op", "crash:dialog", true, null), reporter, CancellationToken.None).WaitAsync(Timeout);
 
         Assert.Equal(0, exitCode);
         Assert.Equal(["crashed", "exited:crashDialogTimeout"], reporter.Entries.TakeLast(2));
@@ -391,7 +394,7 @@ public sealed class CatSimulatedGameRunnerTests
     public async Task Close_WhileRunning_ExitsWithReasonClosed()
     {
         var reporter = new RecordingReporter();
-        var run      = runner.RunAsync(new CatLaunchRequest("op", "acc", false, null, null), reporter, CancellationToken.None);
+        var run      = runner.RunAsync(new CatLaunchRequest("op", "acc", false, null), reporter, CancellationToken.None);
 
         await reporter.Running.Task.WaitAsync(Timeout);
         await runner.CloseAsync(TimeSpan.FromSeconds(1));
@@ -405,7 +408,7 @@ public sealed class CatSimulatedGameRunnerTests
     {
         var slow     = new CatSimulatedGameRunner { StepDelay = TimeSpan.FromSeconds(5) };
         var reporter = new RecordingReporter();
-        var run      = slow.RunAsync(new CatLaunchRequest("op", "acc", true, null, null), reporter, CancellationToken.None);
+        var run      = slow.RunAsync(new CatLaunchRequest("op", "acc", true, null), reporter, CancellationToken.None);
 
         await WaitUntilAsync(() => reporter.Entries.Contains("stage:preparing"));
         await slow.CloseAsync(TimeSpan.Zero);
@@ -416,7 +419,7 @@ public sealed class CatSimulatedGameRunnerTests
     }
 
     private static CatLaunchRequest AutoEnterRequest(string account, bool minion = false, string? character = null, string? homeWorld = null) =>
-        new("op", account, false, minion ? "0123456789abcdef" : null, minion ? "cn" : null, AutoEnter: true, CharacterName: character, CharacterHomeWorld: homeWorld);
+        new("op", account, false, minion ? Card("0123456789abcdef", "cn") : null, AutoEnter: true, CharacterName: character, CharacterHomeWorld: homeWorld);
 
     private async Task<string[]> RunAutoEnterUntilAsync(CatLaunchRequest request, RecordingReporter reporter, string lastEntry, Func<Task>? midway = null)
     {

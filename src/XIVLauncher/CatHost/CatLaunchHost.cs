@@ -7,7 +7,7 @@ using XIVLauncher.Minion;
 namespace XIVLauncher.CatHost;
 
 /// <summary>
-///     一次 launch 的参数（已校验）; WeGameLogin = WeGame 号在本机没有可用的登录信息时拉起 WeGame 等员工登录, 为 false 时直接报 authorizationRequired;
+///     一次 launch 的参数（已校验）; MinionCard = 要挂的 Minion 卡, 不挂为 null; WeGameLogin = WeGame 号在本机没有可用的登录信息时拉起 WeGame 等员工登录, 为 false 时直接报 authorizationRequired;
 ///     AutoEnter = 游戏起来后自动经标题、选角进入游戏; CharacterName / CharacterHomeWorld = 要登录的角色（可为空）
 /// </summary>
 public sealed record CatLaunchRequest
@@ -15,8 +15,7 @@ public sealed record CatLaunchRequest
     string         OperationId,
     string         AccountName,
     bool           Dalamud,
-    string?        CardFingerprint,
-    string?        Variant,
+    CatMinionLaunch? MinionCard,
     int            CrashDialogTimeoutSeconds = CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS,
     string?        AreaName                  = null,
     XIVAccountType Platform                  = XIVAccountType.Sdo,
@@ -39,7 +38,13 @@ public sealed record CatLaunchRequest
         IsInternational ? CatPlatform.International : IsWeGame ? CatPlatform.WeGame : CatPlatform.Shengqu;
 
     /// <summary>是否要挂 Minion</summary>
-    public bool Minion => CardFingerprint != null;
+    public bool Minion => MinionCard != null;
+
+    /// <summary>要挂的卡的指纹, 不挂为 null</summary>
+    public string? CardFingerprint => MinionCard?.Fingerprint;
+
+    /// <summary>要挂的卡的 variant, 不挂为 null</summary>
+    public string? Variant => MinionCard?.Variant;
 
     /// <summary>游戏已退出而崩溃处理器还开着时最多等多久</summary>
     public TimeSpan CrashDialogTimeout => TimeSpan.FromSeconds(CrashDialogTimeoutSeconds);
@@ -127,7 +132,7 @@ public interface ICatGameRunner
 
     /// <summary>
     ///     下号: 不再崩溃重启, 请游戏自己关闭, 超过 <paramref name="gracefulTimeout" /> 结束进程;
-    ///     游戏还没起来时取消启动。之后 <see cref="RunAsync" /> 照常收尾（补报 Minion 停机、发 game.exited 或 launch.failed）。
+    ///     游戏还没起来时取消启动。之后 <see cref="RunAsync" /> 照常收尾（发 game.exited 或 launch.failed）。
     /// </summary>
     Task CloseAsync(TimeSpan gracefulTimeout);
 
@@ -263,6 +268,50 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         };
 
     /// <summary>
+    ///     校验 launch 的 minion: 指纹、variant、编号格式不对报 invalidParams; 卡号、论坛账号、论坛密码缺任一项报 minionNotConfigured
+    ///     （缺值说明后台没有配置这张卡或论坛账号）。通过时返回 null 并给出要挂的卡。
+    /// </summary>
+    internal static CatAcceptResult? ValidateMinion(CatMinionParams minion, out CatMinionLaunch? card)
+    {
+        card = null;
+
+        if (!MinionCards.IsValidFingerprint(minion.CardFingerprint))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "minion.cardFingerprint 必须是 16 位小写十六进制");
+
+        if (!MinionCards.IsValidVariant(minion.Variant))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "minion.variant 只能是 cn 或 global");
+
+        List<string> missing = [];
+
+        if (string.IsNullOrWhiteSpace(minion.Keycode))
+            missing.Add("卡号");
+        if (string.IsNullOrWhiteSpace(minion.ForumId))
+            missing.Add("论坛账号");
+        if (string.IsNullOrEmpty(minion.ForumPassword))
+            missing.Add("论坛密码");
+
+        if (missing.Count > 0)
+            return CatAcceptResult.Rejected(CatCodes.MINION_NOT_CONFIGURED, $"上号请求里没有 Minion 的{string.Join("、", missing)}, 请在 Cat 工作台「设置 → Minion」里补上");
+
+        var uid = minion.Uid?.Trim();
+
+        if (!MinionCards.IsValidUid(uid))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "minion.uid 必须是 32 位十六进制");
+
+        card = new CatMinionLaunch
+        (
+            minion.CardFingerprint!,
+            minion.Variant!,
+            new CatSecret(minion.Keycode!),
+            uid!,
+            minion.ForumId!.Trim(),
+            new CatSecret(minion.ForumPassword!)
+        );
+
+        return null;
+    }
+
+    /// <summary>
     ///     接受一次 launch 并在后台执行
     /// </summary>
     public CatAcceptResult Launch(CatLaunchParams? parameters)
@@ -270,14 +319,14 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (parameters == null || string.IsNullOrWhiteSpace(parameters.OperationId) || string.IsNullOrWhiteSpace(parameters.AccountName))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "operationId 与 accountName 不能为空");
 
-        if (parameters.Minion != null)
-        {
-            if (!MinionCards.IsValidFingerprint(parameters.Minion.CardFingerprint))
-                return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "minion.cardFingerprint 必须是 16 位小写十六进制");
+        // 卡号和论坛密码先登记脱敏, 之后不管接受与否都不会出现在发给外壳的消息里
+        redactor.RegisterSecret(parameters.Minion?.Keycode);
+        redactor.RegisterSecret(parameters.Minion?.ForumPassword);
 
-            if (!MinionCards.IsValidVariant(parameters.Minion.Variant))
-                return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "minion.variant 只能是 cn 或 global");
-        }
+        CatMinionLaunch? minionCard = null;
+
+        if (parameters.Minion != null && ValidateMinion(parameters.Minion, out minionCard) is { } minionRejected)
+            return minionRejected;
 
         if (parameters.CrashDialogTimeoutSeconds is { } crashTimeout and (< 1 or > CatProtocol.MAX_CRASH_DIALOG_TIMEOUT_SECONDS))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"crashDialogTimeoutSeconds 必须在 1 到 {CatProtocol.MAX_CRASH_DIALOG_TIMEOUT_SECONDS} 之间");
@@ -293,7 +342,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (isInternational && string.IsNullOrEmpty(parameters.Password))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "国际服必须带 password");
 
-        // 国际服的游戏只能挂卡的国际服行（注入文件不同）
+        // 国际服的游戏只能按国际服挂（注入文件和编号都不同）
         if (isInternational && parameters.Minion != null && parameters.Minion.Variant != MinionCards.VARIANT_GLOBAL)
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"国际服的 minion.variant 只能是 {MinionCards.VARIANT_GLOBAL}");
 
@@ -336,8 +385,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 parameters.OperationId.Trim(),
                 parameters.AccountName.Trim(),
                 parameters.Dalamud,
-                parameters.Minion?.CardFingerprint,
-                parameters.Minion?.Variant,
+                minionCard,
                 parameters.CrashDialogTimeoutSeconds ?? CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS,
                 string.IsNullOrWhiteSpace(parameters.AreaName) ? null : parameters.AreaName.Trim(),
                 channel == CatPlatform.WeGame ? XIVAccountType.WeGame : XIVAccountType.Sdo,
@@ -425,7 +473,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     }
 
     /// <summary>
-    ///     下号: 关掉崩溃重启 → 请游戏自己关闭（超时结束进程）→ 补报 Minion 停机 → game.exited → 本进程退出。
+    ///     下号: 关掉崩溃重启 → 请游戏自己关闭（超时结束进程）→ game.exited → 本进程退出。
     ///     还没 launch 时直接退出; 启动途中则取消启动（launch.failed{cancelled}）。重复调用无副作用。
     /// </summary>
     public CatAcceptResult Close(CatCloseParams? parameters)
@@ -757,8 +805,6 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         while (CatGameCloser.IsAlive(target, startedAt))
             await Task.Delay(GuardErrorPollInterval).ConfigureAwait(false);
-
-        MinionAppStatusReporter.ReportStopped(target);
 
         bool closed;
 
