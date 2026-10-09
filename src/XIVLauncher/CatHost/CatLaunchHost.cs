@@ -150,6 +150,14 @@ public interface ICatGameRunner
     }
 
     /// <summary>
+    ///     交接停止前的准备: 核对此刻能不能交接（游戏还在、没有正在进行的游戏内跨区、崩溃对话框没开着、守护记录在）,
+    ///     能就把最新的跨区会话写进守护记录, 之后不再做任何会碰游戏的事。返回 null = 可以交接（本进程随后直接退出:
+    ///     不关游戏、不登出、不删记录、不发 game.exited）; 否则返回拒绝原因, 一切照旧。
+    /// </summary>
+    Task<CatAcceptResult?> PrepareHandOffAsync(CancellationToken cancellationToken) =>
+        Task.FromResult<CatAcceptResult?>(CatAcceptResult.Rejected(CatCodes.UNSUPPORTED, "这个启动器不支持交接停止"));
+
+    /// <summary>
     ///     对运行中的游戏补注入 Dalamud / 重新挂 Minion, 结果经 <see cref="ICatLaunchReporter.Agent" /> 报告
     /// </summary>
     /// <param name="dalamud">补注入 Dalamud</param>
@@ -218,6 +226,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     private bool?             minionOk;
     private int               injectBusy;
     private bool              closeRequested;
+    private bool              handOffRequested;
+    private volatile bool     handOffCommitted;
     private bool              runnerFaulted;
     private int               pendingEvents;
 
@@ -292,6 +302,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             "inject" => Task.FromResult<object?>(Inject(Deserialize<CatInjectParams>(parameters))),
             "status" => Task.FromResult<object?>(GetStatus()),
             "close"  => Task.FromResult<object?>(Close(Deserialize<CatCloseParams>(parameters))),
+            "handoff" => HandOffBoxedAsync(cancellationToken),
             "weGame.confirmSms" => Task.FromResult<object?>(ConfirmWeGameSms(Deserialize<CatWeGameConfirmSmsParams>(parameters))),
             "selectCharacter" => Task.FromResult<object?>(SelectCharacter(Deserialize<CatSelectCharacterParams>(parameters))),
             _        => throw new CatRpcException(CatRpcException.METHOD_NOT_FOUND, $"未知方法: {method}")
@@ -578,6 +589,9 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             if (pid == null || !CatStages.IsGameRunning(stage) || closeRequested || runnerFaulted)
                 return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
 
+            if (handOffRequested)
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "正在交接停止, 本进程即将退出");
+
             current = runner;
         }
 
@@ -630,6 +644,10 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             if (closeRequested)
                 return CatAcceptResult.Ok();
 
+            // 交接停止已在进行: 游戏要留给下一个守护进程, 这里不能再去关它（外壳要下号就对接管的那个进程发 close）
+            if (handOffRequested)
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "正在交接停止, 本进程即将退出; 要下号请对接管的进程发 close");
+
             closeRequested = true;
             current        = runner;
             hasLaunch      = request != null;
@@ -670,6 +688,74 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         return CatAcceptResult.Ok();
     }
+
+    /// <summary>
+    ///     交接停止（更新启动器时用）: 本进程不再守这个游戏, 但不关游戏、不登出跨区、不删守护记录、不发 game.exited,
+    ///     发 game.handedOff 后以 <see cref="CatHostRuntime.EXIT_HANDED_OFF" /> 退出; 守护锁随进程退出放掉, 下一个进程凭记录 adopt。
+    ///     只在游戏稳定运行时接受（running / inWorld, 且没有补注入、游戏内跨区、崩溃对话框）, 否则回 busy, 稍后再试。
+    /// </summary>
+    public async Task<CatAcceptResult> HandOffAsync(CancellationToken cancellationToken = default)
+    {
+        ICatGameRunner current;
+        int            gamePid;
+        DateTimeOffset startedAt;
+
+        lock (stateLock)
+        {
+            if (closeRequested)
+                return CatAcceptResult.Rejected(CatCodes.CLOSING, "已收到 close, 本进程即将退出");
+
+            if (handOffRequested)
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "交接停止已在进行");
+
+            if (runner == null || pid is not { } p || processStartedAt is not { } at || stage is CatStages.EXITED or CatStages.FAILED)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
+
+            // 启动、崩溃重开、自动进入角色途中交接会把这些流程拦腰截断（接管方只会接着守, 不会接着做）
+            if (stage is not (CatStages.RUNNING or CatStages.IN_WORLD))
+                return CatAcceptResult.Rejected(CatCodes.BUSY, $"游戏正处于 {stage} 阶段, 现在交接会打断它, 稍后再试");
+
+            if (Volatile.Read(ref injectBusy) == 1)
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "正在补注入, 稍后再试");
+
+            handOffRequested = true;
+            current          = runner;
+            gamePid          = p;
+            startedAt        = at;
+        }
+
+        CatAcceptResult? blocked;
+
+        try
+        {
+            blocked = await current.PrepareHandOffAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Serilog.Log.Error(ex, "[CatHost] 准备交接停止时出错, 照旧守护");
+            blocked = CatAcceptResult.Rejected(CatCodes.LAUNCH_FAILED, $"准备交接停止时出错: {ex.Message}");
+        }
+
+        if (blocked != null)
+        {
+            lock (stateLock)
+                handOffRequested = false;
+
+            Serilog.Log.Information("[CatHost] 交接停止被拒: {Code} {Message}", blocked.Code, blocked.Message);
+            return blocked;
+        }
+
+        Serilog.Log.Information("[CatHost] 交接停止: 游戏 {Pid} 留给下一个守护进程接管, 本进程退出", gamePid);
+        Publish("game.handedOff", new { operationId = OperationId, pid = gamePid, processStartedAt = CatProtocol.FormatTimestamp(startedAt) });
+
+        // game.handedOff 是本进程关于这个游戏的最后一句话: 之后启动器里残留的动静（如游戏恰好崩了）一律不再发, 归接管的进程报
+        handOffCommitted = true;
+        completion.TrySetResult(CatHostRuntime.EXIT_HANDED_OFF);
+        return CatAcceptResult.Ok();
+    }
+
+    private async Task<object?> HandOffBoxedAsync(CancellationToken cancellationToken) =>
+        await HandOffAsync(cancellationToken).ConfigureAwait(false);
 
     /// <summary>
     ///     客户说设备验证的短信已经发了: 交给启动器去点验证窗口的「确定」, 立即回是否点了
@@ -1022,6 +1108,12 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
     private void Publish(string method, object parameters)
     {
+        if (handOffCommitted)
+        {
+            Serilog.Log.Debug("[CatHost] 已交接停止, 不再发 {Method}", method);
+            return;
+        }
+
         Interlocked.Increment(ref pendingEvents);
 
         if (!events.Writer.TryWrite((method, parameters)))

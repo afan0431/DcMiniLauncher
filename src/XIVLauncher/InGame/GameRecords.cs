@@ -65,6 +65,12 @@ public sealed record GameRecord
     /// <summary>加密后的 guid, 与 <see cref="Tgt" /> 成对</summary>
     public string? Guid { get; init; }
 
+    /// <summary>
+    ///     加密后的盛趣跨区网页会话（nsessionid）; 只在交接停止（handoff）时写: 旧守护不登出, 新守护拿它直接续用,
+    ///     连换票据都省了。失效了照常走 <see cref="Tgt" />
+    /// </summary>
+    public string? DcTravelSession { get; init; }
+
     public string? MinionFingerprint { get; init; }
 
     public string? MinionVariant { get; init; }

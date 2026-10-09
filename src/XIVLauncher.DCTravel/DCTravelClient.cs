@@ -429,6 +429,27 @@ public partial class DCTravelClient : IDisposable
         }
     }
 
+    /// <summary>
+    ///     续用另一个进程交接过来的网页会话（它没登出）: 之后 <see cref="GetValidCookie" /> 先拿它试, 失效了才换票据
+    /// </summary>
+    public void SeedNSessionId(string nSessionId)
+    {
+        if (string.IsNullOrWhiteSpace(nSessionId))
+            return;
+
+        cookieContainer.Add(new Cookie("nsessionid", nSessionId, "/", DOMAIN));
+    }
+
+    /// <summary>
+    ///     当前网页会话的 nsessionid; 还没有时为 null（交接停止时存进守护记录用）
+    /// </summary>
+    public string? TryGetNSessionId() =>
+        cookieContainer.GetCookies(BaseUri)
+                       .FirstOrDefault(x => string.Equals(x.Name, "nsessionid", StringComparison.Ordinal))
+                       ?.Value is { Length: > 0 } value
+            ? value
+            : null;
+
     public string GetNSessionIdFromCookie()
     {
         var cookies = cookieContainer.GetCookies(BaseUri);

@@ -109,6 +109,11 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     /// <summary>本进程对守护记录的写、改、删都经这把锁</summary>
     private readonly SemaphoreSlim recordLock = new(1, 1);
 
+    /// <summary>
+    ///     已决定交接停止: 进程退出前不再碰游戏、记录、端口文件, 也不再重开（游戏留给下一个守护进程）
+    /// </summary>
+    private volatile bool handingOff;
+
     private bool IsCloseRequested
     {
         get
@@ -132,6 +137,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             using var final = await RunGameAsync(RestartMonitor.RestartOptions.Normal, null, reporter, linked.Token, cancellationToken).ConfigureAwait(false);
 
             await WaitAutoEnterEndAsync().ConfigureAwait(false);
+
+            if (handingOff)
+                return CatHostRuntime.EXIT_HANDED_OFF;
 
             if (IsCloseRequested)
                 reporter.Exited(lastPid, lastExitCode, CatExitReasons.CLOSED);
@@ -193,6 +201,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             using var final = await GuardAsync(launched, record.Dalamud, options, null, TimeSpan.Zero, reporter, linked.Token, cancellationToken).ConfigureAwait(false);
 
             await WaitAutoEnterEndAsync().ConfigureAwait(false);
+
+            if (handingOff)
+                return CatHostRuntime.EXIT_HANDED_OFF;
 
             if (IsCloseRequested)
                 reporter.Exited(lastPid, lastExitCode, CatExitReasons.CLOSED);
@@ -310,6 +321,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         if (CanRefreshByLogin)
             dcTravel.ConfigureQuickLoginRefresh(RefreshSessionIdByQuickLoginAsync);
 
+        // 交接停止过来的: 旧守护没登出, 它的网页会话接着用（失效了 GetValidCookie 照常换票据）
+        if (await DecryptOrNullAsync(record.DcTravelSession).ConfigureAwait(false) is { } handedSession)
+            dcTravel.Client.SeedNSessionId(handedSession);
+
         if (record.DcTravelPort > 0)
         {
             context.DcTravelPort = await dcTravel.StartAsync(record.DcTravelPort).ConfigureAwait(false);
@@ -337,7 +352,14 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         (
             () => Task.FromResult<GameRecord?>
             (
-                record with { OperationId = adoptRequest.OperationId, GuardPid = Environment.ProcessId, GuardStartedAt = SelfStartedAt, UpdatedAt = DateTimeOffset.UtcNow }
+                record with
+                {
+                    OperationId = adoptRequest.OperationId,
+                    GuardPid = Environment.ProcessId,
+                    GuardStartedAt = SelfStartedAt,
+                    DcTravelSession = null,
+                    UpdatedAt = DateTimeOffset.UtcNow
+                }
             )
         ).ConfigureAwait(false);
 
@@ -463,6 +485,61 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     /// <inheritdoc />
     public CatAcceptResult SelectCharacter(string contentId) =>
         autoEnter?.SelectCharacter(contentId) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等人选角色");
+
+    /// <inheritdoc />
+    public async Task<CatAcceptResult?> PrepareHandOffAsync(CancellationToken cancellationToken)
+    {
+        if (IsCloseRequested)
+            return CatAcceptResult.Rejected(CatCodes.CLOSING, "已收到 close, 本进程即将退出");
+
+        if (currentProcess is not { } launched || launched.UnderlyingProcess.HasExited)
+            return CatAcceptResult.Rejected(CatCodes.BUSY, "游戏刚退出（可能开着崩溃对话框）, 稍后再试");
+
+        var gamePid = launched.ProcessID;
+
+        if (InGameTravelJobs.IsRunning(gamePid))
+            return CatAcceptResult.Rejected(CatCodes.BUSY, "游戏内跨区正在进行, 等它结束再交接");
+
+        DateTimeOffset startedAt;
+
+        lock (cleanupLock)
+        {
+            if (!recordedGames.TryGetValue(gamePid, out startedAt))
+                return CatAcceptResult.Rejected(CatCodes.GAME_NOT_FOUND, $"游戏 {gamePid} 没有守护记录, 交接后没有进程接得了");
+        }
+
+        // 从这里起不再碰游戏: 之后游戏若退出或崩溃, 留给接管的进程处理（它会找到崩溃处理器）
+        handingOff = true;
+
+        var session = dcTravel?.Client.TryGetNSessionId();
+        var written = await WriteRecordLockedAsync
+                      (async () =>
+                          {
+                              if (GameRecords.ReadMatching(gamePid, startedAt) is not { } record)
+                                  return null;
+
+                              var oauth = context.LoginResult.OAuthLogin;
+
+                              return record with
+                              {
+                                  OperationId = request.OperationId,
+                                  Tgt = await EncryptOrNullAsync(oauth?.TGT).ConfigureAwait(false) ?? record.Tgt,
+                                  Guid = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false) ?? record.Guid,
+                                  DcTravelSession = await EncryptOrNullAsync(session).ConfigureAwait(false),
+                                  UpdatedAt = DateTimeOffset.UtcNow
+                              };
+                          }
+                      ).ConfigureAwait(false);
+
+        if (!written)
+        {
+            handingOff = false;
+            return CatAcceptResult.Rejected(CatCodes.GAME_NOT_FOUND, $"游戏 {gamePid} 的守护记录读不到或写不进去, 交接后没有进程接得了");
+        }
+
+        Log.Information("[CatHost] 交接停止: 游戏 {Pid} 的记录已更新（带跨区会话={HasSession}）, 不登出、不删记录", gamePid, session != null);
+        return null;
+    }
 
     /// <summary>
     ///     游戏起来后出了意外异常: 不再守护（崩溃重启、跨区刷新）, 但照样等游戏结束再发 game.exited。期间 close 仍可用。
@@ -1202,7 +1279,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                                   {
                                       CleanupProcess(launched, companionAppManager);
 
-                                      if (IsCloseRequested)
+                                      // 交接停止已定: 不在本进程里重开（本进程马上退出, 重开出来的游戏没人守）
+                                      if (IsCloseRequested || handingOff)
                                           return null;
 
                                       try
@@ -1544,6 +1622,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
     private void CleanupProcess(FFXIVProcess launched, CompanionAppManager? companionAppManager)
     {
+        // 交接停止: 游戏、记录、端口文件、伴随程序都留给接管的进程, 也不报 Minion 停机
+        if (handingOff)
+            return;
+
         lock (cleanupLock)
         {
             if (!cleanedPids.Add(launched.ProcessID))
