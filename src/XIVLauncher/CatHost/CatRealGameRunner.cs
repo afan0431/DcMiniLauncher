@@ -393,8 +393,6 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             CanRefreshByLogin
         );
 
-        reporter.Adopted(process.Id, record.ProcessStartedAt);
-
         // 接管来的游戏已经注好的东西照实报一次, status 才不会是空的
         if (record.Dalamud)
             reporter.Agent(CatAgentKinds.DALAMUD, IsDalamudLoaded(process));
@@ -402,14 +400,18 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         if (record.MinionFingerprint != null)
             reporter.Agent(CatAgentKinds.MINION, CatMinionReservations.IsAttached(process));
 
+        // running 先于 game.adopted: 外壳把 adopted 之前的阶段当作接管进程自己的准备过程, 不转述（游戏早就进了游戏）
+        if (!closeNow)
+            reporter.Stage(CatStages.RUNNING);
+
+        reporter.Adopted(process.Id, record.ProcessStartedAt);
+
         if (closeNow)
         {
             // 准备途中收到了 close: 接管下来再关, 之后照常发 game.exited{closed}
             _ = CatGameCloser.CloseAsync(process, closeTimeout);
             return launched;
         }
-
-        reporter.Stage(CatStages.RUNNING);
 
         // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色（编排早就做完了, 不再重做）
         if (record.AutoEnter && !process.HasExited)
