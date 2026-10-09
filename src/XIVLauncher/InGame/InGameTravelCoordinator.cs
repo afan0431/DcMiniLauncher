@@ -22,6 +22,9 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     /// </summary>
     private const int TRAVEL_STATUS_ARRIVED = 1;
 
+    /// <summary>规划期间有另一次换大区先开始了, 或守护进程正在交接停止（启动器换版本, 几秒后由新进程接着服务）</summary>
+    private const string BUSY_MESSAGE = "这个客户端已经有一次换大区在进行中, 或启动器正在换版本, 稍后再试";
+
     public async Task<DCTravelListener.InGameTravelResponse> HandleAsync
     (
         DCTravelListener.InGameTravelRequest request,
@@ -52,7 +55,8 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             var last   = legs[^1].Context;
             var target = $"{last.TargetArea!.AreaName}/{last.TargetGroup!.GroupName}";
 
-            InGameTravelJobs.Begin(pid, target);
+            if (InGameTravelJobs.TryBegin(pid, target) == null)
+                return Failed(BUSY_MESSAGE);
 
             var run = RunLegsAsync(game.Process, legs);
 
@@ -204,7 +208,8 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
                 return Failed($"没有大区 {request.Area}, 可选: {string.Join(", ", loginAreas.Select(x => x.AreaName))}");
 
             var pid = game.Process.Id;
-            InGameTravelJobs.Begin(pid, targetArea.AreaName);
+            if (InGameTravelJobs.TryBegin(pid, targetArea.AreaName) == null)
+                return Failed(BUSY_MESSAGE);
 
             var run = RunSwitchAsync(game.Process, targetArea);
 

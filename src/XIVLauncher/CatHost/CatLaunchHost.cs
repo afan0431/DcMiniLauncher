@@ -593,13 +593,14 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 return CatAcceptResult.Rejected(CatCodes.BUSY, "正在交接停止, 本进程即将退出");
 
             current = runner;
+
+            if (current == null)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
+
+            // 与交接停止在同一把锁里互斥: 交接看到 injectBusy == 0 后, 这里就不会再开始
+            if (Interlocked.Exchange(ref injectBusy, 1) == 1)
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "上一次补注入还没结束");
         }
-
-        if (current == null)
-            return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
-
-        if (Interlocked.Exchange(ref injectBusy, 1) == 1)
-            return CatAcceptResult.Rejected(CatCodes.BUSY, "上一次补注入还没结束");
 
         _ = Task.Run
         (async () =>
