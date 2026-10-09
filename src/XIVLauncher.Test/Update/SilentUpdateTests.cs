@@ -53,4 +53,14 @@ public sealed class SilentUpdateTests : IDisposable
         Assert.True(CatHostMode.HasSwitch(update, CatHostMode.SELF_UPDATE_SWITCH));
         Assert.False(CatHostMode.HasSwitch(detached, CatHostMode.SELF_UPDATE_SWITCH));
     }
+
+    [Theory]
+    [InlineData(UpdateOrchestrator.SILENT_UP_TO_DATE, CatSelfUpdateExitCodes.UP_TO_DATE)]
+    [InlineData(UpdateOrchestrator.SILENT_APPLYING, CatSelfUpdateExitCodes.APPLYING)]
+    [InlineData(UpdateOrchestrator.SILENT_GUARDED, CatSelfUpdateExitCodes.GUARDED)]
+    [InlineData(UpdateOrchestrator.SILENT_IN_USE, CatSelfUpdateExitCodes.IN_USE)]
+    [InlineData(UpdateOrchestrator.SILENT_NOT_INSTALLED, CatSelfUpdateExitCodes.NOT_INSTALLED)]
+    [InlineData("whatever", CatSelfUpdateExitCodes.FAILED)]
+    public void Outcome_MapsToDistinctExitCode(string outcome, int exitCode) =>
+        Assert.Equal(exitCode, CatSelfUpdateExitCodes.From(outcome));
 }
