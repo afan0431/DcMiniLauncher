@@ -54,6 +54,11 @@ public class RestartMonitor
 
         /// <summary>触发后不再重启: 游戏退出时不等崩溃处理器的决定, 还开着就结束它</summary>
         public CancellationToken StopToken { get; init; }
+
+        /// <summary>
+        ///     找崩溃处理器最多等多久; null = 默认 10 秒。接管已经在跑的游戏时给 0: 崩溃处理器早就起来了, 找一次就定论
+        /// </summary>
+        public TimeSpan? CrashHandlerDiscoveryTimeout { get; init; }
     }
 
     public async Task MonitorAsync
@@ -67,7 +72,12 @@ public class RestartMonitor
     {
         // 必须在游戏存活时就抓住崩溃处理器句柄: 重启 / 杀死路径下它终止游戏后会立即退出,
         // 等游戏退出再去找会与其退出竞态
-        using var crashHandler = await TryAcquireCrashHandlerAsync(gameProcess, cancellationToken).ConfigureAwait(false);
+        using var crashHandler = await TryAcquireCrashHandlerAsync
+                                 (
+                                     gameProcess,
+                                     monitorOptions?.CrashHandlerDiscoveryTimeout ?? CrashHandlerDiscoveryTimeout,
+                                     cancellationToken
+                                 ).ConfigureAwait(false);
 
         if (crashHandler == null || monitorOptions == null)
         {
@@ -331,17 +341,27 @@ public class RestartMonitor
             _                               => null
         };
 
-    private static async Task<Process?> TryAcquireCrashHandlerAsync(FFXIVProcess gameProcess, CancellationToken cancellationToken)
+    private static async Task<Process?> TryAcquireCrashHandlerAsync(FFXIVProcess gameProcess, TimeSpan discoveryTimeout, CancellationToken cancellationToken)
     {
         var gamePid  = gameProcess.ProcessID;
-        var deadline = DateTime.Now + CrashHandlerDiscoveryTimeout;
+        var deadline = DateTime.Now + discoveryTimeout;
 
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             if (gameProcess.UnderlyingProcess.HasExited)
+            {
+                // 游戏已经没了, 但它的崩溃处理器可能还开着（崩溃对话框在等人, 或刚做完重开决定还没退出）:
+                // 它是游戏的子进程, 按父进程号照样找得到, 找到就照常读它的决定
+                if (TryFindCrashHandlerProcess(gamePid) is { } orphan)
+                {
+                    Log.Information("游戏 {GamePid} 已退出, 捕获到它留下的 Dalamud 崩溃处理器进程 {ProcessId}", gamePid, orphan.Id);
+                    return orphan;
+                }
+
                 return null;
+            }
 
             if (TryFindCrashHandlerProcess(gamePid) is { } crashHandler)
             {
