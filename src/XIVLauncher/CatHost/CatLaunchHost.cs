@@ -8,7 +8,8 @@ namespace XIVLauncher.CatHost;
 
 /// <summary>
 ///     一次 launch 的参数（已校验）; MinionCard = 要挂的 Minion 卡, 不挂为 null; WeGameLogin = WeGame 号在本机没有可用的登录信息时拉起 WeGame 等员工登录, 为 false 时直接报 authorizationRequired;
-///     AutoEnter = 游戏起来后自动经标题、选角进入游戏; CharacterName / CharacterHomeWorld = 要登录的角色（可为空）
+///     AutoEnter = 游戏起来后自动经标题、选角进入游戏; CharacterName / CharacterHomeWorld = 要登录的角色（可为空）;
+///     WeGameToken / WeGameAccountId = 工作台下发的 WeGame 登录信息与 WeGame 用户号（只有 WeGame 号会带, 两个同时有或同时为 null）
 /// </summary>
 public sealed record CatLaunchRequest
 (
@@ -25,7 +26,9 @@ public sealed record CatLaunchRequest
     CatWeGameScan? WeGameScan                = null,
     bool           AutoEnter                 = false,
     string?        CharacterName             = null,
-    string?        CharacterHomeWorld        = null
+    string?        CharacterHomeWorld        = null,
+    CatSecret?     WeGameToken               = null,
+    string?        WeGameAccountId           = null
 )
 {
     /// <summary>是否为 WeGame 版国服的号</summary>
@@ -398,6 +401,21 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (weGameScan != null && !weGameLogin)
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "weGameScan 只能和 weGameLogin 一起用");
 
+        // 下发的 WeGame 登录信息不管接受与否都先登记脱敏
+        redactor.RegisterSecret(parameters.WeGameToken);
+
+        var hasWeGameToken  = !string.IsNullOrWhiteSpace(parameters.WeGameToken);
+        var weGameAccountId = string.IsNullOrWhiteSpace(parameters.WeGameAccountId) ? null : parameters.WeGameAccountId.Trim();
+
+        if ((hasWeGameToken || weGameAccountId != null) && channel != CatPlatform.WeGame)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"weGameToken 与 weGameAccountId 只能用于 platform 为 {CatPlatforms.WE_GAME} 的号");
+
+        if (hasWeGameToken != (weGameAccountId != null))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "weGameToken 与 weGameAccountId 必须同时带");
+
+        if (weGameAccountId != null && !weGameAccountId.All(char.IsAsciiDigit))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "weGameAccountId 只能是数字");
+
         var characterName = string.IsNullOrWhiteSpace(parameters.Character?.Name) ? null : parameters.Character.Name.Trim();
         var homeWorld     = string.IsNullOrWhiteSpace(parameters.Character?.HomeWorld) ? null : parameters.Character.HomeWorld.Trim();
 
@@ -436,7 +454,9 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 weGameScan,
                 autoEnter,
                 characterName,
-                homeWorld
+                homeWorld,
+                hasWeGameToken ? new CatSecret(parameters.WeGameToken!) : null,
+                weGameAccountId
             );
             selected = runnerFactory(accepted);
             runner   = selected;
@@ -445,7 +465,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         Serilog.Log.Information
         (
-            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s, 就地登录 WeGame={WeGameLogin}, 自动切扫码页={WeGameScan}, 自动进入角色={AutoEnter}, 角色={Character}, 原始服务器={HomeWorld}",
+            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s, 就地登录 WeGame={WeGameLogin}, 自动切扫码页={WeGameScan}, 自动进入角色={AutoEnter}, 角色={Character}, 原始服务器={HomeWorld}, 下发 WeGame 登录信息={WeGameToken}",
             accepted.OperationId,
             CatPlatforms.DisplayName(accepted.Channel),
             accepted.AccountName,
@@ -456,7 +476,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             accepted.WeGameScan is { } scan ? CatWeGameScans.Name(scan) : "否",
             accepted.AutoEnter,
             accepted.CharacterName ?? "(未指定)",
-            accepted.CharacterHomeWorld ?? "(未指定)"
+            accepted.CharacterHomeWorld ?? "(未指定)",
+            accepted.WeGameToken != null ? "带了" : "没带"
         );
 
         _ = Task.Run(() => RunLifecycleAsync(selected, accepted));

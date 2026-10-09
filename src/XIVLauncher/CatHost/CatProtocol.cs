@@ -400,7 +400,9 @@ public sealed record CatCharacterInfo
 ///     password = 国际服的 Square Enix 账号密码（国际服必填, 其它渠道带了也不用）;
 ///     weGameLogin = WeGame 号在本机没有可用的登录信息时, 拉起 WeGame 等员工在窗口里登录（只能用于 weGame 渠道, 不带按 false）;
 ///     weGameScan = 等 WeGame 登录时自动把登录窗口切到哪种扫码页, 见 <see cref="CatWeGameScans" />（只能和 weGameLogin 一起用, 不带 = 不切换）;
-///     character = 要登录的角色（可不带）; autoEnter = 游戏起来后自动经标题、选角进入游戏（不带按 false, 国际服忽略）
+///     character = 要登录的角色（可不带）; autoEnter = 游戏起来后自动经标题、选角进入游戏（不带按 false, 国际服忽略）;
+///     weGameToken / weGameAccountId = 工作台下发的这个号的 WeGame 登录信息与 WeGame 用户号（只能用于 weGame 渠道, 两个要么都带要么都不带, 用户号全为数字）,
+///     本机账号库没有这个号或存的不同时先写进账号库再登录, 见 <see cref="CatWeGameTokenHandoff" />
 /// </summary>
 public sealed record CatLaunchParams
 (
@@ -415,16 +417,19 @@ public sealed record CatLaunchParams
     bool?            WeGameLogin               = null,
     string?          WeGameScan                = null,
     CatCharacterParams? Character              = null,
-    bool?            AutoEnter                 = null
+    bool?            AutoEnter                 = null,
+    string?          WeGameToken               = null,
+    string?          WeGameAccountId           = null
 )
 {
     /// <summary>
-    ///     record 自动生成的 ToString 会打印所有成员, 这里改成不带密码, 免得哪天被写进日志
+    ///     record 自动生成的 ToString 会打印所有成员, 这里改成不带密码和 WeGame 登录信息, 免得哪天被写进日志
     /// </summary>
     public override string ToString() =>
         $"CatLaunchParams {{ OperationId = {OperationId}, AccountName = {AccountName}, Dalamud = {Dalamud}, Minion = {Minion}, " +
         $"CrashDialogTimeoutSeconds = {CrashDialogTimeoutSeconds}, AreaName = {AreaName}, Platform = {Platform}, Password = {(Password == null ? "(无)" : "***")}, " +
-        $"WeGameLogin = {WeGameLogin}, WeGameScan = {WeGameScan}, Character = {Character}, AutoEnter = {AutoEnter} }}";
+        $"WeGameLogin = {WeGameLogin}, WeGameScan = {WeGameScan}, Character = {Character}, AutoEnter = {AutoEnter}, " +
+        $"WeGameToken = {(WeGameToken == null ? "(无)" : "***")}, WeGameAccountId = {WeGameAccountId} }}";
 }
 
 /// <summary>
