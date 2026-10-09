@@ -97,6 +97,12 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     /// <summary>等自动进入角色的后台任务收尾的上限（它们在游戏退出时已被取消, 这里只是不让事件落在 game.exited 后面）</summary>
     private static readonly TimeSpan AutoEnterShutdownTimeout = TimeSpan.FromSeconds(5);
 
+    /// <summary>本进程的创建时间, 写进守护记录的「守护者」</summary>
+    private static readonly DateTimeOffset SelfStartedAt = MinionOccupancy.GetProcessStartedAt(Process.GetCurrentProcess());
+
+    /// <summary>写过守护记录的游戏进程 → 它的创建时间（删记录时核对, 防进程号复用后误删）</summary>
+    private readonly Dictionary<int, DateTimeOffset> recordedGames = [];
+
     private bool IsCloseRequested
     {
         get
@@ -645,12 +651,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             if (oauth == null)
                 return string.Empty;
 
-            // 新 TGT 写回, 下次崩溃重启先用它换票据, 少登录一次
+            // 新 TGT 写回, 下次崩溃重启先用它换票据, 少登录一次; 守护记录也跟着换, 接管的进程拿到的是能用的那个
             if (!string.IsNullOrEmpty(oauth.TGT) && !string.IsNullOrEmpty(oauth.Guid) && context?.LoginResult.OAuthLogin is { } current)
             {
                 redactor.Register(oauth.TGT);
                 current.TGT  = oauth.TGT;
                 current.Guid = oauth.Guid;
+                await RewriteGameRecordCredentialsAsync().ConfigureAwait(false);
             }
 
             if (!string.IsNullOrEmpty(oauth.SessionID))
@@ -869,11 +876,39 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     )
     {
         var (launched, dalamudOk, companionAppManager) = await StartOnceAsync(options, restartedFromPid, reporter, startToken).ConfigureAwait(false);
+
+        return await GuardAsync(launched, dalamudOk, options, companionAppManager, null, reporter, startToken, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     守护一个已经在跑的游戏到它退出（正常启动与接管共用）: 注入了 Dalamud 的盯崩溃处理器, 要重开时递归 <see cref="RunGameAsync" />。
+    ///     返回最后一个游戏进程（重开过则是新进程）。
+    /// </summary>
+    /// <param name="launched">游戏进程</param>
+    /// <param name="watchCrashHandler">游戏里有 Dalamud（有崩溃处理器可盯）</param>
+    /// <param name="options">本次的模式, 崩溃处理器回「按原模式重开」时用</param>
+    /// <param name="companionAppManager">伴随程序（接管来的游戏为 null）</param>
+    /// <param name="crashHandlerDiscoveryTimeout">找崩溃处理器的期限; null = 默认, 接管时给 0</param>
+    /// <param name="reporter">报告</param>
+    /// <param name="startToken">重开途中可被 close 取消</param>
+    /// <param name="cancellationToken">外部取消</param>
+    private async Task<FFXIVProcess> GuardAsync
+    (
+        FFXIVProcess                  launched,
+        bool                          watchCrashHandler,
+        RestartMonitor.RestartOptions options,
+        CompanionAppManager?          companionAppManager,
+        TimeSpan?                     crashHandlerDiscoveryTimeout,
+        ICatLaunchReporter            reporter,
+        CancellationToken             startToken,
+        CancellationToken             cancellationToken
+    )
+    {
         FFXIVProcess result = launched;
 
         try
         {
-            if (dalamudOk)
+            if (watchCrashHandler)
             {
                 await launcher.RestartMonitor
                               .MonitorAsync
@@ -909,10 +944,11 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                                   cancellationToken,
                                   new RestartMonitor.MonitorOptions
                                   {
-                                      CrashHandlerExitTimeout  = request.CrashDialogTimeout,
-                                      CrashHandlerOutlivedGame = reporter.Crashed,
-                                      CrashHandlerTimedOut     = () => exitReason = CatExitReasons.CRASH_DIALOG_TIMEOUT,
-                                      StopToken                = closeCts.Token
+                                      CrashHandlerExitTimeout      = request.CrashDialogTimeout,
+                                      CrashHandlerOutlivedGame     = reporter.Crashed,
+                                      CrashHandlerTimedOut         = () => exitReason = CatExitReasons.CRASH_DIALOG_TIMEOUT,
+                                      StopToken                    = closeCts.Token,
+                                      CrashHandlerDiscoveryTimeout = crashHandlerDiscoveryTimeout
                                   }
                               )
                               .ConfigureAwait(false);
@@ -989,6 +1025,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             reporter.Started(launched.ProcessID, startedAt);
 
         RunningGameRegistry.Register(process, context.InGameAgents, context.DcTravelPort);
+        await WriteGameRecordAsync(process, startedAt, options, dalamudOk).ConfigureAwait(false);
 
         CompanionAppManager? companionAppManager = null;
 
@@ -1234,6 +1271,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
 
         RunningGameRegistry.Unregister(launched.ProcessID);
+        DeleteGameRecord(launched.ProcessID);
 
         lastPid      = launched.ProcessID;
         lastExitCode = TryGetExitCode(launched);
@@ -1259,6 +1297,131 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
         catch (Exception)
         {
+            return null;
+        }
+    }
+
+    #endregion
+
+    #region 守护记录
+
+    /// <summary>
+    ///     写这个游戏的守护记录, 本进程死了之后新进程凭它接管（adopt）。写失败只记日志, 不影响游戏
+    /// </summary>
+    /// <param name="process">游戏进程</param>
+    /// <param name="startedAt">游戏进程创建时间</param>
+    /// <param name="options">本次启动的模式, 也是崩溃处理器回「按原模式重开」时用的模式</param>
+    /// <param name="dalamudOk">本次是否注入了 Dalamud（决定接管后要不要盯崩溃处理器）</param>
+    private async Task WriteGameRecordAsync(Process process, DateTimeOffset startedAt, RestartMonitor.RestartOptions options, bool dalamudOk)
+    {
+        try
+        {
+            var oauth = context.LoginResult.OAuthLogin;
+            var record = new GameRecord
+            {
+                Pid                       = process.Id,
+                ProcessStartedAt          = startedAt,
+                OperationId               = request.OperationId,
+                Channel                   = request.IsWeGame ? GameRecordChannels.WE_GAME : GameRecordChannels.SDO,
+                AccountName               = request.AccountName,
+                AccountUserName           = account.UserName,
+                AreaName                  = context.Area.AreaName,
+                Dalamud                   = dalamudOk,
+                DalamudRequested          = request.Dalamud,
+                RestartNoDalamud          = options.ForceNoDalamud,
+                RestartNoThirdPlugins     = options.NoThirdPlugins,
+                RestartNoPlugins          = options.NoPlugins,
+                DcTravelPort              = context.DcTravelPort,
+                SndaId                    = oauth?.SndaID,
+                Tgt                       = await EncryptOrNullAsync(oauth?.TGT).ConfigureAwait(false),
+                Guid                      = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false),
+                MinionFingerprint         = request.CardFingerprint,
+                MinionVariant             = request.Variant,
+                AutoEnter                 = request.AutoEnter,
+                CharacterName             = request.CharacterName,
+                CharacterHomeWorld        = request.CharacterHomeWorld,
+                CrashDialogTimeoutSeconds = request.CrashDialogTimeoutSeconds,
+                GuardPid                  = Environment.ProcessId,
+                GuardStartedAt            = SelfStartedAt,
+                UpdatedAt                 = DateTimeOffset.UtcNow
+            };
+
+            if (GameRecords.Write(record))
+            {
+                lock (cleanupLock)
+                    recordedGames[process.Id] = startedAt;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 写守护记录失败（不影响游戏, 只是本进程死了之后接管不了）");
+        }
+    }
+
+    /// <summary>
+    ///     换到新 TGT 后更新当前游戏守护记录里的凭证
+    /// </summary>
+    private async Task RewriteGameRecordCredentialsAsync()
+    {
+        try
+        {
+            if (currentProcess is not { } process || GameRecords.Read(process.ProcessID) is not { } record)
+                return;
+
+            var oauth = context.LoginResult.OAuthLogin;
+
+            GameRecords.Write
+            (
+                record with
+                {
+                    Tgt = await EncryptOrNullAsync(oauth?.TGT).ConfigureAwait(false),
+                    Guid = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false),
+                    UpdatedAt = DateTimeOffset.UtcNow
+                }
+            );
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 更新守护记录里的凭证失败");
+        }
+    }
+
+    /// <summary>
+    ///     游戏退出（或崩溃重开换了新进程）时删掉它的守护记录
+    /// </summary>
+    private void DeleteGameRecord(int processId)
+    {
+        DateTimeOffset startedAt;
+
+        lock (cleanupLock)
+        {
+            if (!recordedGames.Remove(processId, out startedAt))
+                return;
+        }
+
+        GameRecords.Delete(processId, startedAt);
+    }
+
+    private async Task<string?> EncryptOrNullAsync(string? text) =>
+        string.IsNullOrEmpty(text) ? null : await accountManager.Encrypt(text).ConfigureAwait(false);
+
+    private async Task<string?> DecryptOrNullAsync(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return null;
+
+        try
+        {
+            var plain = await accountManager.Decrypt(text).ConfigureAwait(false);
+
+            if (!string.IsNullOrEmpty(plain))
+                redactor.Register(plain);
+
+            return plain;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 解密守护记录里的凭证失败");
             return null;
         }
     }

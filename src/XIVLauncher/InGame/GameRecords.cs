@@ -7,6 +7,16 @@ using XIVLauncher.Minion;
 namespace XIVLauncher.InGame;
 
 /// <summary>
+///     <see cref="GameRecord.Channel" /> 的取值: 账号库里的行类型
+/// </summary>
+public static class GameRecordChannels
+{
+    public const string SDO = "sdo";
+
+    public const string WE_GAME = "weGame";
+}
+
+/// <summary>
 ///     一个在跑的游戏的守护所需的全部信息, 守护进程死了之后新进程凭它接管（热更新 / 崩溃恢复）。
 ///     凭证字段（<see cref="Tgt" />、<see cref="Guid" />）存的是经账号库加密后的串, 保护强度与账号库一致; 不存任何卡密和密码。
 /// </summary>
