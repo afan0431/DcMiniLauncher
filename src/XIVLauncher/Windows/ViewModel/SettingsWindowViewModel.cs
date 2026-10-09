@@ -103,6 +103,18 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
     public partial string MinionInstallPath { get; set; } = string.Empty;
 
     /// <summary>
+    ///     Minion 论坛账号（-minionid）, 只在本机没有 Cat 工作台的卡文件时使用
+    /// </summary>
+    [ObservableProperty]
+    public partial string MinionId { get; set; } = string.Empty;
+
+    /// <summary>
+    ///     Minion 账号密码, 明文 —— MinionLauncher 的 -minionpass 只接受明文; 只在本机没有 Cat 工作台的卡文件时使用
+    /// </summary>
+    [ObservableProperty]
+    public partial string MinionPassword { get; set; } = string.Empty;
+
+    /// <summary>
     ///     游戏窗口出现后等多久再挂 bot（毫秒）；两个都开时会自动排在 Dalamud 之后, 见 <c>MinionAttacher</c>
     /// </summary>
     [ObservableProperty]
@@ -114,26 +126,58 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
     [ObservableProperty]
     public partial string MinionDetectResult { get; set; } = string.Empty;
 
+    /// <summary>
+    ///     启动页挂 Minion 时卡从哪里来（Cat 工作台的卡文件或 MINIONAPP 的 Accounts.json）
+    /// </summary>
+    [ObservableProperty]
+    public partial string MinionCardSourceText { get; set; } = string.Empty;
+
     [RelayCommand]
     private void DetectMinionInstall()
     {
+        string installPath;
+        string launcherLine;
+
         if (string.IsNullOrWhiteSpace(MinionInstallPath))
         {
-            var found = MinionInstall.InstallPath;
+            installPath  = MinionInstall.InstallPath;
+            launcherLine = MinionInstall.IsLauncherPresent(installPath)
+                               ? $"✔ 自动找到 {MinionInstall.GetLauncherExePath(installPath)}"
+                               : $"✘ 各个硬盘的 MINI 目录下都没有 {MinionInstall.LAUNCHER_EXE_NAME}, 请指定安装目录";
+        }
+        else
+        {
+            installPath       = MinionInstallPath.Trim();
+            MinionInstallPath = installPath;
 
-            MinionDetectResult = MinionInstall.IsLauncherPresent(found)
-                                     ? $"✔ 自动找到 {MinionInstall.GetLauncherExePath(found)}"
-                                     : $"✘ 各个硬盘的 MINI 目录下都没有 {MinionInstall.LAUNCHER_EXE_NAME}, 请指定安装目录";
-            return;
+            var launcherExePath = MinionInstall.GetLauncherExePath(installPath);
+            launcherLine = MinionInstall.IsLauncherPresent(installPath)
+                               ? $"✔ 找到 {launcherExePath}"
+                               : $"✘ 未找到 {launcherExePath}";
         }
 
-        var installPath     = MinionInstallPath.Trim();
-        var launcherExePath = MinionInstall.GetLauncherExePath(installPath);
+        var lines   = new List<string> { launcherLine };
+        var choices = MinionCardSource.Load(installPath: installPath);
 
-        MinionInstallPath  = installPath;
-        MinionDetectResult = MinionInstall.IsLauncherPresent(installPath)
-                                 ? $"✔ 找到 {launcherExePath}"
-                                 : $"✘ 未找到 {launcherExePath}";
+        if (choices.Workbench is { } file)
+            lines.Add(file.Cards.Count > 0 ? $"✔ {choices.SourceText}" : $"✘ {choices.SourceText}, 没有可用的卡");
+        else if (choices.GroupLoadError != null)
+            lines.Add($"✘ {choices.GroupLoadError}");
+        else
+        {
+            // 界面版只起国服, 只数国服行
+            var accountsPath = MinionAccounts.GetAccountsJsonPath(installPath);
+            var groups       = MinionCardSource.GroupsFor(choices.Groups, MinionCards.VARIANT_CN, MinionAccounts.ConfiguredCnGameRoots());
+            lines.Add
+            (
+                groups.Count > 0
+                    ? $"✔ {accountsPath}: {groups.Count} 个分组 / {groups.Sum(group => group.Accounts.Count)} 个国服账号（{string.Join("、", groups.Select(group => group.Id))}）"
+                    : $"✘ {accountsPath} 里没有国服的账号行"
+            );
+        }
+
+        MinionCardSourceText = choices.SourceText;
+        MinionDetectResult   = string.Join(Environment.NewLine, lines);
     }
 
     #endregion
@@ -313,8 +357,11 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
         EnableHooks                                 = App.Settings.DalamudEnabled;
         EnableDcTravel                              = true;
         MinionInstallPath                           = App.Settings.MinionInstallPath ?? string.Empty;
+        MinionId                                    = App.Settings.MinionId          ?? string.Empty;
+        MinionPassword                              = App.Settings.MinionPassword    ?? string.Empty;
         MinionAttachDelayMs                         = App.Settings.MinionAttachDelayMS;
         MinionDetectResult                          = string.Empty;
+        MinionCardSourceText                        = MinionCardSource.Load().SourceText;
         LaunchArgs                                  = App.Settings.AdditionalLaunchArgs ?? string.Empty;
         DpiAwarenessIndex                           = (int)App.Settings.DPIAwareness;
         VersionLabelText                            = $"XIVLauncher - v{AppUtil.GetAssemblyVersion()}";
@@ -438,8 +485,12 @@ public sealed partial class SettingsWindowViewModel : ObservableObject
                 settings.CredType = credTypeApplyResult.AppliedCredType;
 
                 var minionInstallPath = MinionInstallPath.Trim();
+                var minionId          = MinionId.Trim();
 
-                settings.MinionInstallPath   = string.IsNullOrEmpty(minionInstallPath) ? null : minionInstallPath;
+                settings.MinionInstallPath = string.IsNullOrEmpty(minionInstallPath) ? null : minionInstallPath;
+                settings.MinionId          = string.IsNullOrEmpty(minionId) ? null : minionId;
+                // 不做 Trim —— 密码可能就是以空白开头或结尾
+                settings.MinionPassword     = string.IsNullOrEmpty(MinionPassword) ? null : MinionPassword;
                 settings.MinionAttachDelayMS = Math.Clamp(MinionAttachDelayMs ?? 0, 0, 120_000);
             }
         );

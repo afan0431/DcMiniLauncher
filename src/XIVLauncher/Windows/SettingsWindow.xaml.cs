@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Windows;
 using System.Windows.Controls;
@@ -24,6 +25,19 @@ public partial class SettingsWindow
         InitializeComponent();
         DataContext                                   = viewModel;
         CompanionAppListView.ContextMenu?.DataContext = viewModel;
+
+        // PasswordBox.Password 不能绑定: 先回填一次, 之后 ViewModel 里的值变了（如重新从设置回填）再同步
+        MinionPasswordBox.Password = viewModel.MinionPassword;
+
+        void SyncMinionPassword(object? _, PropertyChangedEventArgs args)
+        {
+            if (args.PropertyName == nameof(SettingsWindowViewModel.MinionPassword) && MinionPasswordBox.Password != viewModel.MinionPassword)
+                MinionPasswordBox.Password = viewModel.MinionPassword;
+        }
+
+        // ViewModel 比窗口活得久, 窗口关了就退订
+        viewModel.PropertyChanged += SyncMinionPassword;
+        Closed                    += (_, _) => viewModel.PropertyChanged -= SyncMinionPassword;
 
         DiscordButton.Click += (_, _) => Process.Start(new ProcessStartInfo(Links.DISCORD_URL) { UseShellExecute = true });
     }
@@ -68,6 +82,9 @@ public partial class SettingsWindow
         CompanionAppListView.SelectedItem = listViewItem.DataContext;
         listViewItem.IsSelected           = true;
     }
+
+    private void MinionPasswordBox_OnPasswordChanged(object sender, RoutedEventArgs e) =>
+        ViewModel.MinionPassword = MinionPasswordBox.Password;
 
     private void LicenseText_OnMouseUp(object sender, MouseButtonEventArgs e) =>
         ViewModel.OpenLicense();

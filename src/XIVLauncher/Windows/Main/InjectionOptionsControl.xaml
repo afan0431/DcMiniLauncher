@@ -52,6 +52,115 @@
                         </ToggleButton.LayoutTransform>
                     </ToggleButton>
                 </Grid>
+
+                <Grid Height="30" Margin="0,4,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Minion" FontSize="13" VerticalAlignment="Center" />
+                    <ToggleButton Grid.Column="1"
+                                  x:Name="MinionToggle"
+                                  VerticalAlignment="Center"
+                                  Style="{StaticResource MaterialDesignSwitchToggleButton}"
+                                  IsChecked="{Binding InjectionOptions.WithMinion}"
+                                  ToolTip="本次启动是否在游戏起来后挂 MinionLauncher（安装目录在设置里配置一次）">
+                        <ToggleButton.LayoutTransform>
+                            <ScaleTransform ScaleX="0.72" ScaleY="0.72" />
+                        </ToggleButton.LayoutTransform>
+                    </ToggleButton>
+                </Grid>
+
+                <!-- 卡来自本机 Cat 工作台写的卡文件 -->
+                <StackPanel Margin="0,22,0,0"
+                            IsEnabled="{Binding InjectionOptions.WithMinion}"
+                            Visibility="{Binding InjectionOptions.Minion.FromWorkbench, Converter={StaticResource BoolToVis}}">
+                    <TextBlock Text="卡（来自 Cat 工作台）" FontSize="11" Opacity="0.5" Margin="2,0,0,6" />
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <ComboBox Grid.Column="0"
+                                  x:Name="MinionCardComboBox"
+                                  DropDownOpened="MinionComboBox_OnDropDownOpened"
+                                  Style="{StaticResource MaterialDesignOutlinedComboBox}"
+                                  materialDesign:TextFieldAssist.TextFieldCornerRadius="8"
+                                  FontSize="12"
+                                  Padding="10,6"
+                                  ItemsSource="{Binding InjectionOptions.Minion.Cards}"
+                                  SelectedItem="{Binding InjectionOptions.Minion.SelectedCard}"
+                                  DisplayMemberPath="DisplayName"
+                                  ToolTip="本次启动用哪张卡（本机 Cat 工作台登录后写下的卡, 论坛账号由后台下发）" />
+
+                        <Button Grid.Column="1"
+                                Margin="8,0,0,0"
+                                Style="{StaticResource HeaderUtilityButtonStyle}"
+                                Width="26" Height="26"
+                                ToolTip="重新读取卡"
+                                Command="{Binding InjectionOptions.Minion.RefreshCommand}">
+                            <materialDesign:PackIcon Kind="Refresh" Width="14" Height="14" />
+                        </Button>
+                    </Grid>
+                </StackPanel>
+
+                <!-- 本机没有 Cat 工作台的卡时, 读 MINIONAPP 的 Accounts.json -->
+                <StackPanel Margin="0,22,0,0"
+                            IsEnabled="{Binding InjectionOptions.WithMinion}"
+                            Visibility="{Binding InjectionOptions.Minion.FromAccountsJson, Converter={StaticResource BoolToVis}}">
+                    <TextBlock Text="分组" FontSize="11" Opacity="0.5" Margin="2,0,0,6" />
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <ComboBox Grid.Column="0"
+                                  x:Name="MinionGroupComboBox"
+                                  DropDownOpened="MinionComboBox_OnDropDownOpened"
+                                  Style="{StaticResource MaterialDesignOutlinedComboBox}"
+                                  materialDesign:TextFieldAssist.TextFieldCornerRadius="8"
+                                  FontSize="12"
+                                  Padding="10,6"
+                                  ItemsSource="{Binding InjectionOptions.Minion.Groups}"
+                                  SelectedItem="{Binding InjectionOptions.Minion.SelectedGroup}"
+                                  DisplayMemberPath="DisplayName"
+                                  ToolTip="本次启动用哪个 Minion 分组（每次现读 Minion 的 Settings\Accounts.json）" />
+
+                        <Button Grid.Column="1"
+                                Margin="8,0,0,0"
+                                Style="{StaticResource HeaderUtilityButtonStyle}"
+                                Width="26" Height="26"
+                                ToolTip="重新读取分组与账号"
+                                Command="{Binding InjectionOptions.Minion.RefreshCommand}">
+                            <materialDesign:PackIcon Kind="Refresh" Width="14" Height="14" />
+                        </Button>
+                    </Grid>
+
+                    <TextBlock Text="Keycode" FontSize="11" Opacity="0.5" Margin="2,16,0,6" />
+
+                    <ComboBox x:Name="MinionAccountComboBox"
+                              DropDownOpened="MinionComboBox_OnDropDownOpened"
+                              Style="{StaticResource MaterialDesignOutlinedComboBox}"
+                              materialDesign:TextFieldAssist.TextFieldCornerRadius="8"
+                              FontSize="12"
+                              Padding="10,6"
+                              Margin="0,0,34,0"
+                              ItemsSource="{Binding InjectionOptions.Minion.AccountsInGroup}"
+                              SelectedItem="{Binding InjectionOptions.Minion.SelectedAccount}"
+                              ToolTip="本次启动用分组里的哪个账号（显示 Accounts.json 里的 Keycode; 只列游戏执行程序在国服游戏目录下的行）">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding DisplayText}"
+                                           ToolTip="{Binding DisplayText}"
+                                           TextTrimming="CharacterEllipsis" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                </StackPanel>
             </StackPanel>
 
             <StackPanel Grid.Row="2" Margin="20,0,20,18">

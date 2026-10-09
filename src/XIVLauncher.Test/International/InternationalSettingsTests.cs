@@ -28,7 +28,7 @@ public sealed class InternationalSettingsTests : IDisposable
     public void OldConfigWithoutInternationalFields_LoadsWithDefaults_AndKeepsDomesticValues()
     {
         // 加这两项之前的配置文件（也是官方启动器写出来的样子）
-        File.WriteAllText(ConfigPath, "{ \"GamePath\": \"D:\\\\FF14\", \"WeGamePath\": \"E:\\\\WeGame\\\\FF14\", \"FastLogin\": false, \"MinionInstallPath\": \"someone\" }");
+        File.WriteAllText(ConfigPath, "{ \"GamePath\": \"D:\\\\FF14\", \"WeGamePath\": \"E:\\\\WeGame\\\\FF14\", \"FastLogin\": false, \"MinionId\": \"someone\" }");
 
         var settings = LauncherSettingsV3.Load(ConfigPath);
 
@@ -37,7 +37,7 @@ public sealed class InternationalSettingsTests : IDisposable
         Assert.Equal(@"D:\FF14", settings.GamePath!.FullName);
         Assert.Equal(@"E:\WeGame\FF14", settings.WeGamePath!.FullName);
         Assert.False(settings.FastLogin);
-        Assert.Equal("someone", settings.MinionInstallPath);
+        Assert.Equal("someone", settings.MinionId);
     }
 
     [Fact]
@@ -86,50 +86,58 @@ public sealed class InternationalSettingsTests : IDisposable
     [InlineData("{\"x\":2}", ClientLanguage.English)]
     public void InternationalLanguage_HandEditedOddValues_NeverBreakTheSharedConfig(string raw, ClientLanguage expected)
     {
-        File.WriteAllText(ConfigPath, $"{{ \"GamePath\": \"D:\\\\FF14\", \"InternationalLanguage\": {raw}, \"MinionInstallPath\": \"someone\" }}");
+        File.WriteAllText(ConfigPath, $"{{ \"GamePath\": \"D:\\\\FF14\", \"InternationalLanguage\": {raw}, \"MinionId\": \"someone\" }}");
 
         var settings = LauncherSettingsV3.Load(ConfigPath);
 
         Assert.Equal(expected, settings.InternationalLanguage);
         Assert.Equal(@"D:\FF14", settings.GamePath!.FullName);
-        Assert.Equal("someone", settings.MinionInstallPath);
+        Assert.Equal("someone", settings.MinionId);
         Assert.Empty(Directory.GetFiles(directory.FullName, "*.broken-*"));
     }
 
     [Fact]
-    public void OldConfigWithRemovedMinionFields_LoadsAndDropsThemFromDiskRightAway()
+    public void MinionUiFields_LoadAndStayOnDisk()
     {
-        // 界面版挂 Minion 时期留下的设置项: 论坛账号和明文密码改由工作台下发, 不再存在本机
-        File.WriteAllText(ConfigPath + ".bak", "{ \"MinionPassword\": \"fake-forum-pass\" }");
-        File.WriteAllText
-        (
-            ConfigPath,
-            "{ \"GamePath\": \"D:\\\\FF14\", \"MinionAttachEnabled\": true, \"MinionGroup\": \"3\", \"MinionAccountUid\": \"0123456789abcdef0123456789abcdef\", " +
-            "\"MinionId\": \"fake-forum-user\", \"MinionPassword\": \"fake-forum-pass\", \"MinionInstallPath\": \"D:\\\\MINI\", \"MinionAttachDelayMS\": 8000 }"
-        );
+        const string json = "{ \"GamePath\": \"D:\\\\FF14\", \"MinionAttachEnabled\": true, \"MinionGroup\": \"3\", \"MinionAccountUid\": \"0123456789abcdef0123456789abcdef\", " +
+                            "\"MinionCardFingerprint\": \"0123456789abcdef\", \"MinionId\": \"fake-forum-user\", \"MinionPassword\": \"fake-forum-pass\", " +
+                            "\"MinionInstallPath\": \"D:\\\\MINI\", \"MinionAttachDelayMS\": 8000 }";
+        File.WriteAllText(ConfigPath, json);
 
         var settings = LauncherSettingsV3.Load(ConfigPath);
 
-        Assert.Equal(@"D:\FF14", settings.GamePath!.FullName);
+        Assert.True(settings.MinionAttachEnabled);
+        Assert.Equal("3", settings.MinionGroup);
+        Assert.Equal("0123456789abcdef0123456789abcdef", settings.MinionAccountUid);
+        Assert.Equal("0123456789abcdef", settings.MinionCardFingerprint);
+        Assert.Equal("fake-forum-user", settings.MinionId);
+        Assert.Equal("fake-forum-pass", settings.MinionPassword);
         Assert.Equal(@"D:\MINI", settings.MinionInstallPath);
         Assert.Equal(8000, settings.MinionAttachDelayMS);
-        Assert.Empty(Directory.GetFiles(directory.FullName, "*.broken-*"));
 
-        // 加载后立即重存, 不等下一次改设置
-        var saved = File.ReadAllText(ConfigPath);
-        Assert.DoesNotContain("fake-forum-pass", saved);
-        Assert.DoesNotContain("fake-forum-user", saved);
-        Assert.DoesNotContain("MinionPassword", saved);
-        Assert.DoesNotContain("MinionId", saved);
-        Assert.DoesNotContain("MinionGroup", saved);
-        Assert.DoesNotContain("MinionAccountUid", saved);
-        Assert.DoesNotContain("MinionAttachEnabled", saved);
-        Assert.Contains("MinionInstallPath", saved);
-        Assert.DoesNotContain("fake-forum-pass", File.ReadAllText(ConfigPath + ".bak"));
+        // 加载不改写配置文件
+        Assert.Equal(json, File.ReadAllText(ConfigPath));
+    }
+
+    [Fact]
+    public void MinionUiFields_RoundTrip()
+    {
+        var settings = LauncherSettingsV3.Load(ConfigPath);
+        settings.MinionAttachEnabled   = true;
+        settings.MinionGroup           = "5";
+        settings.MinionAccountUid      = "fedcba9876543210fedcba9876543210";
+        settings.MinionCardFingerprint = "fedcba9876543210";
+        settings.MinionId              = "fake-forum-user";
+        settings.MinionPassword        = " fake pass ";
 
         var reloaded = LauncherSettingsV3.Load(ConfigPath);
-        Assert.Equal(@"D:\MINI", reloaded.MinionInstallPath);
-        Assert.Equal(8000, reloaded.MinionAttachDelayMS);
+
+        Assert.True(reloaded.MinionAttachEnabled);
+        Assert.Equal("5", reloaded.MinionGroup);
+        Assert.Equal("fedcba9876543210fedcba9876543210", reloaded.MinionAccountUid);
+        Assert.Equal("fedcba9876543210", reloaded.MinionCardFingerprint);
+        Assert.Equal("fake-forum-user", reloaded.MinionId);
+        Assert.Equal(" fake pass ", reloaded.MinionPassword);
     }
 
     [Fact]

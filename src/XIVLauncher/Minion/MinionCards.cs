@@ -1,3 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
+
 namespace XIVLauncher.Minion;
 
 /// <summary>
@@ -14,7 +17,20 @@ public static class MinionCards
 
     private const int FINGERPRINT_LENGTH = 16;
 
+    private const string FINGERPRINT_PREFIX = "cat-minion-card:";
+
     private const int UID_LENGTH = 32;
+
+    /// <summary>
+    ///     卡指纹: SHA-256("cat-minion-card:" + 卡号) 的前 16 个小写十六进制字符, 与服务器的算法相同
+    /// </summary>
+    public static string Fingerprint(string keycode)
+    {
+        ArgumentNullException.ThrowIfNull(keycode);
+
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(FINGERPRINT_PREFIX + keycode));
+        return Convert.ToHexStringLower(hash)[..FINGERPRINT_LENGTH];
+    }
 
     /// <summary>
     ///     指纹格式是否合法（16 个小写十六进制字符）
