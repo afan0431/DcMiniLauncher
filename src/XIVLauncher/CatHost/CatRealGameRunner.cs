@@ -229,7 +229,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             // 接管准备途中收到 close: 外壳要的是下号, 游戏照样关掉
             Log.Information("[CatHost] 接管途中收到关闭请求, 直接关游戏 {Pid}", adoptRequest.Pid);
-            await CatGameCloser.CloseAsync(adoptRequest.Game, closeTimeout).ConfigureAwait(false);
+            await CatGameCloser.CloseAsync(adoptRequest.Game, closeTimeout, GameExit).ConfigureAwait(false);
 
             int? exitCode = null;
 
@@ -409,7 +409,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         if (closeNow)
         {
             // 准备途中收到了 close: 接管下来再关, 之后照常发 game.exited{closed}
-            _ = CatGameCloser.CloseAsync(process, closeTimeout);
+            _ = CatGameCloser.CloseAsync(process, closeTimeout, GameExit);
             return launched;
         }
 
@@ -464,6 +464,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     }
 
     /// <inheritdoc />
+    public ICatGameExit? GameExit => CatModuleGameExit.Instance;
+
+    /// <inheritdoc />
     public async Task CloseAsync(TimeSpan gracefulTimeout)
     {
         FFXIVProcess? process;
@@ -485,7 +488,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         // 游戏还没起来时由启动流程自己收尾; 正在创建进程时由创建方看到关闭请求后关
         if (process != null)
-            await CatGameCloser.CloseAsync(process.UnderlyingProcess, gracefulTimeout).ConfigureAwait(false);
+            await CatGameCloser.CloseAsync(process.UnderlyingProcess, gracefulTimeout, GameExit).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -1449,7 +1452,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         if (closeNow)
         {
-            _ = CatGameCloser.CloseAsync(process, closeTimeout);
+            _ = CatGameCloser.CloseAsync(process, closeTimeout, GameExit);
             return (launched, dalamudOk, companionAppManager);
         }
 

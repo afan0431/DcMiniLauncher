@@ -6,7 +6,8 @@ using XIVLauncher.Minion;
 namespace XIVLauncher.CatHost;
 
 /// <summary>
-///     下号时关游戏: 先给游戏窗口发 WM_CLOSE 请它自己退出, 超时再结束进程
+///     下号时关游戏。有 <see cref="ICatGameExit" /> 时先请游戏登出后自己退出（不弹确认框）, 不在世界里就直接结束进程;
+///     请不动时给游戏窗口发 WM_CLOSE。全程共用一个时限, 超时结束进程。
 /// </summary>
 public static class CatGameCloser
 {
@@ -21,7 +22,7 @@ public static class CatGameCloser
     /// <summary>
     ///     按进程号关游戏; 进程已不在或进程号已被复用时直接返回 true
     /// </summary>
-    public static async Task<bool> CloseAsync(int pid, DateTimeOffset? processStartedAt, TimeSpan gracefulTimeout)
+    public static async Task<bool> CloseAsync(int pid, DateTimeOffset? processStartedAt, TimeSpan gracefulTimeout, ICatGameExit? exit = null)
     {
         Process process;
 
@@ -39,19 +40,48 @@ public static class CatGameCloser
             if (processStartedAt is { } expected && !IsAlive(pid, expected))
                 return true;
 
-            return await CloseAsync(process, gracefulTimeout).ConfigureAwait(false);
+            return await CloseAsync(process, gracefulTimeout, exit).ConfigureAwait(false);
         }
     }
 
     /// <summary>
-    ///     请游戏自己关闭, 等 <paramref name="gracefulTimeout" />, 还没退出就结束进程。返回进程是否已退出。
+    ///     请游戏自己关闭, 最多等 <paramref name="gracefulTimeout" />, 还没退出就结束进程。返回进程是否已退出。
     /// </summary>
-    public static async Task<bool> CloseAsync(Process process, TimeSpan gracefulTimeout)
+    /// <param name="process">游戏进程</param>
+    /// <param name="gracefulTimeout">从调用起到结束进程的时限</param>
+    /// <param name="exit">请游戏登出后退出的途径; null 时只发 WM_CLOSE</param>
+    public static async Task<bool> CloseAsync(Process process, TimeSpan gracefulTimeout, ICatGameExit? exit = null)
     {
         if (HasExited(process))
             return true;
 
-        var pid     = process.Id;
+        var pid   = process.Id;
+        var clock = Stopwatch.StartNew();
+
+        if (exit != null && gracefulTimeout > TimeSpan.Zero)
+        {
+            switch (await RequestExitAsync(exit, process, gracefulTimeout).ConfigureAwait(false))
+            {
+                case CatGameExitOutcome.Exiting:
+                    Log.Information("[CatHost] 已请游戏登出后退出 PID={Pid}, 最多再等 {Seconds:F1}s", pid, Remaining(gracefulTimeout, clock).TotalSeconds);
+
+                    if (await WaitForExitAsync(process, Remaining(gracefulTimeout, clock)).ConfigureAwait(false))
+                    {
+                        Log.Information("[CatHost] 游戏已登出退出 PID={Pid}, 用时 {Seconds:F1}s", pid, clock.Elapsed.TotalSeconds);
+                        return true;
+                    }
+
+                    return await KillAsync(process).ConfigureAwait(false);
+
+                case CatGameExitOutcome.NotInWorld:
+                    Log.Information("[CatHost] 游戏不在世界里, 直接结束进程 PID={Pid}", pid);
+                    return await KillAsync(process).ConfigureAwait(false);
+            }
+
+            if (HasExited(process))
+                return true;
+        }
+
         var windows = FindWindows(process);
 
         foreach (var window in windows)
@@ -60,29 +90,73 @@ public static class CatGameCloser
                 Log.Warning("[CatHost] 给游戏窗口发关闭消息失败 PID={Pid}, 错误码 {Error}", pid, Marshal.GetLastWin32Error());
         }
 
-        Log.Information("[CatHost] 已请游戏自己关闭 PID={Pid}（窗口 {Count} 个）, 最多等 {Seconds}s", pid, windows.Count, gracefulTimeout.TotalSeconds);
+        var remaining = Remaining(gracefulTimeout, clock);
+        Log.Information("[CatHost] 已请游戏自己关闭 PID={Pid}（窗口 {Count} 个）, 最多等 {Seconds:F1}s", pid, windows.Count, remaining.TotalSeconds);
 
-        if (windows.Count > 0 && gracefulTimeout > TimeSpan.Zero)
+        if (windows.Count > 0 && await WaitForExitAsync(process, remaining).ConfigureAwait(false))
         {
-            using var timeout = new CancellationTokenSource(gracefulTimeout);
-
-            try
-            {
-                await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-                Log.Information("[CatHost] 游戏已自己退出 PID={Pid}", pid);
-                return true;
-            }
-            catch (OperationCanceledException)
-            {
-            }
+            Log.Information("[CatHost] 游戏已自己退出 PID={Pid}", pid);
+            return true;
         }
+
+        return await KillAsync(process).ConfigureAwait(false);
+    }
+
+    /// <summary>问 <paramref name="exit" />, 最多占用整个时限; 出错一律当作请不动</summary>
+    private static async Task<CatGameExitOutcome> RequestExitAsync(ICatGameExit exit, Process process, TimeSpan limit)
+    {
+        using var timeout = new CancellationTokenSource(limit);
+
+        try
+        {
+            return await exit.RequestAsync(process, timeout.Token).WaitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            Log.Warning("[CatHost] 请游戏登出退出超时 PID={Pid}, 改发关闭消息", process.Id);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 请游戏登出退出失败 PID={Pid}, 改发关闭消息", process.Id);
+        }
+
+        return CatGameExitOutcome.Unavailable;
+    }
+
+    private static TimeSpan Remaining(TimeSpan limit, Stopwatch clock)
+    {
+        var remaining = limit - clock.Elapsed;
+        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+    }
+
+    private static async Task<bool> WaitForExitAsync(Process process, TimeSpan limit)
+    {
+        if (limit <= TimeSpan.Zero)
+            return HasExited(process);
+
+        using var timeout = new CancellationTokenSource(limit);
+
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return HasExited(process);
+        }
+    }
+
+    private static async Task<bool> KillAsync(Process process)
+    {
+        var pid = process.Id;
 
         try
         {
             if (!HasExited(process))
             {
                 process.Kill();
-                Log.Information("[CatHost] 游戏没有在时限内退出, 已结束进程 PID={Pid}", pid);
+                Log.Information("[CatHost] 已结束游戏进程 PID={Pid}", pid);
             }
 
             using var killWait = new CancellationTokenSource(TimeSpan.FromSeconds(10));

@@ -174,6 +174,11 @@ public interface ICatGameRunner
     Task CloseAsync(TimeSpan gracefulTimeout);
 
     /// <summary>
+    ///     下号时先经它请游戏自己登出退出（见 <see cref="CatGameCloser" />）; null = 只发关闭消息、超时结束进程
+    /// </summary>
+    ICatGameExit? GameExit => null;
+
+    /// <summary>
     ///     客户说设备验证的短信已经发了: 点验证窗口的「确定」。立即返回是否点了, 结果经
     ///     <see cref="ICatLaunchReporter.WeGameSmsResult" /> 或 <see cref="ICatLaunchReporter.WeGameChallengeCleared" /> 报告。
     ///     不在等 WeGame 登录的启动器一律回 notRunning。
@@ -675,7 +680,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 {
                     // 启动器已出错不再守护时, 直接按进程号关游戏
                     if (faulted && gamePid is { } target)
-                        await CatGameCloser.CloseAsync(target, startedAt, timeout).ConfigureAwait(false);
+                        await CatGameCloser.CloseAsync(target, startedAt, timeout, current.GameExit).ConfigureAwait(false);
                     else
                         await current.CloseAsync(timeout).ConfigureAwait(false);
                 }

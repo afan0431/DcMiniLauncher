@@ -138,6 +138,9 @@ namespace
         if (command == "LOGOUT")
             return GameLogout(false); // /logout 文本命令 + 确认框
 
+        if (command == "EXIT")
+            return GameExit();        // 下号: 在世界里直调 HandleLogout(isExiting=true), 不弹确认框
+
         if (command == "LOGOUT DIRECT")
             return GameLogout(true);  // 直接调 AgentLobby::HandleLogout
 

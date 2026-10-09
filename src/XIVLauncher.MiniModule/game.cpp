@@ -650,6 +650,25 @@ namespace
         }
     }
 
+    // 退出游戏: 同一个处理函数, isExiting=true —— 游戏在「确定要结束游戏吗？」点了确定之后走的就是它,
+    // 先向服务器登出再退出进程。不在世界里时返回 0, 由调用方直接结束进程。
+    int OpExitGame(const Pointers* p)
+    {
+        __try
+        {
+            if (OpWhere(p) != 3)
+                return 0;
+
+            reinterpret_cast<HandleLogoutFn>(g_handleLogout)(p->agentLobby, true, 0);
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] HandleLogout(退出) 异常 code=0x%08X", GetExceptionCode());
+            return -1;
+        }
+    }
+
     // 是不是正在放片头动画。判据是 MovieStaffList 这个 addon 在不在 ——
     // 实测动画期间它在、标题菜单时不在。
     // ⚠ 不能用「where==busy」当判据: 登录读盘、过场也都是 busy, 那时候投 ESC 是误伤。
@@ -859,6 +878,32 @@ std::string GameLogout(bool direct)
     }
 
     return "FAIL logout-timeout";
+}
+
+// 下号退出游戏。只发起、不等: 进程退不退由启动器看。
+//   OK exiting       在世界里, 已调 HandleLogout(isExiting=true)
+//   OK not-in-world  标题 / 选角 / 片头, 没有要登出的角色
+std::string GameExit()
+{
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareCall(state, failure))
+        return failure;
+
+    auto captured = state;
+
+    if (!MainThreadRun([captured] { captured->result = OpExitGame(&captured->pointers); }, 5000))
+        return "FAIL mainthread-timeout";
+
+    if (state->result < 0)
+        return "FAIL exception";
+
+    if (state->result == 0)
+        return "OK not-in-world";
+
+    LogF("[game] 已发起退出游戏 (HandleLogout isExiting=1)");
+    return "OK exiting";
 }
 
 namespace
