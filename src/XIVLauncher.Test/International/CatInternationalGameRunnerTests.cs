@@ -439,6 +439,7 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
             reporter.Entries
         );
         Assert.Equal(["config", "boot", "loginStatus", "login", "gate", "dalamud", "start"], environment.Calls);
+        Assert.Equal([environment.GameProcess.Id], environment.FakeMinion.ReportedStopped);
         Assert.True(environment.Login.Disposed);
 
         AssertNothingSensitive();
@@ -902,6 +903,10 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         public void ReleaseReservation(int gamePid) => Released.Add(gamePid);
 
         public bool IsAttached(Process process) => IsAttachedResult;
+
+        public List<int> ReportedStopped { get; } = [];
+
+        public void ReportStopped(int gamePid) => ReportedStopped.Add(gamePid);
     }
 
     #endregion

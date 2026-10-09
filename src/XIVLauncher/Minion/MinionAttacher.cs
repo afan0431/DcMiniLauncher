@@ -117,8 +117,23 @@ public static class MinionAttacher
 
         var result = await SpawnLauncherAsync(minion, installPath, gamePath, gameProcess, cancellationToken).ConfigureAwait(false);
 
-        if (result.Ok)
-            WriteOccupancy(minion, gameProcess, accountName);
+        if (!result.Ok)
+            return result;
+
+        // 先落占用记录（带编号与卡号 MD5, 本进程不在时别人也能据此补报停机）, 再报结果
+        var keycodeMd5 = MinionAppStatusReporter.KeycodeMd5Hex(minion.Keycode.Reveal());
+        WriteOccupancy(minion, keycodeMd5, gameProcess, accountName);
+
+        // MINIONAPP 开着时, 它的看门狗会把「我们挂的、它没记过账的」会话当成卡死的杀掉,
+        // 所以按它自己的协议先替 bot 报一次「运行中」把计时器种上（见 MinionAppStatusReporter）; 补发在后台, 不拖慢结果
+        try
+        {
+            MinionAppStatusReporter.SeedRunningStatus(minion.Uid, keycodeMd5, minion.Fingerprint, gameProcess);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[Minion] 给 MINIONAPP 报「运行中」失败");
+        }
 
         return result;
     }
@@ -255,7 +270,7 @@ public static class MinionAttacher
         }
     }
 
-    private static void WriteOccupancy(CatMinionLaunch minion, Process gameProcess, string? accountName)
+    private static void WriteOccupancy(CatMinionLaunch minion, string? keycodeMd5, Process gameProcess, string? accountName)
     {
         try
         {
@@ -269,6 +284,7 @@ public static class MinionAttacher
                     Variant          = minion.Variant,
                     AccountName      = accountName,
                     MinionUid        = minion.Uid,
+                    KeycodeMd5       = keycodeMd5,
                     AttachedAt       = DateTimeOffset.UtcNow
                 },
                 gameProcess

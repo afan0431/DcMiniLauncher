@@ -8,7 +8,7 @@ using Serilog;
 namespace XIVLauncher.Minion;
 
 /// <summary>
-///     Minion 占用记录的内容: 哪张卡挂在哪个游戏进程上。不含 Keycode, 只含不可逆指纹。
+///     Minion 占用记录的内容: 哪张卡挂在哪个游戏进程上。不含卡号原文, 只含不可逆指纹与卡号 MD5。
 /// </summary>
 public sealed record MinionOccupancyRecord
 {
@@ -26,6 +26,12 @@ public sealed record MinionOccupancyRecord
     ///     挂上的这张卡在这个 variant 下的 Minion 编号（<c>-uid</c>, 32 位十六进制）。同一编号同一时间只挂在一个游戏上
     /// </summary>
     public string? MinionUid { get; init; }
+
+    /// <summary>
+    ///     卡号的 MD5（32 位小写十六进制）, 与给 MINIONAPP 报状态的包里用的是同一个值。
+    ///     挂载它的启动器已不在时, 别人据此和 <see cref="MinionUid" /> 给 MINIONAPP 补报「停机」。旧记录没有这一项
+    /// </summary>
+    public string? KeycodeMd5 { get; init; }
 
     public required DateTimeOffset AttachedAt { get; init; }
 }
@@ -132,7 +138,7 @@ public static class MinionOccupancy
     }
 
     /// <summary>
-    ///     写入记录, 游戏进程退出时删除记录
+    ///     写入记录, 游戏进程退出时给 MINIONAPP 报「停机」并删除记录
     /// </summary>
     public static void WriteAndDeleteOnExit(MinionOccupancyRecord record, Process gameProcess)
     {
@@ -155,20 +161,36 @@ public static class MinionOccupancy
                 if (Read(record.Pid) is { } current && current.ProcessStartedAt != TruncateToMilliseconds(record.ProcessStartedAt))
                     return;
 
+                MinionAppStatusReporter.ReportStopped(record.Pid, record.MinionUid, record.KeycodeMd5);
                 Delete(record.Pid);
             }
         );
     }
 
     /// <summary>
-    ///     清掉进程已不在（或进程号已被别的进程复用）的残留记录
+    ///     清掉进程已不在（或进程号已被别的进程复用）的残留记录。
+    ///     记录里有编号、且这个编号没有挂在别的活着的游戏上时, 先给 MINIONAPP 补报「停机」——
+    ///     挂它的启动器已经不在了, 不补报的话 MINIONAPP 会过一分钟自己把客户端拉起来。
     /// </summary>
     public static void PruneStale()
     {
-        foreach (var (pid, record) in ReadAll())
+        var records = ReadAll();
+        var stale   = records.Where(x => !IsSameProcessAlive(x.Pid, x.Record?.ProcessStartedAt)).ToList();
+
+        if (stale.Count == 0)
+            return;
+
+        var liveUids = records.Except(stale)
+                              .Select(x => x.Record?.MinionUid)
+                              .Where(uid => !string.IsNullOrWhiteSpace(uid))
+                              .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (pid, record) in stale)
         {
-            if (!IsSameProcessAlive(pid, record?.ProcessStartedAt))
-                Delete(pid);
+            if (record?.MinionUid is { } uid && !liveUids.Contains(uid))
+                MinionAppStatusReporter.ReportStopped(pid, uid, record.KeycodeMd5);
+
+            Delete(pid);
         }
     }
 

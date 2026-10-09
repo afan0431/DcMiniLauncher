@@ -68,6 +68,9 @@ public interface ICatInternationalMinion
 
     /// <summary>占用记录里这个游戏进程是否已挂着 Minion</summary>
     bool IsAttached(Process process);
+
+    /// <summary>游戏退出后告诉 MINIONAPP 这一行停机了（MINIONAPP 没在运行时什么也不做）</summary>
+    void ReportStopped(int gamePid);
 }
 
 /// <summary>
@@ -316,4 +319,7 @@ internal sealed class CatInternationalMinion : ICatInternationalMinion
 
     public bool IsAttached(Process process) =>
         CatMinionReservations.IsAttached(process);
+
+    public void ReportStopped(int gamePid) =>
+        MinionAppStatusReporter.ReportStopped(gamePid);
 }
