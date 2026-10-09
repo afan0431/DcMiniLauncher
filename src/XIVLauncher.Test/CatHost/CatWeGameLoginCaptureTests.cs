@@ -6,6 +6,7 @@ using XIVLauncher.CatHost;
 using XIVLauncher.Common.Game;
 using XIVLauncher.Login.Exceptions;
 using XIVLauncher.Login.WeGame;
+using XIVLauncher.Test.International;
 using Xunit;
 
 namespace XIVLauncher.Test.CatHost;
@@ -13,11 +14,13 @@ namespace XIVLauncher.Test.CatHost;
 /// <summary>
 ///     WeGame 号就地登录: 全部用假的本机环境和假的账号库, 不拉起 WeGame、不结束进程、不碰真实账号库
 /// </summary>
+[Collection(SerilogCaptureCollection.NAME)]
 public sealed class CatWeGameLoginCaptureTests
 {
     private const string REQUESTED = "123456";
     private const string USER_ID   = "10000000000000001";
     private const string TOKEN     = "captured-token-AAAA";
+    private const string HANDED    = "handed-off-token-DDDD";
 
     private const string UI_HINT = "请在这台电脑的 DcMiniLauncher 界面版里用 WeGame 方式重新登录一次";
 
@@ -36,6 +39,14 @@ public sealed class CatWeGameLoginCaptureTests
         Assert.Equal("XIVLauncher.CatHost.CatWeGameLoginCapture", typeof(CatWeGameLoginCapture).FullName);
         Assert.Same(typeof(CatInternationalGameRunner).Assembly, typeof(CatWeGameLoginCapture).Assembly);
         Assert.Equal("waitingWeGameLogin", CatStages.WAITING_WE_GAME_LOGIN);
+    }
+
+    /// <summary>工作台外壳靠程序集里有没有这个类型名判断能不能下发 WeGame 登录信息, 名字和命名空间不能改</summary>
+    [Fact]
+    public void TokenHandoff_TypeNameIsStable()
+    {
+        Assert.Equal("XIVLauncher.CatHost.CatWeGameTokenHandoff", typeof(CatWeGameTokenHandoff).FullName);
+        Assert.Same(typeof(CatWeGameLoginCapture).Assembly, typeof(CatWeGameTokenHandoff).Assembly);
     }
 
     [Fact]
@@ -413,6 +424,279 @@ public sealed class CatWeGameLoginCaptureTests
 
     #endregion
 
+    #region 工作台下发的登录信息
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Handoff_NoRow_CreatesRowWithRequestedNumberAsNote_AndLogsInWithoutWeGame(bool weGameLogin)
+    {
+        var capture = Create();
+
+        var row    = await capture.FindRowAsync(Handoff(weGameLogin), reporter, CancellationToken.None);
+        var result = await capture.LoginAsync(Handoff(weGameLogin), row, reporter, LoginOk, CancellationToken.None);
+
+        Assert.Equal(new CatWeGameRow(USER_ID, REQUESTED), row);
+        Assert.Equal((USER_ID, HANDED, (string?)REQUESTED), Assert.Single(store.Saved));
+        Assert.Equal("ok:" + HANDED, result);
+        Assert.Equal([HANDED], loginTokens);
+        Assert.Empty(store.Cleared);
+        Assert.Equal(0, environment.CaptureCount);
+        Assert.Empty(environment.Calls);
+        Assert.Empty(reporter.Entries);
+    }
+
+    [Fact]
+    public async Task Handoff_RowFoundByNote_WithAnotherToken_IsUpdated_AndKeepsItsNote()
+    {
+        store.Add(USER_ID, "老王 QQ123456", "old-token-BBBB");
+        var capture = Create();
+
+        var row = await capture.FindRowAsync(Handoff(true), reporter, CancellationToken.None);
+
+        Assert.Equal("ok:" + HANDED, await capture.LoginAsync(Handoff(true), row, reporter, LoginOk, CancellationToken.None));
+        Assert.Equal((USER_ID, HANDED, (string?)null), Assert.Single(store.Saved));
+        Assert.Equal(new CatWeGameRow(USER_ID, "老王 QQ123456"), Assert.Single(store.Rows));
+        Assert.Equal(0, environment.CaptureCount);
+    }
+
+    [Fact]
+    public async Task Handoff_RowWithoutToken_IsFilled()
+    {
+        store.Add(USER_ID, REQUESTED, null);
+        var capture = Create();
+
+        var row = await capture.FindRowAsync(Handoff(false), reporter, CancellationToken.None);
+
+        Assert.Equal("ok:" + HANDED, await capture.LoginAsync(Handoff(false), row, reporter, LoginOk, CancellationToken.None));
+        Assert.Equal((USER_ID, HANDED, (string?)null), Assert.Single(store.Saved));
+    }
+
+    [Fact]
+    public async Task Handoff_SameTokenAlreadySaved_IsNotWritten()
+    {
+        store.Add(USER_ID, REQUESTED, HANDED);
+        var capture = Create();
+
+        var row = await capture.FindRowAsync(Handoff(true), reporter, CancellationToken.None);
+
+        Assert.Equal("ok:" + HANDED, await capture.LoginAsync(Handoff(true), row, reporter, LoginOk, CancellationToken.None));
+        Assert.Empty(store.Saved);
+        Assert.Equal(0, environment.CaptureCount);
+    }
+
+    [Fact]
+    public async Task Handoff_RowWithEmptyNote_GetsRequestedNumberAsNote()
+    {
+        store.Add(USER_ID, "", "old-token-BBBB");
+        var capture = Create();
+
+        var row = await capture.FindRowAsync(Handoff(false), reporter, CancellationToken.None);
+
+        Assert.Equal(new CatWeGameRow(USER_ID, REQUESTED), row);
+        Assert.Equal((USER_ID, HANDED, (string?)REQUESTED), Assert.Single(store.Saved));
+        Assert.Equal("ok:" + HANDED, await capture.LoginAsync(Handoff(false), row, reporter, LoginOk, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Handoff_RequestedNumberBoundToAnotherUser_IsNotUsed()
+    {
+        store.Add("10000000000000009", "QQ123456", "other-token-CCCC");
+        var capture = Create();
+
+        var row = await capture.FindRowAsync(Handoff(true), reporter, CancellationToken.None);
+
+        // 照本机原有的行和登录信息走
+        Assert.Equal("10000000000000009", row.UserName);
+        Assert.Equal("ok:other-token-CCCC", await capture.LoginAsync(Handoff(true), row, reporter, LoginOk, CancellationToken.None));
+        Assert.Empty(store.Saved);
+        Assert.False(store.Tokens.ContainsKey(USER_ID));
+    }
+
+    [Fact]
+    public async Task Handoff_UserRowBelongsToAnotherCustomer_IsNotUsed()
+    {
+        store.Add(USER_ID, "654321", "other-token-CCCC");
+
+        var ex = await Assert.ThrowsAsync<CatLaunchException>(() => Create().FindRowAsync(Handoff(false), reporter, CancellationToken.None));
+
+        // 与没下发时一样: 账号库里找不到这个号
+        Assert.Equal(CatCodes.AUTHORIZATION_REQUIRED, ex.Code);
+        Assert.StartsWith("DcMiniLauncher 账号库里没有这个 WeGame 号", ex.Message);
+        Assert.Empty(store.Saved);
+        Assert.Equal(new CatWeGameRow(USER_ID, "654321"), Assert.Single(store.Rows));
+        Assert.Equal("other-token-CCCC", store.Tokens[USER_ID]);
+    }
+
+    [Fact]
+    public async Task Handoff_AmbiguousNote_IsNotUsed()
+    {
+        store.Add("10000000000000002", "大号 123456", "t1-AAAAAA");
+        store.Add("10000000000000003", "小号(123456)", "t2-AAAAAA");
+
+        var ex = await Assert.ThrowsAsync<CatLaunchException>(() => Create().FindRowAsync(Handoff(true), reporter, CancellationToken.None));
+
+        Assert.Equal(CatCodes.WE_GAME_ACCOUNT_AMBIGUOUS, ex.Code);
+        Assert.Empty(store.Saved);
+        Assert.Equal(2, store.Rows.Count);
+        Assert.Equal(0, environment.CaptureCount);
+    }
+
+    [Fact]
+    public async Task Handoff_TokenRejected_IsCleared_ThenWaitsForLogin_AndSavesTheNewOne()
+    {
+        environment.Result = new WeGameCaptureResult(USER_ID, TOKEN);
+        var capture = Create();
+
+        var row = await capture.FindRowAsync(Handoff(true), reporter, CancellationToken.None);
+        var result = await capture.LoginAsync
+                     (
+                         Handoff(true),
+                         row,
+                         reporter,
+                         (token, _) =>
+                         {
+                             loginTokens.Add(token);
+                             return token == TOKEN ? Task.FromResult("ok") : throw Rejected();
+                         },
+                         CancellationToken.None
+                     );
+
+        Assert.Equal("ok", result);
+        Assert.Equal([HANDED, TOKEN], loginTokens);
+        Assert.Equal([USER_ID], store.Cleared);
+        Assert.Equal([(USER_ID, HANDED, (string?)REQUESTED), (USER_ID, TOKEN, (string?)null)], store.Saved);
+        Assert.Equal(TOKEN, store.Tokens[USER_ID]);
+        Assert.Equal(1, environment.CaptureCount);
+        Assert.Equal(["stage:waitingWeGameLogin", "stage:preparing"], reporter.Entries);
+    }
+
+    [Fact]
+    public async Task Handoff_TokenRejected_WithoutWeGameLogin_IsClearedAndFails()
+    {
+        var capture = Create();
+        var row     = await capture.FindRowAsync(Handoff(false), reporter, CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<CatLaunchException>(() => capture.LoginAsync<string>(Handoff(false), row, reporter, (_, _) => throw Rejected(), CancellationToken.None));
+
+        Assert.Equal(CatCodes.AUTHORIZATION_REQUIRED, ex.Code);
+        Assert.Equal([USER_ID], store.Cleared);
+        Assert.Equal(0, environment.CaptureCount);
+    }
+
+    [Fact]
+    public async Task Handoff_SaveFails_FallsBackToTheSavedToken()
+    {
+        store.Add(USER_ID, REQUESTED, "old-token-BBBB");
+        store.SaveFailure = new InvalidOperationException("登录信息加密失败");
+        var capture = Create();
+
+        var row = await capture.FindRowAsync(Handoff(true), reporter, CancellationToken.None);
+
+        Assert.Equal(new CatWeGameRow(USER_ID, REQUESTED), row);
+        Assert.Equal("ok:old-token-BBBB", await capture.LoginAsync(Handoff(true), row, reporter, LoginOk, CancellationToken.None));
+        Assert.Equal(0, environment.CaptureCount);
+    }
+
+    [Fact]
+    public async Task Handoff_SaveFails_WithoutRow_KeepsTheOriginalFlow()
+    {
+        store.SaveFailure = new InvalidOperationException("登录信息加密失败");
+
+        var ex = await Assert.ThrowsAsync<CatLaunchException>(() => Create().FindRowAsync(Handoff(false), reporter, CancellationToken.None));
+
+        Assert.Equal(CatCodes.AUTHORIZATION_REQUIRED, ex.Code);
+        Assert.Empty(store.Rows);
+    }
+
+    [Fact]
+    public async Task Handoff_TokenNeverWrittenToTheLog()
+    {
+        using var logs = new CapturedLogs();
+
+        // 新建
+        await Create().FindRowAsync(Handoff(false), reporter, CancellationToken.None);
+
+        // 对不上
+        var conflicting = new FakeStore();
+        conflicting.Add("10000000000000009", REQUESTED, "other-token-CCCC");
+        await new CatWeGameLoginCapture(environment, conflicting, redactor).FindRowAsync(Handoff(false), reporter, CancellationToken.None);
+
+        // 写库出错
+        var failing = new FakeStore { SaveFailure = new InvalidOperationException("登录信息加密失败") };
+        failing.Add(USER_ID, REQUESTED, "old-token-BBBB");
+        await new CatWeGameLoginCapture(environment, failing, redactor).FindRowAsync(Handoff(false), reporter, CancellationToken.None);
+
+        Assert.Contains("工作台下发的 WeGame 登录信息", logs.All);
+        Assert.DoesNotContain(HANDED, logs.All);
+    }
+
+    [Fact]
+    public async Task Handoff_LaunchLog_OnlySaysTheTokenWasHandedOff()
+    {
+        using var logs = new CapturedLogs();
+        var runner = new FakeGameRunner();
+        var host   = new CatLaunchHost(runner, (_, _) => Task.CompletedTask, new CatLogRedactor());
+
+        Assert.True(host.Launch(new CatLaunchParams("op1", REQUESTED, false, null, Platform: "weGame", WeGameToken: HANDED, WeGameAccountId: USER_ID)).Accepted);
+        await runner.Started.Task.WaitAsync(Timeout);
+        runner.Finish.TrySetResult(0);
+
+        Assert.Contains("下发 WeGame 登录信息=\"带了\"", logs.All);
+        Assert.DoesNotContain(HANDED, logs.All);
+    }
+
+    [Fact]
+    public async Task Store_Handoff_CreatesRow_LikeTheOneTheUiCreates_AndLogsInWithIt()
+    {
+        using var library = await TempLibrary.CreateAsync();
+        var accountStore = new CatWeGameAccountStore(library.Manager);
+        var capture      = new CatWeGameLoginCapture(environment, accountStore, redactor);
+
+        var row = await capture.FindRowAsync(Handoff(true), reporter, CancellationToken.None);
+
+        Assert.Equal(new CatWeGameRow(USER_ID, REQUESTED), row);
+        Assert.Equal(USER_ID, accountStore.GetAccount(row).UserName);
+        Assert.Equal("ok:" + HANDED, await capture.LoginAsync(Handoff(true), row, reporter, LoginOk, CancellationToken.None));
+        Assert.Equal(0, environment.CaptureCount);
+
+        var saved = library.Reopen().FindAccount(USER_ID, XIVAccountType.WeGame)!;
+        Assert.Equal(REQUESTED, saved.UserDefinedName);
+        Assert.Equal(USER_ID, saved.WeGameLoginAccount);
+        Assert.True(saved.QuickLoginEnabled);
+        Assert.False(saved.DeviceProfileDynamicEnabled);
+        Assert.Equal(HANDED, await library.Manager.Decrypt(saved.WeGameQuickLoginSecret));
+    }
+
+    [Fact]
+    public async Task Store_Handoff_UpdatesRowAddedByAnotherProcess_AndRejectedTokenIsCleared()
+    {
+        using var library = await TempLibrary.CreateAsync();
+        var accountStore = new CatWeGameAccountStore(library.Manager);
+        Assert.Empty(accountStore.ListRows());
+
+        // 本进程加载之后, 界面版登录了这个号并填了备注
+        var ui       = library.Reopen();
+        var existing = NewAccount(USER_ID, XIVAccountType.WeGame, "老王 QQ123456");
+        existing.WeGameQuickLoginSecret = await ui.Encrypt("old-token-BBBB");
+        ui.AddAccount(existing);
+
+        var capture = new CatWeGameLoginCapture(environment, accountStore, redactor);
+        var row     = await capture.FindRowAsync(Handoff(false), reporter, CancellationToken.None);
+
+        Assert.Equal(new CatWeGameRow(USER_ID, "老王 QQ123456"), row);
+        Assert.Equal(HANDED, await library.Manager.Decrypt(library.Reopen().FindAccount(USER_ID, XIVAccountType.WeGame)!.WeGameQuickLoginSecret));
+
+        var ex = await Assert.ThrowsAsync<CatLaunchException>(() => capture.LoginAsync<string>(Handoff(false), row, reporter, (_, _) => throw Rejected(), CancellationToken.None));
+
+        Assert.Equal(CatCodes.AUTHORIZATION_REQUIRED, ex.Code);
+        var cleared = library.Reopen().FindAccount(USER_ID, XIVAccountType.WeGame)!;
+        Assert.Null(cleared.WeGameQuickLoginSecret);
+        Assert.Equal("老王 QQ123456", cleared.UserDefinedName);
+    }
+
+    #endregion
+
     #region 账号库（临时目录里的真实实现）
 
     [Fact]
@@ -509,6 +793,9 @@ public sealed class CatWeGameLoginCaptureTests
 
     private static CatLaunchRequest Request(bool weGameLogin) =>
         new("op", REQUESTED, false, null, Platform: XIVAccountType.WeGame, WeGameLogin: weGameLogin);
+
+    private static CatLaunchRequest Handoff(bool weGameLogin) =>
+        Request(weGameLogin) with { WeGameToken = new CatSecret(HANDED), WeGameAccountId = USER_ID };
 
     private Task<string> LoginOk(string token, CancellationToken cancellationToken)
     {
@@ -610,6 +897,8 @@ public sealed class CatWeGameLoginCaptureTests
 
         public int ReadTokenCount { get; private set; }
 
+        public Exception? SaveFailure { get; set; }
+
         public void Add(string userName, string? note, string? token)
         {
             Rows.Add(new CatWeGameRow(userName, note));
@@ -638,6 +927,9 @@ public sealed class CatWeGameLoginCaptureTests
 
         public Task<CatWeGameRow> SaveCapturedAsync(string userId, string token, string? note)
         {
+            if (SaveFailure != null)
+                throw SaveFailure;
+
             Saved.Add((userId, token, note));
 
             var index = Rows.FindIndex(x => x.UserName == userId);
