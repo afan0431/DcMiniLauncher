@@ -342,7 +342,12 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         ).ConfigureAwait(false);
 
         lock (cleanupLock)
+        {
             recordedGames[process.Id] = record.ProcessStartedAt;
+
+            // 受理 adopt 时认领的守护锁: 这个游戏一退出（含崩溃重开换了新进程）就放掉, 不等整个接管流程结束
+            guardClaims[process.Id] = adoptRequest.GuardClaim;
+        }
 
         context.InGameAgents = (record.Dalamud ? InGameAgents.Dalamud : InGameAgents.None) | (record.MinionFingerprint != null ? InGameAgents.Minion : InGameAgents.None);
         RunningGameRegistry.Register(process, context.InGameAgents, context.DcTravelPort);
