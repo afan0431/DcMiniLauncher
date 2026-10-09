@@ -8,6 +8,13 @@
 //   VERSION     → OK version=… pid=… log=…
 //   MAINTHREAD  → OK tid=… window=… main=… same=0|1   （在主线程上取到的线程 id）
 //   UNLOAD      → OK BYE, 随后模块自我卸载
+//
+// ⚠ 管道必须是重叠 I/O（FILE_FLAG_OVERLAPPED）, 别改回同步:
+//   同步句柄上挂着 ReadFile / ConnectNamedPipe 时, 内核为这个文件对象持锁, 别的进程复制句柄来查名字
+//   （GetFileInformationByHandleEx / NtQueryObject）会一直排队到这次 I/O 结束。MinionLauncher_64 挂载前
+//   会遍历所有游戏进程的句柄、按 100 ms 超时取名, 超时后留下的线程迟早写坏内存让启动器崩溃（0xC0000005）。
+//   多开时启动器每 15 s 轮询一次各客户端的本管道, 撞上的概率高到挂载几乎必崩（2026-10-09 PC2 转储与现场复现）。
+//   重叠句柄不持这把锁, 取名立即返回。
 #include "MiniModule.h"
 
 #include <atomic>
@@ -196,13 +203,27 @@ namespace
         return "FAIL unknown-command";
     }
 
+    // 发起一次重叠 I/O 后等它完成; 语义与同步调用相同（成功返回 TRUE, 失败时 GetLastError 是这次 I/O 的错误）
+    BOOL CompleteIo(HANDLE pipe, OVERLAPPED& overlapped, BOOL started, DWORD& transferred)
+    {
+        if (started)
+            return GetOverlappedResult(pipe, &overlapped, &transferred, FALSE);
+
+        if (GetLastError() != ERROR_IO_PENDING)
+            return FALSE;
+
+        return GetOverlappedResult(pipe, &overlapped, &transferred, TRUE);
+    }
+
     // 一个客户端的完整会话; 客户端断开就返回
-    void ServeSession(HANDLE pipe)
+    void ServeSession(HANDLE pipe, OVERLAPPED& overlapped)
     {
         char  buffer[1024];
         DWORD read = 0;
 
-        while (!g_stop.load() && ReadFile(pipe, buffer, sizeof(buffer) - 1, &read, nullptr) && read > 0)
+        while (!g_stop.load() &&
+               CompleteIo(pipe, overlapped, ReadFile(pipe, buffer, sizeof(buffer) - 1, nullptr, &overlapped), read) &&
+               read > 0)
         {
             buffer[read] = '\0';
 
@@ -216,7 +237,9 @@ namespace
             LogF("[pipe] < %s | > %s", secret ? "SETSID <已隐去>" : command.c_str(), shown.c_str());
 
             DWORD written = 0;
-            if (!WriteFile(pipe, response.c_str(), static_cast<DWORD>(response.size()), &written, nullptr))
+            if (!CompleteIo(pipe, overlapped,
+                            WriteFile(pipe, response.c_str(), static_cast<DWORD>(response.size()), nullptr, &overlapped),
+                            written))
             {
                 LogF("[pipe] 回包失败 err=%lu", GetLastError());
                 return;
@@ -232,10 +255,18 @@ void PipeServerRun()
     const std::string name = PipeName();
     LogF("[pipe] 服务端启动 %s", name.c_str());
 
+    // 手动复位事件; 每次 ReadFile / WriteFile / ConnectNamedPipe 发起时系统会先把它复位
+    const HANDLE ioEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (ioEvent == nullptr)
+    {
+        LogF("[pipe] 创建事件失败 err=%lu, 管道服务不可用", GetLastError());
+        return;
+    }
+
     while (!g_stop.load())
     {
         const HANDLE pipe = CreateNamedPipeA(name.c_str(),
-                                             PIPE_ACCESS_DUPLEX,
+                                             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                              PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                                              1,      // 一次只服务一个启动器
                                              4096, 4096,
@@ -249,12 +280,22 @@ void PipeServerRun()
             continue;
         }
 
-        const BOOL connected = ConnectNamedPipe(pipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        OVERLAPPED overlapped {};
+        overlapped.hEvent = ioEvent;
+
+        DWORD unused = 0;
+        BOOL  connected;
+        if (ConnectNamedPipe(pipe, &overlapped))
+            connected = TRUE;
+        else if (GetLastError() == ERROR_PIPE_CONNECTED) // 客户端抢在 Connect 之前就连上了, 事件不会被置位
+            connected = TRUE;
+        else
+            connected = CompleteIo(pipe, overlapped, FALSE, unused);
 
         if (connected)
         {
             LogF("[pipe] 启动器已连接");
-            ServeSession(pipe);
+            ServeSession(pipe, overlapped);
             LogF("[pipe] 会话结束");
         }
 
@@ -262,5 +303,6 @@ void PipeServerRun()
         CloseHandle(pipe);
     }
 
+    CloseHandle(ioEvent);
     LogF("[pipe] 服务端退出");
 }
