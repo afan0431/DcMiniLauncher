@@ -8,7 +8,7 @@ namespace XIVLauncher.CatHost;
 /// </summary>
 public static class CatHostRuntime
 {
-    /// <summary>游戏已退出（任何方式）且已发 game.exited; 或还没 launch 就收到 close</summary>
+    /// <summary>游戏已退出（任何方式）且已发 game.exited; 或只登录已完成且已发 launch.authorized; 或还没 launch 就收到 close</summary>
     public const int EXIT_OK = 0;
 
     /// <summary>stdin 握手无效或管道无法创建</summary>
@@ -94,7 +94,7 @@ public static class CatHostRuntime
                     {
                         host.Log("error", message);
 
-                        if (host.HasLaunch && !host.HasStarted)
+                        if (host.HasLaunch && !host.HasStarted && !host.IsAuthorized)
                             host.Failed(CatCodes.LAUNCH_FAILED, message);
 
                         await host.DrainEventsAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
