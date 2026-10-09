@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using XIVLauncher.CatHost;
 using XIVLauncher.Minion;
 using Xunit;
 
@@ -82,6 +83,72 @@ public sealed class MinionOccupancyTests : IDisposable
             live.Kill();
         }
     }
+
+    [Fact]
+    public async Task Reserve_International_WritesLaunchVariantAndUid()
+    {
+        using var game = StartSleeper();
+
+        try
+        {
+            var (error, reserved) = await CatMinionReservations.ReserveAsync(Card(MinionCards.VARIANT_GLOBAL), game, "seAccount", MinionOccupancy.GetProcessStartedAt);
+
+            Assert.Null(error);
+            Assert.True(reserved);
+
+            var record = MinionOccupancy.Read(game.Id)!;
+            Assert.Equal(MinionCards.VARIANT_GLOBAL, record.Variant);
+            Assert.Equal("0123456789abcdef", record.CardFingerprint);
+            Assert.Equal(UID, record.MinionUid);
+            Assert.Equal("seAccount", record.AccountName);
+
+            var json = await File.ReadAllTextAsync(MinionOccupancy.FilePath(game.Id));
+            Assert.DoesNotContain(KEYCODE, json);
+            Assert.DoesNotContain(FORUM_PASSWORD, json);
+            Assert.DoesNotContain(FORUM_ID, json);
+        }
+        finally
+        {
+            game.Kill();
+        }
+    }
+
+    [Fact]
+    public async Task Reserve_SameUidOnAnotherLiveGame_IsAlreadyAttached()
+    {
+        using var first  = StartSleeper();
+        using var second = StartSleeper();
+
+        try
+        {
+            MinionOccupancy.Write(NewRecord(first) with { MinionUid = UID });
+
+            var (error, reserved) = await CatMinionReservations.ReserveAsync(Card(MinionCards.VARIANT_CN), second, "acc", MinionOccupancy.GetProcessStartedAt);
+
+            Assert.Equal(CatCodes.ALREADY_ATTACHED, error?.Code);
+            Assert.False(reserved);
+            Assert.Null(MinionOccupancy.Read(second.Id));
+
+            // 同一个游戏重挂（force）: 不算占用, 也不再写预占
+            var (again, reservedAgain) = await CatMinionReservations.ReserveAsync(Card(MinionCards.VARIANT_CN), first, "acc", MinionOccupancy.GetProcessStartedAt);
+
+            Assert.Null(again);
+            Assert.False(reservedAgain);
+        }
+        finally
+        {
+            first.Kill();
+            second.Kill();
+        }
+    }
+
+    private const string UID            = "0123456789abcdef0123456789abcdef";
+    private const string KEYCODE        = "FFXIVXFAKE2222222222222222222222";
+    private const string FORUM_ID       = "fake-forum-user";
+    private const string FORUM_PASSWORD = "fake-forum-pass";
+
+    private static CatMinionLaunch Card(string variant) =>
+        new("0123456789abcdef", variant, new CatSecret(KEYCODE), UID, FORUM_ID, new CatSecret(FORUM_PASSWORD));
 
     private static MinionOccupancyRecord NewRecord(Process process) =>
         new()

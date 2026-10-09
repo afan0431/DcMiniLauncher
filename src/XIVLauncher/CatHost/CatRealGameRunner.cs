@@ -67,10 +67,6 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     private readonly HashSet<int>        cleanedPids         = [];
     private readonly object              closeLock           = new();
 
-    /// <summary>选 Minion 行并写预占记录时持有, 防止同一张卡的号同时启动时选到同一行</summary>
-    private const string MINION_SELECT_MUTEX_NAME = @"Local\DcMiniLauncher-MinionSelect";
-
-    private static readonly TimeSpan MinionSelectMutexTimeout = TimeSpan.FromSeconds(30);
     private readonly CancellationTokenSource closeCts        = new();
 
     private CatLaunchRequest       request        = null!;
@@ -186,7 +182,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         autoEnter?.SelectCharacter(contentId) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等人选角色");
 
     /// <summary>
-    ///     游戏起来后出了意外异常: 不再守护（崩溃重启、跨区刷新）, 但照样等游戏结束、补报 Minion 停机, 再发 game.exited。期间 close 仍可用。
+    ///     游戏起来后出了意外异常: 不再守护（崩溃重启、跨区刷新）, 但照样等游戏结束再发 game.exited。期间 close 仍可用。
     /// </summary>
     private async Task<int> GuardAfterErrorAsync(Exception exception, ICatLaunchReporter reporter)
     {
@@ -234,7 +230,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
             if (minion)
             {
-                if (!force && IsMinionAttached(process.UnderlyingProcess))
+                if (!force && CatMinionReservations.IsAttached(process.UnderlyingProcess))
                     reporter.Agent(CatAgentKinds.MINION, true, CatCodes.ALREADY_ATTACHED, "这个游戏已经挂着 Minion, 没有重复挂; 要重新挂请带 force");
                 else
                     await AttachMinionAsync(process, IsDalamudLoaded(process.UnderlyingProcess), reporter, cancellationToken).ConfigureAwait(false);
@@ -300,8 +296,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         if (request.Minion)
         {
-            // 起游戏前先确认这张卡在本机有对应的行; 真正选哪一行在挂载前加锁再选并预占
-            _ = ReloadMinionRow(reporter, null, out var minionError) ?? throw new CatLaunchException(minionError.Code, minionError.Message);
+            // 起游戏前先确认本机能挂 Minion; 占用检查与预占在挂载前加锁再做
+            if (CatMinionReservations.Check(request.MinionCard) is { } minionError)
+                throw new CatLaunchException(minionError.Code, minionError.Message);
         }
 
         device = CatDeviceProfiles.Resolve(accountManager, account, out var isPerAccount)
@@ -408,63 +405,6 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             throw new CatLaunchException(CatCodes.LAUNCH_FAILED, "获取大区列表失败: 列表为空");
 
         return areas;
-    }
-
-    private MinionAccount? ReloadMinionRow(ICatLaunchReporter reporter, int? selfPid, out (string Code, string Message) error)
-    {
-        error = default;
-
-        if (!request.Minion)
-        {
-            error = (CatCodes.MINION_NOT_CONFIGURED, "launch 时没有指定 Minion 卡");
-            return null;
-        }
-
-        var installPath = MinionAccounts.InstallPath;
-
-        if (!MinionAccounts.IsLauncherPresent(installPath))
-        {
-            error = (CatCodes.MINION_NOT_CONFIGURED, $"找不到 {MinionAccounts.GetLauncherExePath(installPath)}, 请在 DcMiniLauncher「设置 → Minion」里指定安装目录");
-            return null;
-        }
-
-        if (string.IsNullOrWhiteSpace(App.Settings.MinionId) || string.IsNullOrWhiteSpace(App.Settings.MinionPassword))
-        {
-            error = (CatCodes.MINION_NOT_CONFIGURED, "DcMiniLauncher「设置 → Minion」里的 Minion 账号或密码没填");
-            return null;
-        }
-
-        IReadOnlyList<MinionAccount> rows;
-
-        try
-        {
-            rows = MinionAccounts.LoadAccounts(installPath);
-        }
-        catch (Exception ex)
-        {
-            error = (CatCodes.MINION_NOT_CONFIGURED, $"读取 Minion 账号文件失败: {ex.Message}");
-            return null;
-        }
-
-        var occupied = MinionOccupancy.ReadAllLive()
-                                      .Where(x => x.Pid != selfPid)
-                                      .Select(x => x.MinionUid)
-                                      .Where(uid => !string.IsNullOrWhiteSpace(uid))
-                                      .Select(uid => uid!.Trim())
-                                      .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        var selection = MinionCards.SelectRow(rows, request.CardFingerprint!, request.Variant!, MinionCards.ConfiguredCnGameRoots(), occupied);
-        var row       = selection.Row;
-
-        Log.Information("[CatHost] 按卡 {Fingerprint} 选 {Variant} 行: {Notes}", request.CardFingerprint, request.Variant, string.Join(" | ", selection.Notes));
-
-        if (selection.AllOccupied)
-            reporter.Log("warning", $"卡 {request.CardFingerprint} 的{(request.Variant == MinionCards.VARIANT_GLOBAL ? "国际服" : "国服")}行都已挂在别的游戏上, 仍挂第一行, 可能把那边的 Minion 顶掉");
-
-        if (row == null)
-            error = (CatCodes.MINION_CARD_NOT_FOUND, $"本机 Minion Accounts.json 里找不到卡 {request.CardFingerprint} 的{(request.Variant == MinionCards.VARIANT_GLOBAL ? "国际服" : "国服")}注入行（按该行的游戏执行程序是否位于国服游戏目录之下区分）");
-
-        return row;
     }
 
     #endregion
@@ -1299,9 +1239,6 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         lastExitCode = TryGetExitCode(launched);
 
         Log.Information("[CatHost] 游戏进程已退出 (PID={ProcessID}, ExitCode=0x{ExitCode:X8})", launched.ProcessID, (uint)(lastExitCode ?? 0));
-
-        // 告诉 MINIONAPP 这一行停机了, 否则它会过一分钟自己拉个新客户端
-        MinionAppStatusReporter.ReportStopped(launched.ProcessID);
     }
 
     private static int? TryGetExitCode(FFXIVProcess process)
@@ -1398,24 +1335,21 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     {
         reporter.Stage(CatStages.ATTACHING_MINION);
 
-        var (minionRow, error, reserved) = await ReserveMinionRowAsync(launched.UnderlyingProcess, reporter).ConfigureAwait(false);
+        var (error, reserved) = await CatMinionReservations.ReserveAsync(request.MinionCard, launched.UnderlyingProcess, request.AccountName, SafeProcessStartedAt)
+                                                           .ConfigureAwait(false);
 
-        if (minionRow == null)
+        if (error is { } failure)
         {
-            reporter.Agent(CatAgentKinds.MINION, false, error.Code, error.Message);
+            reporter.Agent(CatAgentKinds.MINION, false, failure.Code, failure.Message);
             return;
         }
-
-        if (!string.IsNullOrEmpty(minionRow.Keycode))
-            redactor.Register(minionRow.Keycode);
-        redactor.Register(App.Settings.MinionPassword);
 
         var ok = false;
 
         try
         {
             // 占用记录里写上号请求带的账号名（外壳认得的那个）: 按备注找到的 WeGame 号, 它与账号库里的账号名不同
-            var result = await MinionAttacher.AttachAsync(minionRow, launched.UnderlyingProcess, gamePath, dalamudInjected, request.AccountName, cancellationToken)
+            var result = await MinionAttacher.AttachAsync(request.MinionCard!, launched.UnderlyingProcess, gamePath, dalamudInjected, request.AccountName, cancellationToken)
                                              .ConfigureAwait(false);
             ok = result.Ok;
 
@@ -1436,46 +1370,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
         finally
         {
-            // 没挂上就撤掉预占, 别让这一行一直显示被占用
+            // 没挂上就撤掉预占, 别让这张卡一直显示被占用
             if (reserved && !ok)
                 MinionOccupancy.Delete(launched.ProcessID);
         }
-    }
-
-    /// <summary>
-    ///     加跨进程锁选 Minion 行, 并立即为这个游戏写占用记录作预占（挂载成功后由挂载流程覆盖成正式记录）。
-    ///     拿不到锁时不加锁照常选。这个游戏已有自己的记录（force 重挂）时不再写预占。
-    /// </summary>
-    private async Task<(MinionAccount? Row, (string Code, string Message) Error, bool Reserved)> ReserveMinionRowAsync(Process process, ICatLaunchReporter reporter)
-    {
-        using var gate = await CrossProcessMutex.TryAcquireAsync(MINION_SELECT_MUTEX_NAME, MinionSelectMutexTimeout).ConfigureAwait(false);
-
-        var row = ReloadMinionRow(reporter, process.Id, out var error);
-
-        if (row == null)
-            return (null, error, false);
-
-        var startedAt = SafeProcessStartedAt(process);
-
-        if (MinionOccupancy.Read(process.Id) is { } existing && existing.ProcessStartedAt == startedAt)
-            return (row, default, false);
-
-        var reserved = !string.IsNullOrWhiteSpace(row.Keycode) &&
-                       MinionOccupancy.Write
-                       (
-                           new MinionOccupancyRecord
-                           {
-                               Pid              = process.Id,
-                               ProcessStartedAt = startedAt,
-                               CardFingerprint  = MinionCards.Fingerprint(row.Keycode),
-                               Variant          = request.Variant ?? MinionCards.VARIANT_CN,
-                               AccountName      = request.AccountName,
-                               MinionUid        = string.IsNullOrWhiteSpace(row.Uid) ? null : row.Uid.Trim(),
-                               AttachedAt       = DateTimeOffset.UtcNow
-                           }
-                       );
-
-        return (row, default, reserved);
     }
 
     /// <summary>
@@ -1491,23 +1389,6 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             Log.Warning(ex, "[CatHost] 读取游戏进程创建时间失败, 用当前时间代替");
             return DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-        }
-    }
-
-    /// <summary>
-    ///     占用记录里这个游戏进程已挂着 Minion（同一进程: 创建时间一致）
-    /// </summary>
-    private static bool IsMinionAttached(Process process)
-    {
-        try
-        {
-            return MinionOccupancy.Read(process.Id) is { } record &&
-                   record.ProcessStartedAt == MinionOccupancy.GetProcessStartedAt(process);
-        }
-        catch (Exception ex)
-        {
-            Log.Debug(ex, "[CatHost] 读取 Minion 占用记录失败");
-            return false;
         }
     }
 

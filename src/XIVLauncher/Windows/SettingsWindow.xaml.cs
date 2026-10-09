@@ -25,9 +25,6 @@ public partial class SettingsWindow
         DataContext                                   = viewModel;
         CompanionAppListView.ContextMenu?.DataContext = viewModel;
 
-        // PasswordBox.Password 不能绑定, 手动回填一次
-        MinionPasswordBox.Password = viewModel.MinionPassword;
-
         DiscordButton.Click += (_, _) => Process.Start(new ProcessStartInfo(Links.DISCORD_URL) { UseShellExecute = true });
     }
 
@@ -71,9 +68,6 @@ public partial class SettingsWindow
         CompanionAppListView.SelectedItem = listViewItem.DataContext;
         listViewItem.IsSelected           = true;
     }
-
-    private void MinionPasswordBox_OnPasswordChanged(object sender, RoutedEventArgs e) =>
-        ViewModel.MinionPassword = MinionPasswordBox.Password;
 
     private void LicenseText_OnMouseUp(object sender, MouseButtonEventArgs e) =>
         ViewModel.OpenLicense();

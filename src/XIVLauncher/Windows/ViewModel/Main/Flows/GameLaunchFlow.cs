@@ -18,7 +18,6 @@ using XIVLauncher.Login;
 using XIVLauncher.Login.Channels;
 using XIVLauncher.Login.Client;
 using XIVLauncher.Login.Models;
-using XIVLauncher.Minion;
 using XIVLauncher.Support;
 using XIVLauncher.Update;
 using XIVLauncher.Windows.GameClientFiles;
@@ -91,10 +90,9 @@ internal sealed class GameLaunchFlow
             dalamudOk = dalamudUpdateResult == DalamudPrepareResult.OK;
         }
 
-        // 本次启动到底有哪个游戏内代理 —— 挂 Minion（F3）与游戏内跨大区走哪条路（F4）都看这个。
-        // Dalamud 那一位用 dalamudOk 而不是设置值: 开关开着但兼容/更新没过时它并不会真的注入。
-        gameLaunchContext.InGameAgents = (dalamudOk ? InGameAgents.Dalamud : InGameAgents.None)
-                                        | (App.Settings.MinionAttachEnabled ? InGameAgents.Minion : InGameAgents.None);
+        // 本次启动到底有哪个游戏内代理 —— 游戏内跨大区走哪条路（F4）看这个。界面版不挂 Minion, 挂 Minion 走 Cat 工作台上号。
+        // 用 dalamudOk 而不是设置值: 开关开着但兼容/更新没过时它并不会真的注入。
+        gameLaunchContext.InGameAgents = dalamudOk ? InGameAgents.Dalamud : InGameAgents.None;
 
         Log.Information("[GameLaunch] 本次启动的游戏内代理: {InGameAgents}", gameLaunchContext.InGameAgents);
 
@@ -203,18 +201,9 @@ internal sealed class GameLaunchFlow
             vm.IsLoggingIn = false;
         }
 
-        if (gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion))
-            await AttachMinionAsync(launched, gamePath, dalamudOk).ConfigureAwait(false);
-
         // F4: 登记这个客户端, 好让外部触发（bot 的 HTTP 请求 / 游戏内 UI）能找到它;
         //     端口一并落盘 —— 游戏内 UI 读不到 XL.DcTraveler 那个游戏参数
         RunningGameRegistry.Register(launched.UnderlyingProcess, gameLaunchContext.InGameAgents, gameLaunchContext.DcTravelPort);
-
-        // F4: 只要挂了 Minion 就注入自家模块 —— 「只 Minion」和「都注」两种模式都要能用。
-        // 「都注」时与 Dalamud 共存: 我们换的是 Framework 虚表里的 Tick 项, 随后照常调原函数,
-        // Dalamud 装在函数体上的 inline hook 仍在链上, 两边不冲突。
-        if (gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion))
-            await RunMiniModuleGateAsync(launched).ConfigureAwait(false);
 
         Log.Debug("等待游戏进程退出");
 
@@ -256,73 +245,7 @@ internal sealed class GameLaunchFlow
         // 退出码是事后判断「玩家自己关的」还是「闪退」的唯一线索, 打成 Info 方便排查
         Log.Information("游戏进程已退出 (PID={ProcessID}, ExitCode=0x{ExitCode:X8})", launched.ProcessID, (uint)launched.ExitCode);
 
-        // 告诉 MINIONAPP 这一行停机了, 否则它会转成「排队开始」并过一分钟自己拉个新客户端
-        MinionAppStatusReporter.ReportStopped(launched.ProcessID);
-
         return launched;
-    }
-
-    /// <summary>
-    ///     起完游戏后把 MinionLauncher 挂到游戏进程上（F3）。挂不上只提示, 不影响已经在跑的游戏。
-    ///     ⚠ 判据纪律: launcher 自报 "Attaching Successfull" 不算数, bot 有没有真跑看游戏内 overlay / 新 bot 日志。
-    /// </summary>
-    private async Task AttachMinionAsync(FFXIVProcess launched, DirectoryInfo gamePath, bool dalamudInjected)
-    {
-        try
-        {
-            var result = await MinionAttacher.AttachAsync
-                               (
-                                   launched.UnderlyingProcess,
-                                   gamePath,
-                                   dalamudInjected,
-                                   vm.LoginFlow.LoginCancellationToken
-                               ).ConfigureAwait(false);
-
-            if (result.Ok)
-                return;
-
-            Log.Error("[Minion] 挂载失败: {Error}", result.Error);
-
-            CustomMessageBox.Builder
-                            .NewFrom($"挂载 Minion 失败\n\n{result.Error}")
-                            .WithImage(MessageBoxImage.Warning)
-                            .WithAppendText("\n\n游戏已经启动, 可在补齐配置后手动挂载")
-                            .WithParentWindow(vm.Window)
-                            .Show();
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "[Minion] 挂载时发生未处理异常");
-
-            CustomMessageBox.Builder
-                            .NewFrom(ex, "Minion")
-                            .WithAppendText("\n\n挂载 Minion 时发生错误, 游戏已经启动, 不受影响")
-                            .WithParentWindow(vm.Window)
-                            .Show();
-        }
-    }
-
-    /// <summary>
-    ///     注入自家的游戏内模块并跑一次生死闸自检（F4）。
-    ///     模块文件不在（还没跑 build.ps1 / 发布里没带）就安静跳过, 绝不影响已经在跑的游戏。
-    /// </summary>
-    private async Task RunMiniModuleGateAsync(FFXIVProcess launched)
-    {
-        if (!MiniModuleInjector.ModulePath.Exists)
-        {
-            Log.Debug("[MiniModule] 没有 {Module}, 跳过", MiniModuleInjector.MODULE_FILE_NAME);
-            return;
-        }
-
-        try
-        {
-            await MiniModuleGate.RunAsync(launched.UnderlyingProcess, vm.LoginFlow.LoginCancellationToken)
-                                .ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "[MiniModule] 自检时发生未处理异常（游戏不受影响）");
-        }
     }
 
     /// <summary>

@@ -1,6 +1,8 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using XIVLauncher.CatHost;
 using XIVLauncher.Common.Game;
+using XIVLauncher.Minion;
 using Xunit;
 
 namespace XIVLauncher.Test.CatHost;
@@ -8,6 +10,18 @@ namespace XIVLauncher.Test.CatHost;
 public sealed class CatRpcServerTests : IDisposable
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(10);
+
+    private const string FINGERPRINT    = "0123456789abcdef";
+    private const string KEYCODE        = "FFXIVXFAKE0000000000000000000000000000";
+    private const string UID            = "0123456789abcdef0123456789abcdef";
+    private const string FORUM_ID       = "fake-forum-user";
+    private const string FORUM_PASSWORD = "fake-forum-pass!9";
+
+    private static object MinionJson(string variant) =>
+        new { cardFingerprint = FINGERPRINT, variant, keycode = KEYCODE, uid = UID, forumId = FORUM_ID, forumPassword = FORUM_PASSWORD };
+
+    private static CatMinionLaunch ExpectedMinion(string variant) =>
+        new(FINGERPRINT, variant, new CatSecret(KEYCODE), UID, FORUM_ID, new CatSecret(FORUM_PASSWORD));
 
     private readonly string                  pipeName = CatTestNames.NewPipeName();
     private readonly string                  token    = CatTestNames.NewToken();
@@ -110,7 +124,7 @@ public sealed class CatRpcServerTests : IDisposable
         var first = await client.RequestAsync
         (
             "launch",
-            new { operationId = "op1", accountName = "acc", dalamud = true, minion = new { cardFingerprint = "0123456789abcdef", variant = "global" }, areaName = " 豆豆柴 " }
+            new { operationId = "op1", accountName = "acc", dalamud = true, minion = MinionJson("global"), areaName = " 豆豆柴 " }
         );
         var second = await client.RequestAsync("launch", new { operationId = "op2", accountName = "acc", dalamud = false });
 
@@ -119,7 +133,7 @@ public sealed class CatRpcServerTests : IDisposable
         Assert.Equal("alreadyLaunched", second["result"]!["code"]!.GetValue<string>());
 
         await runner.Started.Task.WaitAsync(Timeout);
-        Assert.Equal(new CatLaunchRequest("op1", "acc", true, "0123456789abcdef", "global", AreaName: "豆豆柴"), runner.Request);
+        Assert.Equal(new CatLaunchRequest("op1", "acc", true, ExpectedMinion("global"), AreaName: "豆豆柴"), runner.Request);
     }
 
     [Theory]
@@ -136,7 +150,7 @@ public sealed class CatRpcServerTests : IDisposable
         await runner.Started.Task.WaitAsync(Timeout);
         Assert.Equal(XIVAccountType.WeGame, runner.Request!.Platform);
         Assert.True(runner.Request.IsWeGame);
-        Assert.Equal(new CatLaunchRequest("op1", "acc", false, null, null, Platform: XIVAccountType.WeGame), runner.Request);
+        Assert.Equal(new CatLaunchRequest("op1", "acc", false, null, Platform: XIVAccountType.WeGame), runner.Request);
     }
 
     [Theory]
@@ -154,7 +168,7 @@ public sealed class CatRpcServerTests : IDisposable
         Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
         await runner.Started.Task.WaitAsync(Timeout);
         Assert.Equal(weGameLogin == true, runner.Request!.WeGameLogin);
-        Assert.Equal(new CatLaunchRequest("op1", "123456", false, null, null, Platform: XIVAccountType.WeGame, WeGameLogin: weGameLogin == true), runner.Request);
+        Assert.Equal(new CatLaunchRequest("op1", "123456", false, null, Platform: XIVAccountType.WeGame, WeGameLogin: weGameLogin == true), runner.Request);
     }
 
     [Theory]
@@ -209,7 +223,7 @@ public sealed class CatRpcServerTests : IDisposable
         Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
         await runner.Started.Task.WaitAsync(Timeout);
         Assert.Equal(expected, runner.Request!.WeGameScan);
-        Assert.Equal(new CatLaunchRequest("op1", "123456", false, null, null, Platform: XIVAccountType.WeGame, WeGameLogin: true, WeGameScan: expected), runner.Request);
+        Assert.Equal(new CatLaunchRequest("op1", "123456", false, null, Platform: XIVAccountType.WeGame, WeGameLogin: true, WeGameScan: expected), runner.Request);
     }
 
     [Theory]
@@ -399,7 +413,7 @@ public sealed class CatRpcServerTests : IDisposable
                 dalamud     = false,
                 platform    = "international",
                 password    = "pw-123456",
-                minion      = new { cardFingerprint = "0123456789abcdef", variant }
+                minion      = MinionJson(variant)
             }
         );
 
@@ -407,6 +421,150 @@ public sealed class CatRpcServerTests : IDisposable
 
         if (!expectedAccepted)
             Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+    }
+
+    [Theory]
+    [InlineData("keycode")]
+    [InlineData("forumId")]
+    [InlineData("forumPassword")]
+    public async Task Launch_MinionMissingKeycodeOrForumAccount_IsMinionNotConfigured(string missing)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var minion = new Dictionary<string, object?>
+        {
+            ["cardFingerprint"] = FINGERPRINT,
+            ["variant"]         = "cn",
+            ["keycode"]         = missing == "keycode" ? "" : KEYCODE,
+            ["uid"]             = UID,
+            ["forumId"]         = missing == "forumId" ? null : FORUM_ID,
+            ["forumPassword"]   = missing == "forumPassword" ? "" : FORUM_PASSWORD
+        };
+
+        var response = await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, minion });
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal(CatCodes.MINION_NOT_CONFIGURED, response["result"]!["code"]!.GetValue<string>());
+        Assert.False(host.HasLaunch);
+    }
+
+    [Fact]
+    public async Task Launch_MinionWithoutAnyNewField_IsMinionNotConfigured()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        // 只带指纹和 variant（旧工作台的样子）
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new { operationId = "op1", accountName = "acc", dalamud = false, minion = new { cardFingerprint = FINGERPRINT, variant = "cn" } }
+        );
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal(CatCodes.MINION_NOT_CONFIGURED, response["result"]!["code"]!.GetValue<string>());
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("0123456789abcdef0123456789abcde")]
+    [InlineData("0123456789abcdef0123456789abcdef0")]
+    [InlineData("0123456789abcdef0123456789abcdeg")]
+    [InlineData("11112222-3333-4444-5555-666677778888")]
+    public async Task Launch_MinionUidNot32Hex_IsInvalidParams(string uid)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new
+            {
+                operationId = "op1",
+                accountName = "acc",
+                dalamud     = false,
+                minion      = new { cardFingerprint = FINGERPRINT, variant = "cn", keycode = KEYCODE, uid, forumId = FORUM_ID, forumPassword = FORUM_PASSWORD }
+            }
+        );
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal(CatCodes.INVALID_PARAMS, response["result"]!["code"]!.GetValue<string>());
+        Assert.DoesNotContain(KEYCODE, response.ToJsonString());
+        Assert.DoesNotContain(FORUM_PASSWORD, response.ToJsonString());
+    }
+
+    [Fact]
+    public void MinionUid_AcceptsUpperCaseHex()
+    {
+        Assert.True(MinionCards.IsValidUid(UID.ToUpperInvariant()));
+        Assert.True(MinionCards.IsValidUid(UID));
+    }
+
+    [Fact]
+    public async Task Launch_Minion_KeycodeAndForumPasswordNeverPrinted()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = true, minion = MinionJson("cn") });
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        var request = runner.Request!;
+        Assert.Equal(KEYCODE, request.MinionCard!.Keycode.Reveal());
+        Assert.Equal(FORUM_PASSWORD, request.MinionCard.ForumPassword.Reveal());
+        Assert.Equal(UID, request.MinionCard.Uid);
+        Assert.Equal(FORUM_ID, request.MinionCard.ForumId);
+
+        foreach (var text in new[] { request.ToString(), request.MinionCard.ToString(), $"{request}" })
+        {
+            Assert.DoesNotContain(KEYCODE, text);
+            Assert.DoesNotContain(FORUM_PASSWORD, text);
+        }
+
+        // 已登记脱敏: 启动器不小心把它们写进任何发给外壳的文字, 都会被遮住
+        runner.Reporter!.Log("error", $"挂载失败 -minionkey={KEYCODE} -minionpass={FORUM_PASSWORD} {Uri.EscapeDataString(FORUM_PASSWORD)}");
+        runner.Reporter.Failed(CatCodes.LAUNCH_FAILED, $"出错: {KEYCODE} {FORUM_PASSWORD}");
+
+        var seen = new List<(string Method, JsonNode? Params)>();
+        client.WaitForEvent("launch.failed", Timeout, seen);
+        Assert.All(seen, x => Assert.DoesNotContain(KEYCODE, x.Params?.ToJsonString(CatProtocol.JsonOptions) ?? string.Empty));
+        Assert.All(seen, x => Assert.DoesNotContain(FORUM_PASSWORD, x.Params?.ToJsonString(CatProtocol.JsonOptions) ?? string.Empty));
+        Assert.All(seen, x => Assert.DoesNotContain(Uri.EscapeDataString(FORUM_PASSWORD), x.Params?.ToJsonString(CatProtocol.JsonOptions) ?? string.Empty));
+    }
+
+    [Fact]
+    public void MinionParams_ToString_PrintsOnlyFingerprintAndVariant()
+    {
+        var minion     = new CatMinionParams(FINGERPRINT, "cn", KEYCODE, UID, FORUM_ID, FORUM_PASSWORD);
+        var parameters = new CatLaunchParams("op1", "acc", true, minion);
+
+        foreach (var text in new[] { minion.ToString(), parameters.ToString(), $"{parameters}" })
+        {
+            Assert.Contains(FINGERPRINT, text);
+            Assert.DoesNotContain(KEYCODE, text);
+            Assert.DoesNotContain(FORUM_PASSWORD, text);
+            Assert.DoesNotContain(FORUM_ID, text);
+            Assert.DoesNotContain(UID, text);
+        }
+    }
+
+    [Fact]
+    public void MinionParams_DeserializeFromCamelCaseFields()
+    {
+        var parameters = JsonSerializer.Deserialize<CatLaunchParams>
+        (
+            $$$"""{"operationId":"op1","accountName":"acc","dalamud":false,"minion":{"cardFingerprint":"{{{FINGERPRINT}}}","variant":"global","keycode":"{{{KEYCODE}}}","uid":"{{{UID}}}","forumId":"{{{FORUM_ID}}}","forumPassword":"{{{FORUM_PASSWORD}}}"}}""",
+            CatProtocol.JsonOptions
+        )!;
+
+        Assert.Equal(new CatMinionParams(FINGERPRINT, "global", KEYCODE, UID, FORUM_ID, FORUM_PASSWORD), parameters.Minion);
+    }
+
+    /// <summary>工作台外壳靠程序集里有没有这个类型名判断启动器是否按 launch 带来的卡号直接挂 Minion, 名字和命名空间不能改</summary>
+    [Fact]
+    public void MinionDirect_TypeNameIsStable()
+    {
+        Assert.Equal("XIVLauncher.CatHost.CatMinionDirect", typeof(CatMinionDirect).FullName);
     }
 
     /// <summary>工作台外壳靠程序集里有没有这个类型名判断启动器是否支持国际服, 名字和命名空间不能改</summary>
@@ -437,7 +595,7 @@ public sealed class CatRpcServerTests : IDisposable
 
         // 与不带 password 时得到的请求完全相同
         var expectedType = platform == "weGame" ? XIVAccountType.WeGame : XIVAccountType.Sdo;
-        Assert.Equal(new CatLaunchRequest("op1", "acc", false, null, null, Platform: expectedType), runner.Request);
+        Assert.Equal(new CatLaunchRequest("op1", "acc", false, null, Platform: expectedType), runner.Request);
     }
 
     [Theory]

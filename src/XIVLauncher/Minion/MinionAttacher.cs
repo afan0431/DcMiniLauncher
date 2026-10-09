@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using Serilog;
+using XIVLauncher.CatHost;
 using XIVLauncher.Common.Game;
 using XIVLauncher.Dalamud;
 
@@ -21,18 +22,21 @@ public sealed record MinionAttachResult(bool Ok, string? Error)
 }
 
 /// <summary>
-///     起完游戏后把 MinionLauncher 挂到游戏进程上（F3）。
+///     起完游戏后把 MinionLauncher 挂到游戏进程上（F3）。卡号、编号、论坛账号都由工作台随 launch 下发, 挂载选项是固定值。
 ///     参数模板取自 MINIONAPP 自己的命令行（research/investigation.md）, 并经 P1 实测：
-///     MINIONAPP 全程关闭也能让 bot 真运行, 但 <c>-minionpass</c> 必须是明文
+///     不开 MINIONAPP 也能让 bot 真运行, 但 <c>-minionpass</c> 必须是明文
 ///     （见 research/probe-P1-attach-standalone.md）。
 /// </summary>
 public static class MinionAttacher
 {
-    /// <summary>国服 —— 本启动器只做国服, 故写死</summary>
-    private const string REGION_CN = "2";
+    /// <summary>Minion 侧的区域设置, 国服与国际服都是 2</summary>
+    private const string REGION = "2";
 
-    /// <summary>Accounts.json 里国服账号的 ProductID 都是 8, 缺失时兜底用它</summary>
-    private const string PRODUCT_ID_CN = "8";
+    /// <summary>产品编号, 国服与国际服都是 8</summary>
+    private const string PRODUCT_ID = "8";
+
+    /// <summary>大区, 固定 0</summary>
+    private const string DATACENTER = "0";
 
     /// <summary>国服 bot 注入文件, 位于 bot 目录的 <c>MinionFiles\</c> 下</summary>
     private const string DAT_NAME_CN = "FFXIVMinionCN_64.dat";
@@ -42,7 +46,7 @@ public static class MinionAttacher
     ///     取证: PC3（Minion 装在 D:\MINI, 由 MINIONAPP 调 MinionLauncher_64）的 MinionLauncherInfo.txt, 2026-10-05、10-06 两次对国际服游戏
     ///     挂载成功（Attaching Successfull）时解析到的参数（2026-10-06 取证）。同一份记录里国际服与国服只有两处不同:
     ///     <c>datpath</c> 的文件名（这个常量）和 <c>path</c> 指向的游戏 exe（国际服是游戏目录下的 game\ffxiv_dx11.exe）;
-    ///     region 两边都是 2（Minion 侧的全局设置, 不随客户端变）, attachtype 0、productid 8、usebeta 0、datacenter 取行里的值也都相同。
+    ///     region 两边都是 2（Minion 侧的全局设置, 不随客户端变）, attachtype 0、productid 8、usebeta 0、datacenter 0 也都相同。
     /// </summary>
     private const string DAT_NAME_GLOBAL = "FFXIVMinion_64.dat";
 
@@ -66,74 +70,26 @@ public static class MinionAttacher
     private static readonly TimeSpan LAUNCHER_TIMEOUT = TimeSpan.FromMinutes(3);
 
     /// <summary>
-    ///     按启动页选中的分组/账号, 把 MinionLauncher 挂到 <paramref name="gameProcess" /> 上。
+    ///     把 <paramref name="minion" /> 这张卡挂到 <paramref name="gameProcess" /> 上, 成功后写占用记录。
     ///     不抛异常, 失败信息在返回值里（挂不上不该连累已经起来的游戏）。
     /// </summary>
-    /// <param name="gamePath">启动器本次用的游戏目录, 用来兜底 <c>-path</c>（Accounts.json 里的路径常常是旧机器的）</param>
+    /// <param name="minion">要挂的卡; variant 决定注入文件名和 <c>-path</c> 的候选, 其余参数两种相同</param>
+    /// <param name="gameProcess">游戏进程</param>
+    /// <param name="gamePath">这次用的游戏目录, 用来找 <c>-path</c></param>
     /// <param name="dalamudInjected">本次是否真的注了 Dalamud —— 是的话要等它先落地再挂 Minion</param>
-    public static async Task<MinionAttachResult> AttachAsync
-    (
-        Process           gameProcess,
-        DirectoryInfo?    gamePath,
-        bool              dalamudInjected,
-        CancellationToken cancellationToken = default
-    )
-    {
-        var installPath = MinionAccounts.InstallPath;
-
-        IReadOnlyList<MinionAccount> accounts;
-
-        try
-        {
-            accounts = MinionAccounts.LoadAccounts(installPath);
-        }
-        catch (Exception ex)
-        {
-            return MinionAttachResult.Failed($"读取 {MinionAccounts.GetAccountsJsonPath(installPath)} 失败: {ex.Message}");
-        }
-
-        var group   = App.Settings.MinionGroup;
-        var account = MinionAccounts.FindAccount(accounts, group, App.Settings.MinionAccountUid);
-
-        if (account == null)
-        {
-            var hasAccountsInGroup = accounts.Any(x => string.Equals(x.Group?.Trim(), group?.Trim(), StringComparison.OrdinalIgnoreCase));
-
-            return MinionAttachResult.Failed
-            (
-                hasAccountsInGroup
-                    ? $"启动页选中的 Minion 账号在 Minion 分组 {group} 里找不到了（Accounts.json 可能改过）, 为免挂错卡顶掉别处的号, 本次没有挂载, 请在启动页重新选择 Keycode"
-                    : $"Minion 分组 {group ?? "(未选择)"} 下没有账号, 请在启动页重新选择分组"
-            );
-        }
-
-        var currentAccountId = App.AccountManager.CurrentAccountID;
-        var accountName      = App.AccountManager.Accounts.FirstOrDefault(x => x.ID == currentAccountId)?.UserName;
-
-        return await AttachAsync(account, gameProcess, gamePath, dalamudInjected, accountName, cancellationToken).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    ///     把指定的 Minion 账号行挂到 <paramref name="gameProcess" /> 上, 成功后写占用记录。不抛异常。
-    /// </summary>
-    /// <param name="account">要挂的 Accounts.json 行</param>
     /// <param name="accountName">游戏账号名, 只写进占用记录</param>
-    /// <param name="variant">
-    ///     行类型: <see cref="MinionCards.VARIANT_CN" />（缺省, 国服）或 <see cref="MinionCards.VARIANT_GLOBAL" />（国际服）。
-    ///     只决定注入文件名和 <c>-path</c> 的候选, 其余参数两种相同
-    /// </param>
+    /// <param name="cancellationToken">取消</param>
     public static async Task<MinionAttachResult> AttachAsync
     (
-        MinionAccount     account,
+        CatMinionLaunch   minion,
         Process           gameProcess,
         DirectoryInfo?    gamePath,
         bool              dalamudInjected,
         string?           accountName,
-        CancellationToken cancellationToken = default,
-        string            variant           = MinionCards.VARIANT_CN
+        CancellationToken cancellationToken = default
     )
     {
-        var installPath = MinionAccounts.InstallPath;
+        var installPath = MinionInstall.InstallPath;
 
         await WaitForGameWindowAsync(gameProcess, cancellationToken).ConfigureAwait(false);
 
@@ -159,18 +115,10 @@ public static class MinionAttacher
         if (gameProcess.HasExited)
             return MinionAttachResult.Failed("游戏进程已退出, 没有可挂载的目标");
 
-        var result = await SpawnLauncherAsync(account, installPath, gamePath, gameProcess, cancellationToken, variant).ConfigureAwait(false);
+        var result = await SpawnLauncherAsync(minion, installPath, gamePath, gameProcess, cancellationToken).ConfigureAwait(false);
 
-        if (!result.Ok)
-            return result;
-
-        // 先落占用记录（带 Minion 行 UID, 本进程不在时别人也能据此补报停机）, 再报结果
-        WriteOccupancy(account, gameProcess, accountName);
-
-        // MINIONAPP 开着时, 它的看门狗会把「我们挂的、它没记过账的」会话当成卡死的杀掉,
-        // 所以按它自己的协议先替 bot 报一次「运行中」把计时器种上（见 MinionAppStatusReporter）; 补发在后台, 不拖慢结果
-        if (MinionAppStatusReporter.IsMinionAppRunning())
-            MinionAppStatusReporter.SeedRunningStatus(account, gameProcess);
+        if (result.Ok)
+            WriteOccupancy(minion, gameProcess, accountName);
 
         return result;
     }
@@ -180,90 +128,72 @@ public static class MinionAttacher
     /// </summary>
     private static async Task<MinionAttachResult> SpawnLauncherAsync
     (
-        MinionAccount     account,
+        CatMinionLaunch   minion,
         string            installPath,
         DirectoryInfo?    gamePath,
         Process           gameProcess,
-        CancellationToken cancellationToken,
-        string            variant = MinionCards.VARIANT_CN
+        CancellationToken cancellationToken
     )
     {
-        var launcherExe = MinionAccounts.GetLauncherExePath(installPath);
+        var launcherExe = MinionInstall.GetLauncherExePath(installPath);
 
         if (!File.Exists(launcherExe))
             return MinionAttachResult.Failed($"未找到 {launcherExe}（在「设置 → Minion」里指定 Minion 安装目录）");
 
-        if (ResolveGameExePath(account, gamePath, gameProcess, variant) is not { } gameExePath)
-            return MinionAttachResult.Failed
-            (
-                $"找不到可用的游戏 exe 给 -path 用（Accounts.json 里写的是 {account.PathToExe ?? "(空)"}, 本机不存在; " +
-                $"启动器的游戏目录 {gamePath?.FullName ?? "(未配置)"} 下也没找到）"
-            );
+        if (ResolveGameExePath(gamePath, gameProcess, minion.Variant) is not { } gameExePath)
+            return MinionAttachResult.Failed($"找不到可用的游戏 exe 给 -path 用（游戏目录 {gamePath?.FullName ?? "(未配置)"} 下没找到, 也读不到游戏进程的 exe）");
 
         var botPath = Path.Combine(installPath, BOT_DIR_NAME);
-        var datPath = Path.Combine(botPath, MINION_FILES_DIR_NAME, DatNameOf(variant));
+        var datPath = Path.Combine(botPath, MINION_FILES_DIR_NAME, DatNameOf(minion.Variant));
 
         if (!File.Exists(datPath))
             return MinionAttachResult.Failed($"找不到 bot 文件 {datPath}");
 
-        if (BuildArguments(account, botPath, datPath, gameExePath, gameProcess.Id) is not { } arguments)
-            return MinionAttachResult.Failed(DescribeMissingFields(account));
+        if (BuildArguments(minion, botPath, datPath, gameExePath, gameProcess.Id) is not { } arguments)
+            return MinionAttachResult.Failed("Minion 挂载所需配置不全: 卡号、编号、论坛账号或论坛密码为空");
 
         Log.Information
         (
-            "[Minion] 挂载 bot: PID={GamePid}, 分组={Group}, 账号={Account}, 行={Variant}, 命令行={CommandLine}",
+            "[Minion] 挂载 bot: PID={GamePid}, 卡={Fingerprint}, 客户端={Variant}, 命令行={CommandLine}",
             gameProcess.Id,
-            account.Group,
-            account.Label,
-            MinionCards.VariantOf(account),
+            minion.Fingerprint,
+            minion.Variant,
             Redact(launcherExe, arguments)
         );
 
-        return await RunLauncherAsync(launcherExe, installPath, arguments, cancellationToken).ConfigureAwait(false);
+        return await RunLauncherAsync(launcherExe, installPath, arguments, RedactorFor(minion), cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
     ///     照抄 MINIONAPP 的命令行（research/investigation.md 抓到的真实参数）。
-    ///     其中 region/attachtype/datpath/botpath/usebeta 是常量, 其余按账号取；
-    ///     <c>-account</c>/<c>-accountpass</c>/<c>-charname</c>/<c>-server</c> 不传 ——
-    ///     游戏由本启动器起并已登录, Minion 只负责 attach。
-    ///     缺必需字段时返回 null。
+    ///     卡号、编号、论坛账号与密码取自 <paramref name="minion" />, 其余是固定值:
+    ///     productid 8、datacenter 0、主播模式开、命名窗口标题关、Beta 关。
+    ///     <c>-account</c>/<c>-accountpass</c>/<c>-charname</c>/<c>-server</c> 不传 —— 游戏由本启动器起并已登录, Minion 只负责 attach。
+    ///     国服与国际服拼法相同, 区别只在调用方传进来的 <paramref name="datPath" /> 与 <paramref name="gameExePath" />。
+    ///     卡号、编号、论坛账号或密码为空时返回 null。
     /// </summary>
-    private static List<string>? BuildArguments(MinionAccount account, string botPath, string datPath, string gameExePath, int gamePid) =>
-        BuildArguments(account, botPath, datPath, gameExePath, gamePid, App.Settings.MinionId, App.Settings.MinionPassword);
-
-    /// <summary>
-    ///     同上, Minion 论坛账号与密码由参数给（不读设置, 便于单测）。国服行与国际服行拼法相同, 区别只在调用方传进来的
-    ///     <paramref name="datPath" /> 与 <paramref name="gameExePath" />。
-    /// </summary>
-    internal static List<string>? BuildArguments
-    (
-        MinionAccount account,
-        string        botPath,
-        string        datPath,
-        string        gameExePath,
-        int           gamePid,
-        string?       minionId,
-        string?       minionPassword
-    )
+    internal static List<string>? BuildArguments(CatMinionLaunch minion, string botPath, string datPath, string gameExePath, int gamePid)
     {
-        if (string.IsNullOrWhiteSpace(account.Uid)     ||
-            string.IsNullOrWhiteSpace(account.Keycode) ||
-            string.IsNullOrWhiteSpace(minionId)        ||
-            string.IsNullOrWhiteSpace(minionPassword))
+        var keycode       = minion.Keycode.Reveal();
+        var forumPassword = minion.ForumPassword.Reveal();
+
+        if (string.IsNullOrWhiteSpace(minion.Uid)     ||
+            string.IsNullOrWhiteSpace(keycode)        ||
+            string.IsNullOrWhiteSpace(minion.ForumId) ||
+            string.IsNullOrEmpty(forumPassword))
             return null;
 
         return
         [
-            $"-region={REGION_CN}",
+            $"-region={REGION}",
             "-attachtype=0",
-            $"-productid={account.ProductId?.ToString() ?? PRODUCT_ID_CN}",
-            $"-uid={account.Uid}",
-            $"-minionid={minionId}",
-            $"-minionkey={account.Keycode}",
+            $"-productid={PRODUCT_ID}",
+            $"-uid={minion.Uid}",
+            $"-minionid={minion.ForumId}",
+            $"-minionkey={keycode}",
 
-            // 明文 —— 传 Accounts.json 里加密的 KeyPassword 会 "attach 成功" 但 bot 不起（P1 实测）
-            $"-minionpass={minionPassword}",
+            // 明文 —— 传加密后的密码会 "attach 成功" 但 bot 不起（P1 实测）
+            $"-minionpass={forumPassword}",
             "-attach=true",
             $"-attachtopid={gamePid}",
 
@@ -273,51 +203,41 @@ public static class MinionAttacher
             $"-datpath={datPath}",
             $"-botpath={botPath}",
             "-usebeta=0",
-            $"-datacenter={account.Datacenter ?? 0}",
-            $"-streamermode={(account.StreamerMode ? "1" : "0")}",
-            $"-setwindowtitle={(account.SetWindowTitle ? "1" : "0")}"
+            $"-datacenter={DATACENTER}",
+            "-streamermode=1",
+            "-setwindowtitle=0"
         ];
     }
 
     /// <summary>
-    ///     挑一个**真实存在**的 exe 给 <c>-path</c>。
-    ///     不能只信 Accounts.json 的 <c>PathToExe</c>: 那是 MINIONAPP 当初配的, 换机器/换盘后就成了死路径,
-    ///     MinionLauncher 校验不过会直接 "ERROR: Invalid Game exe path!" 退出, 根本不会 attach（2026-08-14 实测）。
-    ///     优先本次启动用的游戏目录下的官方登录器（与 MINIONAPP 的配法一致）, 再退回账号里的路径, 最后用游戏进程自己的 exe。
+    ///     挑一个**真实存在**的 exe 给 <c>-path</c>: MinionLauncher 校验不过会直接 "ERROR: Invalid Game exe path!" 退出, 根本不会 attach（2026-08-14 实测）
     /// </summary>
-    private static string? ResolveGameExePath(MinionAccount account, DirectoryInfo? gamePath, Process gameProcess, string variant = MinionCards.VARIANT_CN) =>
-        GameExeCandidates(account, gamePath, TryGetProcessExePath(gameProcess), variant)
+    private static string? ResolveGameExePath(DirectoryInfo? gamePath, Process gameProcess, string variant) =>
+        GameExeCandidates(gamePath, TryGetProcessExePath(gameProcess), variant)
             .FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate) && File.Exists(candidate));
 
     /// <summary>
     ///     <c>-path</c> 的候选, 按先后取第一个真实存在的。
-    ///     国服行: 游戏目录下的盛趣登录器 → 行里的路径 → 游戏目录下的 game\ffxiv_dx11.exe → 游戏进程自己的 exe。
-    ///     国际服行（取证见 <see cref="DAT_NAME_GLOBAL" />）: MINIONAPP 传的就是国际服游戏目录下的 game\ffxiv_dx11.exe, 行里的 PathToExe 也是它;
-    ///     所以先用行里的路径, 本机不存在时用启动器这次用的国际服游戏目录兜底, 最后是游戏进程自己的 exe。国际服没有盛趣登录器, 不找它。
+    ///     国服: 游戏目录下的盛趣登录器（与 MINIONAPP 的配法一致）→ 游戏目录下的 game\ffxiv_dx11.exe → 游戏进程自己的 exe。
+    ///     国际服（取证见 <see cref="DAT_NAME_GLOBAL" />）: 国际服游戏目录下的 game\ffxiv_dx11.exe → 游戏进程自己的 exe; 国际服没有盛趣登录器, 不找它。
     /// </summary>
-    internal static List<string?> GameExeCandidates(MinionAccount account, DirectoryInfo? gamePath, string? processExePath, string variant)
+    internal static List<string?> GameExeCandidates(DirectoryInfo? gamePath, string? processExePath, string variant)
     {
+        var gameExe = gamePath == null ? null : Path.Combine(gamePath.FullName, "game", "ffxiv_dx11.exe");
+
         if (variant == MinionCards.VARIANT_GLOBAL)
-        {
-            return
-            [
-                account.PathToExe,
-                gamePath == null ? null : Path.Combine(gamePath.FullName, "game", "ffxiv_dx11.exe"),
-                processExePath
-            ];
-        }
+            return [gameExe, processExePath];
 
         return
         [
             gamePath == null ? null : Path.Combine(gamePath.FullName, "sdo", "sdologin", "Launcher.exe"),
-            account.PathToExe,
-            gamePath == null ? null : Path.Combine(gamePath.FullName, "game", "ffxiv_dx11.exe"),
+            gameExe,
             processExePath
         ];
     }
 
     /// <summary>
-    ///     行类型对应的 bot 注入文件名: 国际服行 <see cref="DAT_NAME_GLOBAL" />, 其余（国服）<see cref="DAT_NAME_CN" />
+    ///     variant 对应的 bot 注入文件名: 国际服 <see cref="DAT_NAME_GLOBAL" />, 其余（国服）<see cref="DAT_NAME_CN" />
     /// </summary>
     internal static string DatNameOf(string variant) =>
         variant == MinionCards.VARIANT_GLOBAL ? DAT_NAME_GLOBAL : DAT_NAME_CN;
@@ -335,11 +255,8 @@ public static class MinionAttacher
         }
     }
 
-    private static void WriteOccupancy(MinionAccount account, Process gameProcess, string? accountName)
+    private static void WriteOccupancy(CatMinionLaunch minion, Process gameProcess, string? accountName)
     {
-        if (string.IsNullOrWhiteSpace(account.Keycode))
-            return;
-
         try
         {
             MinionOccupancy.WriteAndDeleteOnExit
@@ -348,10 +265,10 @@ public static class MinionAttacher
                 {
                     Pid              = gameProcess.Id,
                     ProcessStartedAt = MinionOccupancy.GetProcessStartedAt(gameProcess),
-                    CardFingerprint  = MinionCards.Fingerprint(account.Keycode),
-                    Variant          = MinionCards.VariantOf(account),
+                    CardFingerprint  = minion.Fingerprint,
+                    Variant          = minion.Variant,
                     AccountName      = accountName,
-                    MinionUid        = string.IsNullOrWhiteSpace(account.Uid) ? null : account.Uid.Trim(),
+                    MinionUid        = minion.Uid,
                     AttachedAt       = DateTimeOffset.UtcNow
                 },
                 gameProcess
@@ -363,27 +280,12 @@ public static class MinionAttacher
         }
     }
 
-    private static string DescribeMissingFields(MinionAccount account)
-    {
-        List<string> missing = [];
-
-        if (string.IsNullOrWhiteSpace(account.Uid))
-            missing.Add("账号 UID");
-        if (string.IsNullOrWhiteSpace(account.Keycode))
-            missing.Add("Keycode");
-        if (string.IsNullOrWhiteSpace(App.Settings.MinionId))
-            missing.Add("Minion 账号（设置 → Minion）");
-        if (string.IsNullOrWhiteSpace(App.Settings.MinionPassword))
-            missing.Add("Minion 密码（设置 → Minion, 只能填明文）");
-
-        return $"Minion 挂载所需配置不全: {string.Join("、", missing)}";
-    }
-
     private static async Task<MinionAttachResult> RunLauncherAsync
     (
         string            launcherExe,
         string            workingDirectory,
         IEnumerable<string> arguments,
+        CatLogRedactor    redactor,
         CancellationToken cancellationToken
     )
     {
@@ -409,22 +311,14 @@ public static class MinionAttacher
 
         launcher.OutputDataReceived += (_, args) =>
         {
-            if (args.Data == null)
-                return;
-
-            Log.Information("[Minion] launcher: {Line}", args.Data);
-
-            if (args.Data.Contains("ERROR", StringComparison.OrdinalIgnoreCase))
-                errorLines.Enqueue(args.Data.Trim());
+            if (args.Data != null)
+                OnLauncherOutput(args.Data, redactor, errorLines);
         };
 
         launcher.ErrorDataReceived += (_, args) =>
         {
-            if (args.Data == null)
-                return;
-
-            Log.Warning("[Minion] launcher(stderr): {Line}", args.Data);
-            errorLines.Enqueue(args.Data.Trim());
+            if (args.Data != null)
+                OnLauncherError(args.Data, redactor, errorLines);
         };
 
         try
@@ -471,6 +365,40 @@ public static class MinionAttacher
         Log.Information("[Minion] launcher 侧没有报错; bot 是否真的在跑以游戏内 overlay / 新 bot 日志为准");
 
         return MinionAttachResult.Succeeded();
+    }
+
+    /// <summary>
+    ///     遮 MinionLauncher 输出用的: 登记本次的卡号与论坛密码（launcher 可能把命令行原样打出来）
+    /// </summary>
+    internal static CatLogRedactor RedactorFor(CatMinionLaunch minion)
+    {
+        var redactor = new CatLogRedactor();
+        redactor.RegisterSecret(minion.Keycode.Reveal());
+        redactor.RegisterSecret(minion.ForumPassword.Reveal());
+
+        return redactor;
+    }
+
+    /// <summary>
+    ///     MinionLauncher 标准输出的一行: 遮住卡号与论坛密码后写日志; 含 ERROR 的记为报错
+    /// </summary>
+    internal static void OnLauncherOutput(string line, CatLogRedactor redactor, ConcurrentQueue<string> errorLines)
+    {
+        var safe = redactor.Redact(line);
+        Log.Information("[Minion] launcher: {Line}", safe);
+
+        if (safe.Contains("ERROR", StringComparison.OrdinalIgnoreCase))
+            errorLines.Enqueue(safe.Trim());
+    }
+
+    /// <summary>
+    ///     MinionLauncher 标准错误的一行: 遮住卡号与论坛密码后写日志, 并记为报错
+    /// </summary>
+    internal static void OnLauncherError(string line, CatLogRedactor redactor, ConcurrentQueue<string> errorLines)
+    {
+        var safe = redactor.Redact(line);
+        Log.Warning("[Minion] launcher(stderr): {Line}", safe);
+        errorLines.Enqueue(safe.Trim());
     }
 
     /// <summary>
@@ -586,9 +514,9 @@ public static class MinionAttacher
     }
 
     /// <summary>
-    ///     日志里不留 Minion 的密码与 Keycode
+    ///     日志里不留 Minion 的论坛密码与卡号
     /// </summary>
-    private static string Redact(string launcherExe, IEnumerable<string> arguments) =>
+    internal static string Redact(string launcherExe, IEnumerable<string> arguments) =>
         string.Join
         (
             ' ',

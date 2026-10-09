@@ -801,7 +801,7 @@ public sealed class CatWeGameChallengeWatcherTests
         new(environment, new EmptyStore(), redactor) { Screen = screen, WatchInterval = TimeSpan.FromMilliseconds(10) };
 
     private static CatLaunchRequest Request(CatWeGameScan? scan) =>
-        new("op", "123456", false, null, null, Platform: XIVAccountType.WeGame, WeGameLogin: true, WeGameScan: scan);
+        new("op", "123456", false, null, Platform: XIVAccountType.WeGame, WeGameLogin: true, WeGameScan: scan);
 
     private static async Task TickAsync(CatWeGameChallengeWatcher watcher, int times)
     {

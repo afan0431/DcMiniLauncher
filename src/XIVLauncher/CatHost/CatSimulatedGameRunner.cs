@@ -12,7 +12,7 @@ namespace XIVLauncher.CatHost;
 ///         <item><c>agentfail:dalamud</c> / <c>agentfail:minion</c>: 游戏照常起来, 该代理注入失败</item>
 ///         <item><c>crash:</c> 或 <c>crash:restart</c>: 运行一会儿后崩溃并重启一次（game.restarted, 进程号变）</item>
 ///         <item><c>crash:dialog</c>: 运行一会儿后崩溃, 崩溃对话框没人选 → game.crashed, 等待超时后 game.exited{reason:"crashDialogTimeout"}</item>
-///         <item>minion.cardFingerprint 为 <c>0000000000000000</c>: 发 launch.failed{minionCardNotFound}</item>
+///         <item>minion.cardFingerprint 为 <c>0000000000000000</c>: 发 launch.failed{minionNotConfigured}（模拟本机找不到 Minion 安装目录）</item>
 ///         <item>WeGame 号带了 weGameLogin: 先进 waitingWeGameLogin 阶段停一会儿（当作员工在 WeGame 里登录）, 回到 preparing 后照常继续; 期间 close 则发 launch.failed{cancelled}</item>
 ///         <item>
 ///             再带了 weGameScan: 停的这段时间里发一条假的二维码验证（weGame.challenge kind=qrcode）, 结束前发 weGame.challengeCleared。
@@ -237,7 +237,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
         if (request.Minion && request.CardFingerprint == MISSING_CARD_FINGERPRINT)
         {
-            reporter.Failed(CatCodes.MINION_CARD_NOT_FOUND, "本机 Minion Accounts.json 里找不到这张卡对应的行（模拟）");
+            reporter.Failed(CatCodes.MINION_NOT_CONFIGURED, "本机找不到 Minion 安装目录（模拟）");
             return CatLaunchHost.EXIT_LAUNCH_FAILED;
         }
 
