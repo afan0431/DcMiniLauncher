@@ -42,8 +42,15 @@ public sealed class CatAdoptTests : IDisposable
 
         GameRecords.Directory = originalDirectory;
 
-        if (Directory.Exists(tempDirectory))
-            Directory.Delete(tempDirectory, true);
+        try
+        {
+            if (Directory.Exists(tempDirectory))
+                Directory.Delete(tempDirectory, true);
+        }
+        catch (IOException)
+        {
+            // 失败的测试可能还拿着守护锁; 临时目录, 不影响结果
+        }
     }
 
     private sealed class AdoptingRunner : ICatGameRunner
@@ -115,6 +122,7 @@ public sealed class CatAdoptTests : IDisposable
             DalamudRequested          = true,
             RestartNoPlugins          = true,
             DcTravelPort              = 51234,
+            SndaId                    = "123456",
             MinionFingerprint         = card,
             MinionVariant             = card == null ? null : MinionCards.VARIANT_CN,
             AutoEnter                 = true,
@@ -171,13 +179,61 @@ public sealed class CatAdoptTests : IDisposable
     public void LiveGuard_IsAlreadyGuarded()
     {
         var game      = StartSleeper();
-        var guard     = StartSleeper();
         var startedAt = MinionOccupancy.GetProcessStartedAt(game);
-        WriteRecord(game.Id, startedAt, guard.Id, MinionOccupancy.GetProcessStartedAt(guard));
+        var record    = WriteRecord(game.Id, startedAt);
+
+        // 原守护进程还拿着守护锁
+        using var held = GameRecords.TryClaimGuard(game.Id, record.ProcessStartedAt);
+        Assert.NotNull(held);
 
         var result = NewHost(new AdoptingRunner()).Adopt(new CatAdoptParams("op", game.Id, Iso(startedAt)));
 
         Assert.Equal(CatCodes.ALREADY_GUARDED, result.Code);
+    }
+
+    /// <summary>
+    ///     两个进程同时接管同一个游戏（比如外壳超时重试）: 只能有一个成功, 不会出现两个守护进程同时重开同一个号
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentAdopts_OnlyOneWins()
+    {
+        var game      = StartSleeper();
+        var startedAt = MinionOccupancy.GetProcessStartedAt(game);
+        WriteRecord(game.Id, startedAt);
+
+        var first  = new AdoptingRunner();
+        var second = new AdoptingRunner();
+        var hostA  = NewHost(first);
+        var hostB  = NewHost(second);
+
+        var results = await Task.WhenAll
+        (
+            Task.Run(() => hostA.Adopt(new CatAdoptParams("op-a", game.Id, Iso(startedAt)))),
+            Task.Run(() => hostB.Adopt(new CatAdoptParams("op-b", game.Id, Iso(startedAt))))
+        );
+
+        Assert.Single(results, x => x.Accepted);
+        Assert.Single(results, x => x.Code == CatCodes.ALREADY_GUARDED);
+
+        // 赢的那个守完（游戏结束）后放掉锁, 之后又能接管
+        var winner = results[0].Accepted ? hostA : hostB;
+        first.Finish.TrySetResult(0);
+        second.Finish.TrySetResult(0);
+        await winner.Completion.WaitAsync(Timeout);
+        Assert.False(GameRecords.IsGuarded(game.Id, startedAt));
+    }
+
+    [Fact]
+    public void IncompleteRecord_IsGameNotFound()
+    {
+        var game      = StartSleeper();
+        var startedAt = MinionOccupancy.GetProcessStartedAt(game);
+        var record    = WriteRecord(game.Id, startedAt);
+        GameRecords.Write(record with { SndaId = null });
+
+        var result = NewHost(new AdoptingRunner()).Adopt(new CatAdoptParams("op", game.Id, Iso(startedAt)));
+
+        Assert.Equal(CatCodes.GAME_NOT_FOUND, result.Code);
     }
 
     [Fact]
@@ -226,7 +282,8 @@ public sealed class CatAdoptTests : IDisposable
 
         Assert.Equal("op-new", host.OperationId);
         Assert.Equal(CatCodes.ALREADY_LAUNCHED, host.Launch(new CatLaunchParams("op-2", "acc", false, null)).Code);
-        Assert.Equal(CatCodes.ALREADY_LAUNCHED, host.Adopt(new CatAdoptParams("op-3", game.Id, Iso(startedAt))).Code);
+        // 同一个游戏再接管一次: 守护锁已在本进程手里
+        Assert.Equal(CatCodes.ALREADY_GUARDED, host.Adopt(new CatAdoptParams("op-3", game.Id, Iso(startedAt))).Code);
 
         await host.DrainEventsAsync(Timeout);
         Assert.Equal(game.Id, host.GetStatus().Pid);

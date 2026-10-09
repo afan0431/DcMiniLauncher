@@ -18,7 +18,8 @@ public static class GameRecordChannels
 
 /// <summary>
 ///     一个在跑的游戏的守护所需的全部信息, 守护进程死了之后新进程凭它接管（热更新 / 崩溃恢复）。
-///     凭证字段（<see cref="Tgt" />、<see cref="Guid" />）存的是经账号库加密后的串, 保护强度与账号库一致; 不存任何卡密和密码。
+///     凭证字段（<see cref="Tgt" />、<see cref="Guid" />）存的是经账号库加密后的串; 账号库选了「不加密」时不存（这个目录本机所有用户可读）,
+///     接管后改用快速登录凭证刷新票据。不存任何卡密和密码。
 /// </summary>
 public sealed record GameRecord
 {
@@ -113,42 +114,142 @@ public static class GameRecords
     public static string FilePath(int processId) =>
         Path.Combine(Directory, $"{processId}{FILE_EXTENSION}");
 
+    /// <summary>替换记录时目标正被别人读着, 重试几次</summary>
+    private const int WRITE_ATTEMPTS = 5;
+
     /// <summary>
     ///     写入（覆盖）记录; 先写临时文件再替换, 读的一方不会看到半个文件。失败只记日志
     /// </summary>
     public static bool Write(GameRecord record)
     {
+        string? tmpPath = null;
+
         try
         {
             System.IO.Directory.CreateDirectory(Directory);
 
-            var path    = FilePath(record.Pid);
-            var tmpPath = $"{path}.{Environment.ProcessId}.tmp";
+            var path = FilePath(record.Pid);
+            tmpPath = $"{path}.{System.Guid.NewGuid():N}.tmp";
             File.WriteAllText(tmpPath, JsonSerializer.Serialize(record, JsonOptions));
-            File.Move(tmpPath, path, true);
-            return true;
+
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    File.Move(tmpPath, path, true);
+                    return true;
+                }
+                catch (IOException) when (attempt < WRITE_ATTEMPTS)
+                {
+                    // 别的进程正读着这份记录（替换要删除权限）, 稍等再试
+                    Thread.Sleep(20 * attempt);
+                }
+                catch (UnauthorizedAccessException) when (attempt < WRITE_ATTEMPTS)
+                {
+                    Thread.Sleep(20 * attempt);
+                }
+            }
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "[GameRecord] 写游戏记录失败 PID={Pid}", record.Pid);
+
+            try
+            {
+                if (tmpPath != null && File.Exists(tmpPath))
+                    File.Delete(tmpPath);
+            }
+            catch
+            {
+                // 留下的临时文件由 PruneStale 清
+            }
+
             return false;
         }
     }
 
     /// <summary>
-    ///     读出某个游戏的记录, 没有或损坏返回 null
+    ///     读出某个游戏的记录, 没有或损坏返回 null。读时允许别人同时替换或删除这个文件
     /// </summary>
     public static GameRecord? Read(int processId)
     {
         try
         {
             var path = FilePath(processId);
-            return File.Exists(path) ? JsonSerializer.Deserialize<GameRecord>(File.ReadAllText(path), JsonOptions) : null;
+
+            if (!File.Exists(path))
+                return null;
+
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return JsonSerializer.Deserialize<GameRecord>(stream, JsonOptions);
         }
         catch (Exception ex)
         {
             Log.Debug(ex, "[GameRecord] 读游戏记录失败 PID={Pid}", processId);
             return null;
+        }
+    }
+
+    /// <summary>
+    ///     某个游戏的守护锁文件。守护它的进程独占打开着这个文件, 进程死了系统自动释放, 所以「锁打不开」= 有人在守
+    /// </summary>
+    public static string GuardLockPath(int processId, DateTimeOffset processStartedAt) =>
+        Path.Combine(Directory, $"{processId}-{processStartedAt.ToUnixTimeMilliseconds() / 1000}.guard");
+
+    /// <summary>
+    ///     认领一个游戏的守护权: 成功返回锁（守护期间一直拿着, 不再守时 Dispose）, 已有别的进程在守时返回 null。
+    ///     正常启动与接管都要先拿到它, 同一个游戏不会有两个守护进程（检查和认领是同一个动作, 没有空档）
+    /// </summary>
+    public static IDisposable? TryClaimGuard(int processId, DateTimeOffset processStartedAt)
+    {
+        try
+        {
+            System.IO.Directory.CreateDirectory(Directory);
+            var stream = new FileStream(GuardLockPath(processId, processStartedAt), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            return new GuardClaim(stream);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    ///     这个游戏现在有没有守护进程（试一下能不能拿到守护锁, 拿到马上放掉）
+    /// </summary>
+    public static bool IsGuarded(int processId, DateTimeOffset processStartedAt)
+    {
+        if (!File.Exists(GuardLockPath(processId, processStartedAt)))
+            return false;
+
+        using var claim = TryClaimGuard(processId, processStartedAt);
+        return claim == null;
+    }
+
+    private sealed class GuardClaim(FileStream stream) : IDisposable
+    {
+        private int disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0)
+                return;
+
+            var path = stream.Name;
+            stream.Dispose();
+
+            try
+            {
+                File.Delete(path);
+            }
+            catch
+            {
+                // 别人刚好又拿到了锁, 文件留给它
+            }
         }
     }
 
@@ -179,11 +280,6 @@ public static class GameRecords
     public static GameRecord? ReadMatching(int processId, DateTimeOffset processStartedAt) =>
         Read(processId) is { } record && SameStart(record.ProcessStartedAt, processStartedAt) ? record : null;
 
-    /// <summary>
-    ///     记录里的守护者是否还活着（同一个进程）
-    /// </summary>
-    public static bool IsGuardAlive(GameRecord record) =>
-        record.GuardPid != Environment.ProcessId && MinionOccupancy.IsSameProcessAlive(record.GuardPid, record.GuardStartedAt);
 
     /// <summary>
     ///     游戏进程还活着的全部记录
@@ -209,6 +305,38 @@ public static class GameRecords
 
             Delete(pid);
             Log.Information("[GameRecord] 清掉残留游戏记录 PID={Pid}", pid);
+        }
+
+        // 写到一半被强杀留下的临时文件、守护者已不在的锁文件
+        foreach (var pattern in new[] { "*.tmp", "*.guard" })
+        {
+            string[] leftovers;
+
+            try
+            {
+                leftovers = System.IO.Directory.Exists(Directory) ? System.IO.Directory.GetFiles(Directory, pattern) : [];
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "[GameRecord] 枚举残留文件失败");
+                continue;
+            }
+
+            foreach (var file in leftovers)
+            {
+                try
+                {
+                    if (pattern == "*.tmp" && File.GetLastWriteTimeUtc(file) > DateTime.UtcNow.AddMinutes(-1))
+                        continue;
+
+                    // 锁文件正被守护者独占打开时删不掉, 正好留着
+                    File.Delete(file);
+                }
+                catch
+                {
+                    // 在用
+                }
+            }
         }
     }
 

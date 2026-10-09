@@ -566,28 +566,25 @@ public class DalamudUpdater : IDalamudUpdater
     /// </summary>
     internal static string? FirstFileInUse(DirectoryInfo directory)
     {
-        IEnumerable<FileInfo> files;
-
         try
         {
-            files = directory.EnumerateFiles("*", SearchOption.AllDirectories);
+            // 枚举是惰性的, 子目录打不开的异常在遍历途中才抛出, 所以整个遍历都包在里面
+            foreach (var file in directory.EnumerateFiles("*", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    using var stream = file.Open(FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+                }
+                catch (Exception)
+                {
+                    return file.FullName;
+                }
+            }
         }
         catch (Exception ex)
         {
             Log.Debug(ex, "[DUPDATE] 枚举 {Directory} 失败, 当作在用", directory.FullName);
             return directory.FullName;
-        }
-
-        foreach (var file in files)
-        {
-            try
-            {
-                using var stream = file.Open(FileMode.Open, FileAccess.ReadWrite, FileShare.None);
-            }
-            catch (Exception)
-            {
-                return file.FullName;
-            }
         }
 
         return null;

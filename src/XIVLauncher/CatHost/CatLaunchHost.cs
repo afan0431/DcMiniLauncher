@@ -55,12 +55,14 @@ public sealed record CatLaunchRequest
 /// </summary>
 public sealed record CatAdoptRequest
 (
-    string             OperationId,
-    int                Pid,
-    DateTimeOffset     ProcessStartedAt,
-    InGame.GameRecord  Record,
-    int                CrashDialogTimeoutSeconds,
-    CatMinionLaunch?   MinionCard
+    string                        OperationId,
+    int                           Pid,
+    DateTimeOffset                ProcessStartedAt,
+    InGame.GameRecord             Record,
+    int                           CrashDialogTimeoutSeconds,
+    CatMinionLaunch?              MinionCard,
+    System.Diagnostics.Process    Game,
+    IDisposable                   GuardClaim
 );
 
 /// <summary>
@@ -479,20 +481,28 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (InGame.GameRecords.ReadMatching(gamePid, startedAt) is not { } record)
             return CatAcceptResult.Rejected(CatCodes.GAME_NOT_FOUND, $"没有游戏 {gamePid} 的守护记录, 或进程号与创建时间对不上");
 
-        if (InGame.GameRecords.IsGuardAlive(record))
-            return CatAcceptResult.Rejected(CatCodes.ALREADY_GUARDED, $"游戏 {gamePid} 的守护进程 {record.GuardPid} 还在, 不能重复接管");
-
-        if (!MinionOccupancy.IsSameProcessAlive(gamePid, startedAt))
-            return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, $"游戏 {gamePid} 已经退出");
+        if (string.IsNullOrEmpty(record.SndaId) || string.IsNullOrEmpty(record.AccountUserName))
+            return CatAcceptResult.Rejected(CatCodes.GAME_NOT_FOUND, $"游戏 {gamePid} 的守护记录不完整（缺账号信息）");
 
         // 换了卡就不能拿来在崩溃重开后挂: 记录里挂的是哪张卡, 重开后也只挂那张
         if (minionCard != null && !string.Equals(minionCard.Fingerprint, record.MinionFingerprint, StringComparison.Ordinal))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "minion.cardFingerprint 与这个游戏挂着的卡不同");
 
+        // 先打开游戏进程并一直拿着句柄: 拿着期间进程号不会被别的进程复用, 之后按进程号做的事都落在这个游戏上
+        if (OpenSameProcess(gamePid, record.ProcessStartedAt) is not { } game)
+            return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, $"游戏 {gamePid} 已经退出");
+
+        // 认领守护权（检查与认领是同一个动作）: 拿不到 = 原守护进程还在, 或另一个进程刚接管了它
+        if (InGame.GameRecords.TryClaimGuard(gamePid, record.ProcessStartedAt) is not { } claim)
+        {
+            game.Dispose();
+            return CatAcceptResult.Rejected(CatCodes.ALREADY_GUARDED, $"游戏 {gamePid} 已经有守护进程（记录里是 {record.GuardPid}）, 不能重复接管");
+        }
+
         var timeoutSeconds = parameters.CrashDialogTimeoutSeconds
                              ?? (record.CrashDialogTimeoutSeconds > 0 ? record.CrashDialogTimeoutSeconds : CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS);
 
-        var adopt = new CatAdoptRequest(parameters.OperationId.Trim(), gamePid, record.ProcessStartedAt, record, timeoutSeconds, minionCard);
+        var adopt = new CatAdoptRequest(parameters.OperationId.Trim(), gamePid, record.ProcessStartedAt, record, timeoutSeconds, minionCard, game, claim);
         var asLaunch = new CatLaunchRequest
         (
             adopt.OperationId,
@@ -515,11 +525,18 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         lock (stateLock)
         {
-            if (closeRequested)
-                return CatAcceptResult.Rejected(CatCodes.CLOSING, "已收到 close, 本进程即将退出");
+            var rejected = closeRequested
+                               ? CatAcceptResult.Rejected(CatCodes.CLOSING, "已收到 close, 本进程即将退出")
+                               : request != null
+                                   ? CatAcceptResult.Rejected(CatCodes.ALREADY_LAUNCHED, "本进程已经接受过一次 launch 或 adopt")
+                                   : null;
 
-            if (request != null)
-                return CatAcceptResult.Rejected(CatCodes.ALREADY_LAUNCHED, "本进程已经接受过一次 launch 或 adopt");
+            if (rejected != null)
+            {
+                claim.Dispose();
+                game.Dispose();
+                return rejected;
+            }
 
             selected = runnerFactory(asLaunch);
             runner   = selected;
@@ -919,8 +936,38 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             Serilog.Log.Error(ex, "[CatHost] 接管流程出现未处理异常");
             exitCode = await HandleRunnerFaultAsync(ex).ConfigureAwait(false);
         }
+        finally
+        {
+            // 接管来的那个游戏已经结束（或没接管成）, 放掉它的守护锁; 崩溃重开出来的新游戏由启动器自己另外认领
+            adopt.GuardClaim.Dispose();
+            adopt.Game.Dispose();
+        }
 
         completion.TrySetResult(exitCode);
+    }
+
+    /// <summary>
+    ///     打开进程号对应的进程, 并核对创建时间是同一个游戏; 已退出或对不上返回 null。返回的进程已打开句柄（拿着期间进程号不会被复用）
+    /// </summary>
+    internal static System.Diagnostics.Process? OpenSameProcess(int processId, DateTimeOffset expectedStartedAt)
+    {
+        System.Diagnostics.Process? process = null;
+
+        try
+        {
+            process = System.Diagnostics.Process.GetProcessById(processId);
+            _ = process.SafeHandle;
+
+            if (!process.HasExited && Math.Abs((MinionOccupancy.GetProcessStartedAt(process) - expectedStartedAt).TotalSeconds) < 2)
+                return process;
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            // 已退出或打不开
+        }
+
+        process?.Dispose();
+        return null;
     }
 
     /// <summary>

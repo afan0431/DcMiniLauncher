@@ -142,22 +142,104 @@ public sealed class GameRecordsTests : IDisposable
     }
 
     [Fact]
-    public void IsGuardAlive_FalseForSelfAndForDeadGuard()
+    public void GuardClaim_IsExclusive_AndReleasedOnDispose()
     {
-        using var guard = StartSleeper();
+        var startedAt = DateTimeOffset.UtcNow;
+
+        using (var first = GameRecords.TryClaimGuard(4321, startedAt))
+        {
+            Assert.NotNull(first);
+            Assert.Null(GameRecords.TryClaimGuard(4321, startedAt));
+            Assert.True(GameRecords.IsGuarded(4321, startedAt));
+        }
+
+        Assert.False(GameRecords.IsGuarded(4321, startedAt));
+        Assert.False(File.Exists(GameRecords.GuardLockPath(4321, startedAt)), "放掉时删掉锁文件");
+
+        using var again = GameRecords.TryClaimGuard(4321, startedAt);
+        Assert.NotNull(again);
+    }
+
+    /// <summary>
+    ///     守护进程被强杀: 系统放掉它的锁, 新进程马上能认领（接管靠它）
+    /// </summary>
+    [Fact]
+    public async Task GuardClaim_HeldByKilledProcess_CanBeClaimedRightAway()
+    {
+        var startedAt = DateTimeOffset.UtcNow;
+        var lockPath  = GameRecords.GuardLockPath(5678, startedAt);
+        Directory.CreateDirectory(tempDirectory);
+
+        var script = $"$f=[IO.File]::Open('{lockPath}','OpenOrCreate','ReadWrite','None'); [Console]::Out.WriteLine('ready'); [Console]::Out.Flush(); Start-Sleep 60";
+        var startInfo = new ProcessStartInfo("powershell.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true };
+        startInfo.ArgumentList.Add("-NoProfile");
+        startInfo.ArgumentList.Add("-Command");
+        startInfo.ArgumentList.Add(script);
+
+        using var guard = Process.Start(startInfo)!;
 
         try
         {
-            var record = NewRecord(guard);
-
-            Assert.False(GameRecords.IsGuardAlive(record), "守护者是本进程时不算「别人还在守」");
-            Assert.True(GameRecords.IsGuardAlive(record with { GuardPid = guard.Id, GuardStartedAt = MinionOccupancy.GetProcessStartedAt(guard) }));
-            Assert.False(GameRecords.IsGuardAlive(record with { GuardPid = FindUnusedPid() }));
+            Assert.Equal("ready", await guard.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(30)));
+            Assert.True(GameRecords.IsGuarded(5678, startedAt));
+            Assert.Null(GameRecords.TryClaimGuard(5678, startedAt));
         }
         finally
         {
-            guard.Kill();
+            guard.Kill(true);
+            await guard.WaitForExitAsync();
         }
+
+        using var claim = GameRecords.TryClaimGuard(5678, startedAt);
+        Assert.NotNull(claim);
+    }
+
+    /// <summary>
+    ///     别的进程正读着记录时替换会失败（Windows 不许覆盖打开着的文件）; 读只占一小会儿, 写入要重试等到它
+    /// </summary>
+    [Fact]
+    public async Task Write_RetriesWhileAnotherReaderBrieflyHoldsTheFile()
+    {
+        using var game = StartSleeper();
+
+        try
+        {
+            var record = NewRecord(game);
+            Assert.True(GameRecords.Write(record));
+
+            var reader = new FileStream(GameRecords.FilePath(game.Id), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var release = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                await reader.DisposeAsync();
+            });
+
+            Assert.True(GameRecords.Write(record with { DcTravelPort = 50000 }));
+            await release;
+
+            Assert.Equal(50000, GameRecords.Read(game.Id)?.DcTravelPort);
+            Assert.Empty(Directory.GetFiles(tempDirectory, "*.tmp"));
+        }
+        finally
+        {
+            game.Kill();
+        }
+    }
+
+    [Fact]
+    public void PruneStale_RemovesOldTempFiles_KeepsFreshOnes()
+    {
+        Directory.CreateDirectory(tempDirectory);
+        var old   = Path.Combine(tempDirectory, "1234.json.old.tmp");
+        var fresh = Path.Combine(tempDirectory, "1234.json.fresh.tmp");
+        File.WriteAllText(old, "{}");
+        File.WriteAllText(fresh, "{}");
+        File.SetLastWriteTimeUtc(old, DateTime.UtcNow.AddMinutes(-10));
+
+        GameRecords.PruneStale();
+
+        Assert.False(File.Exists(old));
+        Assert.True(File.Exists(fresh), "刚写的临时文件可能正被别的进程用, 留着");
     }
 
     private static Process StartSleeper()

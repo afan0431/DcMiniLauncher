@@ -117,13 +117,11 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         DcTravelPort                            = bound;
         RunningGameRegistry.CurrentDcTravelPort = bound;
 
+        // 端口没开成也照样建立会话: 启动器自己的超域传送页面用同一个 Client, 不依赖这个端口
         if (bound == 0)
-        {
             Log.Error("[DCTravelListener] 跨区端口没能打开, 游戏内跨区不可用");
-            return 0;
-        }
-
-        Log.Information("[DCTravelListener] 打开监听端口: {DcTravelPort}", DcTravelPort);
+        else
+            Log.Information("[DCTravelListener] 打开监听端口: {DcTravelPort}", DcTravelPort);
 
         try
         {
