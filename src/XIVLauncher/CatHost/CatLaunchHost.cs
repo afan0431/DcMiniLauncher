@@ -51,10 +51,28 @@ public sealed record CatLaunchRequest
 }
 
 /// <summary>
+///     一次 adopt 的参数（已校验）: 要接管的游戏、它的守护记录, 以及崩溃重开后重新挂 Minion 用的卡（没给为 null）
+/// </summary>
+public sealed record CatAdoptRequest
+(
+    string             OperationId,
+    int                Pid,
+    DateTimeOffset     ProcessStartedAt,
+    InGame.GameRecord  Record,
+    int                CrashDialogTimeoutSeconds,
+    CatMinionLaunch?   MinionCard
+);
+
+/// <summary>
 ///     启动过程向外壳报告进度
 /// </summary>
 public interface ICatLaunchReporter
 {
+    /// <summary>已接管一个在跑的游戏（adopt）, 之后与 launch 起来的游戏一样守护</summary>
+    void Adopted(int pid, DateTimeOffset processStartedAt)
+    {
+    }
+
     /// <summary>进入某个阶段</summary>
     void Stage(string stage);
 
@@ -119,6 +137,15 @@ public interface ICatGameRunner
     ///     执行整个生命周期直到游戏退出或启动失败, 返回进程退出码
     /// </summary>
     Task<int> RunAsync(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken cancellationToken);
+
+    /// <summary>
+    ///     接管一个在跑的游戏并守护到它退出, 返回进程退出码。不支持的启动器报 launch.failed{unsupported}
+    /// </summary>
+    Task<int> AdoptAsync(CatAdoptRequest request, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        reporter.Failed(CatCodes.UNSUPPORTED, "这个启动器不支持接管在跑的游戏");
+        return Task.FromResult(CatLaunchHost.EXIT_LAUNCH_FAILED);
+    }
 
     /// <summary>
     ///     对运行中的游戏补注入 Dalamud / 重新挂 Minion, 结果经 <see cref="ICatLaunchReporter.Agent" /> 报告
@@ -259,6 +286,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         method switch
         {
             "launch" => Task.FromResult<object?>(Launch(Deserialize<CatLaunchParams>(parameters))),
+            "adopt"  => Task.FromResult<object?>(Adopt(Deserialize<CatAdoptParams>(parameters))),
             "inject" => Task.FromResult<object?>(Inject(Deserialize<CatInjectParams>(parameters))),
             "status" => Task.FromResult<object?>(GetStatus()),
             "close"  => Task.FromResult<object?>(Close(Deserialize<CatCloseParams>(parameters))),
@@ -419,6 +447,98 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         );
 
         _ = Task.Run(() => RunLifecycleAsync(selected, accepted));
+        return CatAcceptResult.Ok();
+    }
+
+    /// <summary>
+    ///     接受一次 adopt: 接管一个在跑、但原守护进程已不在的游戏, 在后台守护到它退出。与 launch 互斥（一个进程只服务一个游戏）。
+    ///     游戏怎么起的全从它的守护记录里读; 记录对不上、原守护者还活着、游戏已退出时当场拒绝
+    /// </summary>
+    public CatAcceptResult Adopt(CatAdoptParams? parameters)
+    {
+        if (parameters == null || string.IsNullOrWhiteSpace(parameters.OperationId) || parameters.Pid is not > 0)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "operationId 不能为空, pid 必须是正整数");
+
+        if (!DateTimeOffset.TryParse(parameters.ProcessStartedAt, System.Globalization.CultureInfo.InvariantCulture,
+                                     System.Globalization.DateTimeStyles.AssumeUniversal, out var startedAt))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "processStartedAt 必须是 ISO 8601 时间");
+
+        redactor.RegisterSecret(parameters.Minion?.Keycode);
+        redactor.RegisterSecret(parameters.Minion?.ForumPassword);
+
+        CatMinionLaunch? minionCard = null;
+
+        if (parameters.Minion != null && ValidateMinion(parameters.Minion, out minionCard) is { } minionRejected)
+            return minionRejected;
+
+        if (parameters.CrashDialogTimeoutSeconds is { } crashTimeout and (< 1 or > CatProtocol.MAX_CRASH_DIALOG_TIMEOUT_SECONDS))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"crashDialogTimeoutSeconds 必须在 1 到 {CatProtocol.MAX_CRASH_DIALOG_TIMEOUT_SECONDS} 之间");
+
+        var gamePid = parameters.Pid.Value;
+
+        if (InGame.GameRecords.ReadMatching(gamePid, startedAt) is not { } record)
+            return CatAcceptResult.Rejected(CatCodes.GAME_NOT_FOUND, $"没有游戏 {gamePid} 的守护记录, 或进程号与创建时间对不上");
+
+        if (InGame.GameRecords.IsGuardAlive(record))
+            return CatAcceptResult.Rejected(CatCodes.ALREADY_GUARDED, $"游戏 {gamePid} 的守护进程 {record.GuardPid} 还在, 不能重复接管");
+
+        if (!MinionOccupancy.IsSameProcessAlive(gamePid, startedAt))
+            return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, $"游戏 {gamePid} 已经退出");
+
+        // 换了卡就不能拿来在崩溃重开后挂: 记录里挂的是哪张卡, 重开后也只挂那张
+        if (minionCard != null && !string.Equals(minionCard.Fingerprint, record.MinionFingerprint, StringComparison.Ordinal))
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "minion.cardFingerprint 与这个游戏挂着的卡不同");
+
+        var timeoutSeconds = parameters.CrashDialogTimeoutSeconds
+                             ?? (record.CrashDialogTimeoutSeconds > 0 ? record.CrashDialogTimeoutSeconds : CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS);
+
+        var adopt = new CatAdoptRequest(parameters.OperationId.Trim(), gamePid, record.ProcessStartedAt, record, timeoutSeconds, minionCard);
+        var asLaunch = new CatLaunchRequest
+        (
+            adopt.OperationId,
+            record.AccountName,
+            record.DalamudRequested,
+            minionCard,
+            timeoutSeconds,
+            record.AreaName,
+            record.Channel == InGame.GameRecordChannels.WE_GAME ? XIVAccountType.WeGame : XIVAccountType.Sdo,
+            false,
+            null,
+            false,
+            null,
+            record.AutoEnter,
+            record.CharacterName,
+            record.CharacterHomeWorld
+        );
+
+        ICatGameRunner selected;
+
+        lock (stateLock)
+        {
+            if (closeRequested)
+                return CatAcceptResult.Rejected(CatCodes.CLOSING, "已收到 close, 本进程即将退出");
+
+            if (request != null)
+                return CatAcceptResult.Rejected(CatCodes.ALREADY_LAUNCHED, "本进程已经接受过一次 launch 或 adopt");
+
+            selected = runnerFactory(asLaunch);
+            runner   = selected;
+            request  = asLaunch;
+        }
+
+        Serilog.Log.Information
+        (
+            "[CatHost] 接受 adopt: 操作={OperationId}, 游戏={Pid}, 账号={Account}, 原守护进程={GuardPid}, 端口={Port}, Dalamud={Dalamud}, 带卡={Minion}",
+            adopt.OperationId,
+            gamePid,
+            record.AccountName,
+            record.GuardPid,
+            record.DcTravelPort,
+            record.Dalamud,
+            minionCard != null
+        );
+
+        _ = Task.Run(() => RunAdoptLifecycleAsync(selected, adopt));
         return CatAcceptResult.Ok();
     }
 
@@ -658,6 +778,18 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     }
 
     /// <inheritdoc />
+    public void Adopted(int newPid, DateTimeOffset startedAt)
+    {
+        lock (stateLock)
+        {
+            pid              = newPid;
+            processStartedAt = startedAt;
+        }
+
+        Publish("game.adopted", new { operationId = OperationId, pid = newPid, processStartedAt = CatProtocol.FormatTimestamp(startedAt) });
+    }
+
+    /// <inheritdoc />
     public void Started(int newPid, DateTimeOffset startedAt)
     {
         lock (stateLock)
@@ -768,6 +900,23 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         catch (Exception ex)
         {
             Serilog.Log.Error(ex, "[CatHost] 启动流程出现未处理异常");
+            exitCode = await HandleRunnerFaultAsync(ex).ConfigureAwait(false);
+        }
+
+        completion.TrySetResult(exitCode);
+    }
+
+    private async Task RunAdoptLifecycleAsync(ICatGameRunner selected, CatAdoptRequest adopt)
+    {
+        int exitCode;
+
+        try
+        {
+            exitCode = await selected.AdoptAsync(adopt, this, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Serilog.Log.Error(ex, "[CatHost] 接管流程出现未处理异常");
             exitCode = await HandleRunnerFaultAsync(ex).ConfigureAwait(false);
         }
 

@@ -155,6 +155,218 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     }
 
     /// <inheritdoc />
+    public async Task<int> AdoptAsync(CatAdoptRequest adoptRequest, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        var record = adoptRequest.Record;
+
+        request = new CatLaunchRequest
+        (
+            adoptRequest.OperationId,
+            record.AccountName,
+            record.DalamudRequested,
+            adoptRequest.MinionCard,
+            adoptRequest.CrashDialogTimeoutSeconds,
+            record.AreaName,
+            record.Channel == GameRecordChannels.WE_GAME ? XIVAccountType.WeGame : XIVAccountType.Sdo,
+            false,
+            null,
+            false,
+            null,
+            record.AutoEnter,
+            record.CharacterName,
+            record.CharacterHomeWorld
+        );
+
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, closeCts.Token);
+
+        try
+        {
+            var launched = await PrepareAdoptAsync(adoptRequest, reporter, linked.Token).ConfigureAwait(false);
+            var options  = new RestartMonitor.RestartOptions(record.RestartNoDalamud, record.RestartNoThirdPlugins, record.RestartNoPlugins);
+
+            using var final = await GuardAsync(launched, record.Dalamud, options, null, TimeSpan.Zero, reporter, linked.Token, cancellationToken).ConfigureAwait(false);
+
+            await WaitAutoEnterEndAsync().ConfigureAwait(false);
+
+            if (IsCloseRequested)
+                reporter.Exited(lastPid, lastExitCode, CatExitReasons.CLOSED);
+            else
+                reporter.Exited(lastPid, lastExitCode, exitReason, exitFailureCode, exitFailureMessage);
+
+            return CatHostRuntime.EXIT_OK;
+        }
+        catch (CatLaunchException ex) when (currentProcess == null)
+        {
+            reporter.Failed(ex.Code, ex.Message);
+            return CatLaunchHost.EXIT_LAUNCH_FAILED;
+        }
+        catch (Exception ex) when (currentProcess != null)
+        {
+            return await GuardAfterErrorAsync(ex, reporter).ConfigureAwait(false);
+        }
+        finally
+        {
+            dcTravel?.Dispose();
+        }
+    }
+
+    /// <summary>
+    ///     接管前的准备: 按守护记录找回账号、设备、大区, 用记录里的 TGT/guid 重建登录刷新（不重新登录）,
+    ///     跨区服务绑回游戏命令行里的端口, 把守护者改成本进程。返回游戏进程。
+    /// </summary>
+    private async Task<FFXIVProcess> PrepareAdoptAsync(CatAdoptRequest adoptRequest, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        var record = adoptRequest.Record;
+
+        reporter.Stage(CatStages.PREPARING);
+
+        try
+        {
+            await ensureInitialized().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[CatHost] 初始化设置与账号库失败");
+            throw new CatLaunchException(CatCodes.LAUNCH_FAILED, $"DcMiniLauncher 初始化失败: {ex.Message}");
+        }
+
+        accountManager = App.AccountManager;
+
+        if (accountManager.CurrentCredType == CredType.WindowsHello)
+            throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "账号库使用 Windows Hello 加密, 无人值守时无法解密已保存的凭证");
+
+        account = accountManager.FindAccount(record.AccountUserName, request.Platform)
+                  ?? throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, $"账号库里找不到守护记录里的号 {record.AccountUserName}");
+
+        accountManager.RefreshFromDatabase(account);
+
+        gamePath = App.Settings.GetGamePath(request.Platform) is { Exists: true } path
+                       ? path
+                       : throw new CatLaunchException(CatCodes.INVALID_GAME_PATH, "DcMiniLauncher 设置里的游戏目录无效");
+
+        device = CatDeviceProfiles.Resolve(accountManager, account, out _)
+                 ?? throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "这个号开了独立设备, 但账号库里找不到它的设备信息");
+
+        var areas = await LoadAreasAsync(cancellationToken).ConfigureAwait(false);
+        var area  = ResolveArea(areas, account.AreaName, record.AreaName, x => x.AreaName, out _) ?? areas[0];
+
+        // 崩溃重开换票据用的凭证: 先用记录里的 TGT/guid（不算登录）, 过期了再用快速登录凭证 / WeGame 令牌
+        var tgt   = await DecryptOrNullAsync(record.Tgt).ConfigureAwait(false);
+        var guid  = await DecryptOrNullAsync(record.Guid).ConfigureAwait(false);
+        var oauth = new OAuthLoginResult { SndaID = record.SndaId!, TGT = tgt, Guid = guid, DeviceProfile = device };
+
+        if (request.IsWeGame)
+            weGameToken = await DecryptOrNullAsync(accountManager.HasUnavailableSecrets(account) ? null : account.WeGameQuickLoginSecret).ConfigureAwait(false);
+        else
+            quickKey = await DecryptOrNullAsync(accountManager.HasUnavailableSecrets(account) ? null : account.SdoQuickLoginSecret).ConfigureAwait(false);
+
+        context = new GameLaunchContext(new LoginResult { State = LoginState.Ok, OAuthLogin = oauth }, area, areas, request.Platform);
+
+        dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel);
+
+        if (!string.IsNullOrEmpty(tgt) && !string.IsNullOrEmpty(guid))
+            new LoginChannelContext(device).BindLoginSessionRefresh(dcTravel, tgt, guid);
+
+        if (CanRefreshByLogin)
+            dcTravel.ConfigureQuickLoginRefresh(RefreshSessionIdByQuickLoginAsync);
+
+        if (record.DcTravelPort > 0)
+        {
+            context.DcTravelPort = await dcTravel.StartAsync(record.DcTravelPort).ConfigureAwait(false);
+
+            if (context.DcTravelPort == 0)
+                reporter.Log("error", $"跨区端口 {record.DcTravelPort} 没能绑回, 这个游戏的游戏内跨区不可用（崩溃重开照常）");
+        }
+
+        Process process;
+
+        try
+        {
+            process = Process.GetProcessById(adoptRequest.Pid);
+        }
+        catch (ArgumentException)
+        {
+            throw new CatLaunchException(CatCodes.NOT_RUNNING, $"游戏 {adoptRequest.Pid} 已经退出");
+        }
+
+        var launched  = new FFXIVProcess(process);
+        var startedAt = SafeProcessStartedAt(process);
+
+        lock (closeLock)
+            currentProcess = launched;
+
+        GameRecords.Write(record with { OperationId = adoptRequest.OperationId, GuardPid = Environment.ProcessId, GuardStartedAt = SelfStartedAt, UpdatedAt = DateTimeOffset.UtcNow });
+
+        lock (cleanupLock)
+            recordedGames[process.Id] = record.ProcessStartedAt;
+
+        context.InGameAgents = (record.Dalamud ? InGameAgents.Dalamud : InGameAgents.None) | (record.MinionFingerprint != null ? InGameAgents.Minion : InGameAgents.None);
+        RunningGameRegistry.Register(process, context.InGameAgents, context.DcTravelPort);
+
+        Log.Information
+        (
+            "[CatHost] 已接管游戏 {Pid}（原守护进程 {GuardPid}）, 跨区端口 {Port}, 盯崩溃处理器={Dalamud}, 能刷新票据={CanRefresh}",
+            process.Id,
+            record.GuardPid,
+            context.DcTravelPort,
+            record.Dalamud,
+            !string.IsNullOrEmpty(tgt) || CanRefreshByLogin
+        );
+
+        reporter.Adopted(process.Id, startedAt);
+        reporter.Stage(CatStages.RUNNING);
+
+        // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色（编排早就做完了, 不再重做）
+        if (record.AutoEnter && !process.HasExited)
+            StartObserve(launched, reporter, cancellationToken);
+
+        return launched;
+    }
+
+    /// <summary>
+    ///     只看当前角色、不做编排（接管来的游戏已经进过游戏了）
+    /// </summary>
+    private void StartObserve(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken token)
+    {
+        var process      = launched.UnderlyingProcess;
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var game         = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea);
+        var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, null));
+        var observeToken = cancellation.Token;
+
+        autoEnter = flow;
+
+        lock (cleanupLock)
+        {
+            autoEnterCancellations[launched.ProcessID] = cancellation;
+            autoEnterTasks.Add
+            (
+                Task.Run
+                (async () =>
+                    {
+                        try
+                        {
+                            await flow.ObserveAsync(observeToken).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // 游戏退出或收到关闭请求
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, "[CatHost] 接管后看当前角色的后台任务出错（游戏不受影响）");
+                        }
+                        finally
+                        {
+                            game.Dispose();
+                        }
+                    }
+                )
+            );
+        }
+    }
+
+    /// <inheritdoc />
     public async Task CloseAsync(TimeSpan gracefulTimeout)
     {
         FFXIVProcess? process;

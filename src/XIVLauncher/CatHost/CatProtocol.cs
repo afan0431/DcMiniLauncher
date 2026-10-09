@@ -210,6 +210,15 @@ public static class CatCodes
 
     /// <summary>登录用的文件写不进游戏目录, 要用管理员身份打开一次界面版（只在 launch 带 weGameLogin 时报）</summary>
     public const string WE_GAME_SETUP_REQUIRED = "weGameSetupRequired";
+
+    /// <summary>adopt: 没有这个游戏的守护记录, 或进程号与创建时间对不上（不是 DcMiniLauncher 起的, 或进程号已被复用）</summary>
+    public const string GAME_NOT_FOUND = "gameNotFound";
+
+    /// <summary>adopt: 这个游戏的守护者还活着, 不能两个进程同时守</summary>
+    public const string ALREADY_GUARDED = "alreadyGuarded";
+
+    /// <summary>这个启动器不支持该操作（如国际服、模拟启动器的 adopt）</summary>
+    public const string UNSUPPORTED = "unsupported";
 }
 
 /// <summary>game.exited 的 reason（不带 reason = 游戏自己退出或被外部结束）</summary>
@@ -441,6 +450,19 @@ public sealed class CatSecret(string value) : IEquatable<CatSecret>
     /// <inheritdoc />
     public override string ToString() => "***";
 }
+
+/// <summary>
+///     adopt 参数: 接管一个在跑的游戏（原守护进程已不在）。游戏怎么起的、账号、端口等全从守护记录里读;
+///     minion 只在之后崩溃重开、要重新挂 Minion 时用（卡密不落盘, 只能由外壳再给一次）
+/// </summary>
+public sealed record CatAdoptParams
+(
+    string?          OperationId,
+    int?             Pid,
+    string?          ProcessStartedAt,
+    int?             CrashDialogTimeoutSeconds = null,
+    CatMinionParams? Minion                    = null
+);
 
 /// <summary>inject 参数; force = 已挂着也重新挂 Minion</summary>
 public sealed record CatInjectParams(bool? Dalamud, bool? Minion, bool? Force = null);
