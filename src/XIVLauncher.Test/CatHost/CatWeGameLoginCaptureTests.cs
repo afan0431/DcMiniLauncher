@@ -50,6 +50,15 @@ public sealed class CatWeGameLoginCaptureTests
     }
 
     [Fact]
+    public void AuthOnly_TypeNameIsStable()
+    {
+        Assert.Equal("XIVLauncher.CatHost.CatWeGameAuthOnly", typeof(CatWeGameAuthOnly).FullName);
+        Assert.Same(typeof(CatWeGameLoginCapture).Assembly, typeof(CatWeGameAuthOnly).Assembly);
+        Assert.Equal("launch.authorized", CatWeGameAuthOnly.EVENT);
+        Assert.Equal("authorized", CatStages.AUTHORIZED);
+    }
+
+    [Fact]
     public void ClientProcessNames_NeverIncludeTheGameOrTheService()
     {
         Assert.Equal(["wegame", "wegame_env", "tgp_daemon"], CatWeGameLoginRealEnvironment.ClientProcessNames);
@@ -78,6 +87,7 @@ public sealed class CatWeGameLoginCaptureTests
         Assert.Equal(["stop", "launch"], environment.Calls);
         Assert.Equal(["stage:waitingWeGameLogin", "stage:preparing"], reporter.Entries);
         Assert.Equal(0, store.ReadTokenCount);
+        Assert.True(capture.Captured);
     }
 
     [Fact]
@@ -124,6 +134,7 @@ public sealed class CatWeGameLoginCaptureTests
         Assert.Equal([USER_ID], store.Cleared);
         Assert.Equal((USER_ID, TOKEN, (string?)null), Assert.Single(store.Saved));
         Assert.Equal(["stage:waitingWeGameLogin", "stage:preparing"], reporter.Entries);
+        Assert.True(capture.Captured);
     }
 
     [Fact]
@@ -420,6 +431,7 @@ public sealed class CatWeGameLoginCaptureTests
 
         Assert.Equal("ok:old-token-BBBB", await capture.LoginAsync(Request(true), row, reporter, LoginOk, CancellationToken.None));
         AssertNeverTouchedWeGame();
+        Assert.False(capture.Captured);
     }
 
     #endregion
@@ -444,6 +456,7 @@ public sealed class CatWeGameLoginCaptureTests
         Assert.Equal(0, environment.CaptureCount);
         Assert.Empty(environment.Calls);
         Assert.Empty(reporter.Entries);
+        Assert.False(capture.Captured);
     }
 
     [Fact]

@@ -92,6 +92,15 @@ public static class CatStages
     /// <summary>启动失败</summary>
     public const string FAILED = "failed";
 
+    /// <summary>只登录（launch 带 authOnly）: 已登录成功并发了 launch.authorized, 没有起游戏</summary>
+    public const string AUTHORIZED = "authorized";
+
+    /// <summary>
+    ///     这次 launch 是否已经结束（游戏已退出、启动失败、只登录已完成）
+    /// </summary>
+    public static bool IsFinished(string stage) =>
+        stage is EXITED or FAILED or AUTHORIZED;
+
     /// <summary>自动进入角色: 正在从标题进入选角界面（在 <see cref="RUNNING" /> 之后）</summary>
     public const string ENTERING_LOBBY = "enteringLobby";
 
@@ -402,7 +411,8 @@ public sealed record CatCharacterInfo
 ///     weGameScan = 等 WeGame 登录时自动把登录窗口切到哪种扫码页, 见 <see cref="CatWeGameScans" />（只能和 weGameLogin 一起用, 不带 = 不切换）;
 ///     character = 要登录的角色（可不带）; autoEnter = 游戏起来后自动经标题、选角进入游戏（不带按 false, 国际服忽略）;
 ///     weGameToken / weGameAccountId = 工作台下发的这个号的 WeGame 登录信息与 WeGame 用户号（只能用于 weGame 渠道, 两个要么都带要么都不带, 用户号全为数字）,
-///     本机账号库没有这个号或存的不同时先写进账号库再登录, 见 <see cref="CatWeGameTokenHandoff" />
+///     本机账号库没有这个号或存的不同时先写进账号库再登录, 见 <see cref="CatWeGameTokenHandoff" />;
+///     authOnly = 只登录: 登录成功即发 launch.authorized 结束, 不取票据、不起游戏（只能用于 weGame 渠道, 不带按 false）, 见 <see cref="CatWeGameAuthOnly" />
 /// </summary>
 public sealed record CatLaunchParams
 (
@@ -419,7 +429,8 @@ public sealed record CatLaunchParams
     CatCharacterParams? Character              = null,
     bool?            AutoEnter                 = null,
     string?          WeGameToken               = null,
-    string?          WeGameAccountId           = null
+    string?          WeGameAccountId           = null,
+    bool?            AuthOnly                  = null
 )
 {
     /// <summary>
@@ -429,7 +440,7 @@ public sealed record CatLaunchParams
         $"CatLaunchParams {{ OperationId = {OperationId}, AccountName = {AccountName}, Dalamud = {Dalamud}, Minion = {Minion}, " +
         $"CrashDialogTimeoutSeconds = {CrashDialogTimeoutSeconds}, AreaName = {AreaName}, Platform = {Platform}, Password = {(Password == null ? "(无)" : "***")}, " +
         $"WeGameLogin = {WeGameLogin}, WeGameScan = {WeGameScan}, Character = {Character}, AutoEnter = {AutoEnter}, " +
-        $"WeGameToken = {(WeGameToken == null ? "(无)" : "***")}, WeGameAccountId = {WeGameAccountId} }}";
+        $"WeGameToken = {(WeGameToken == null ? "(无)" : "***")}, WeGameAccountId = {WeGameAccountId}, AuthOnly = {AuthOnly} }}";
 }
 
 /// <summary>

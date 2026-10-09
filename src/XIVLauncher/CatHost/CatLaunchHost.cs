@@ -9,7 +9,8 @@ namespace XIVLauncher.CatHost;
 /// <summary>
 ///     一次 launch 的参数（已校验）; MinionCard = 要挂的 Minion 卡, 不挂为 null; WeGameLogin = WeGame 号在本机没有可用的登录信息时拉起 WeGame 等员工登录, 为 false 时直接报 authorizationRequired;
 ///     AutoEnter = 游戏起来后自动经标题、选角进入游戏; CharacterName / CharacterHomeWorld = 要登录的角色（可为空）;
-///     WeGameToken / WeGameAccountId = 工作台下发的 WeGame 登录信息与 WeGame 用户号（只有 WeGame 号会带, 两个同时有或同时为 null）
+///     WeGameToken / WeGameAccountId = 工作台下发的 WeGame 登录信息与 WeGame 用户号（只有 WeGame 号会带, 两个同时有或同时为 null）;
+///     AuthOnly = 只登录: 登录成功即报 <see cref="ICatLaunchReporter.Authorized" /> 结束, 不起游戏（只有 WeGame 号会带, 此时 MinionCard 为 null、AutoEnter 为 false）
 /// </summary>
 public sealed record CatLaunchRequest
 (
@@ -28,7 +29,8 @@ public sealed record CatLaunchRequest
     string?        CharacterName             = null,
     string?        CharacterHomeWorld        = null,
     CatSecret?     WeGameToken               = null,
-    string?        WeGameAccountId           = null
+    string?        WeGameAccountId           = null,
+    bool           AuthOnly                  = false
 )
 {
     /// <summary>是否为 WeGame 版国服的号</summary>
@@ -80,6 +82,11 @@ public interface ICatLaunchReporter
 
     /// <summary>进入某个阶段</summary>
     void Stage(string stage);
+
+    /// <summary>只登录（launch 带 authOnly）已登录成功, 不起游戏; weGameAccountId = 实际登录用的 WeGame 用户号, captured = 本次是否在 WeGame 里登录取到了新的登录信息</summary>
+    void Authorized(string weGameAccountId, bool captured)
+    {
+    }
 
     /// <summary>进入排队阶段或排队名次变了; queuePosition = 排在第几位, 读不到时为 null</summary>
     void Queueing(int? queuePosition) => Stage(CatStages.QUEUEING);
@@ -283,6 +290,16 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         }
     }
 
+    /// <summary>只登录是否已完成（已发 launch.authorized）</summary>
+    public bool IsAuthorized
+    {
+        get
+        {
+            lock (stateLock)
+                return stage == CatStages.AUTHORIZED;
+        }
+    }
+
     /// <summary>当前 operationId</summary>
     public string? OperationId
     {
@@ -395,6 +412,11 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (weGameLogin && channel != CatPlatform.WeGame)
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"weGameLogin 只能用于 platform 为 {CatPlatforms.WE_GAME} 的号");
 
+        var authOnly = parameters.AuthOnly == true;
+
+        if (authOnly && channel != CatPlatform.WeGame)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"authOnly 只能用于 platform 为 {CatPlatforms.WE_GAME} 的号");
+
         if (!CatWeGameScans.TryParse(parameters.WeGameScan, out var weGameScan))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"weGameScan 只能是 {CatWeGameScans.QQ} 或 {CatWeGameScans.WE_CHAT}");
 
@@ -425,8 +447,12 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (homeWorld is { Length: > MAX_HOME_WORLD_LENGTH } || homeWorld?.Any(char.IsControl) == true)
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"character.homeWorld 不能超过 {MAX_HOME_WORLD_LENGTH} 个字符, 也不能有控制字符");
 
-        // 游戏内模块是按国服客户端写的, 国际服带了 autoEnter 也不做
-        var autoEnter = parameters.AutoEnter == true && !isInternational;
+        // 游戏内模块是按国服客户端写的, 国际服带了 autoEnter 也不做; 只登录不起游戏, 也不做
+        var autoEnter = parameters.AutoEnter == true && !isInternational && !authOnly;
+
+        // 只登录不起游戏, 不挂 Minion
+        if (authOnly)
+            minionCard = null;
 
         CatLaunchRequest accepted;
         ICatGameRunner   selected;
@@ -456,7 +482,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 characterName,
                 homeWorld,
                 hasWeGameToken ? new CatSecret(parameters.WeGameToken!) : null,
-                weGameAccountId
+                weGameAccountId,
+                authOnly
             );
             selected = runnerFactory(accepted);
             runner   = selected;
@@ -465,7 +492,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         Serilog.Log.Information
         (
-            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s, 就地登录 WeGame={WeGameLogin}, 自动切扫码页={WeGameScan}, 自动进入角色={AutoEnter}, 角色={Character}, 原始服务器={HomeWorld}, 下发 WeGame 登录信息={WeGameToken}",
+            "[CatHost] 接受 launch: 操作={OperationId}, 渠道={Platform}, 账号={Account}, Dalamud={Dalamud}, Minion={Minion}, 崩溃对话框等待={CrashTimeout}s, 就地登录 WeGame={WeGameLogin}, 自动切扫码页={WeGameScan}, 自动进入角色={AutoEnter}, 角色={Character}, 原始服务器={HomeWorld}, 下发 WeGame 登录信息={WeGameToken}, 只登录={AuthOnly}",
             accepted.OperationId,
             CatPlatforms.DisplayName(accepted.Channel),
             accepted.AccountName,
@@ -477,7 +504,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             accepted.AutoEnter,
             accepted.CharacterName ?? "(未指定)",
             accepted.CharacterHomeWorld ?? "(未指定)",
-            accepted.WeGameToken != null ? "带了" : "没带"
+            accepted.WeGameToken != null ? "带了" : "没带",
+            accepted.AuthOnly ? "是" : "否"
         );
 
         _ = Task.Run(() => RunLifecycleAsync(selected, accepted));
@@ -677,7 +705,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             gamePid        = pid;
             startedAt      = processStartedAt;
 
-            if (stage is CatStages.EXITED or CatStages.FAILED)
+            if (CatStages.IsFinished(stage))
                 return CatAcceptResult.Ok();
         }
 
@@ -791,7 +819,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         lock (stateLock)
         {
-            if (closeRequested || runnerFaulted || stage is CatStages.EXITED or CatStages.FAILED)
+            if (closeRequested || runnerFaulted || CatStages.IsFinished(stage))
                 return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证");
 
             current = runner;
@@ -975,6 +1003,16 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         Serilog.Log.Warning("[CatHost] 启动失败: {Code} {Message}", code, message);
         Publish("launch.failed", new { operationId = OperationId, code, message = Redact(message) });
+    }
+
+    /// <inheritdoc />
+    public void Authorized(string weGameAccountId, bool captured)
+    {
+        lock (stateLock)
+            stage = CatStages.AUTHORIZED;
+
+        Serilog.Log.Information("[CatHost] 只登录完成: WeGame 用户号={WeGameAccountId}, 本次在 WeGame 里登录={Captured}", weGameAccountId, captured);
+        Publish(CatWeGameAuthOnly.EVENT, new { operationId = OperationId, weGameAccountId, captured });
     }
 
     /// <inheritdoc />

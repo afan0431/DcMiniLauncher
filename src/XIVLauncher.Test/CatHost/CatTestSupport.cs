@@ -261,6 +261,9 @@ internal sealed class RecordingReporter : ICatLaunchReporter
         Messages.Enqueue(message);
     }
 
+    public void Authorized(string weGameAccountId, bool captured) =>
+        Entries.Enqueue($"authorized:{weGameAccountId}:{(captured ? "captured" : "saved")}");
+
     /// <summary>所有带文字的报告（日志、失败、代理、退出）里的文字, 查敏感值有没有漏出来用</summary>
     public ConcurrentQueue<string> Messages { get; } = new();
 

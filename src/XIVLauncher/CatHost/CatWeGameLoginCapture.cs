@@ -21,6 +21,16 @@ public static class CatWeGameTokenHandoff
 }
 
 /// <summary>
+///     能力标记: 这个版本认 launch 带来的 authOnly（只登录）: WeGame 号登录盛趣成功即发 <see cref="EVENT" /> 结束, 不取票据、不起游戏、不注入、不挂 Minion、不开跨区;
+///     没有可用的登录信息时照常拉起 WeGame 等登录。工作台按程序集里有没有这个类型判断能不能给它发 authOnly, 名字和命名空间不能改。
+/// </summary>
+public static class CatWeGameAuthOnly
+{
+    /// <summary>只登录成功后发的事件, 载荷 { operationId, weGameAccountId, captured }; 之后进程以 <see cref="CatHostRuntime.EXIT_OK" /> 退出</summary>
+    public const string EVENT = "launch.authorized";
+}
+
+/// <summary>
 ///     就地登录 WeGame 时对本机的操作（游戏目录、WeGame 客户端、取登录信息）, 单独抽出来好让测试替换
 /// </summary>
 public interface ICatWeGameLoginEnvironment
@@ -95,6 +105,9 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
     private string? capturedToken;
 
     private volatile CatWeGameChallengeWatcher? watcher;
+
+    /// <summary>本次是否在 WeGame 里登录取到了新的登录信息</summary>
+    public bool Captured => capturedToken != null;
 
     /// <summary>拉起 WeGame 后等员工登录的上限</summary>
     public TimeSpan LoginTimeout { get; init; } = TimeSpan.FromMinutes(10);
