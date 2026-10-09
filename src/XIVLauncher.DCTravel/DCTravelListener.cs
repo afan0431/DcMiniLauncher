@@ -75,6 +75,9 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
     private int        stopState;
     private int        disposeState;
 
+    /// <summary>真正开始监听时为 true; 绑定失败或被停掉为 false</summary>
+    private readonly TaskCompletionSource<bool> listening = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public DCTravelListener(DCTravelClient dcTravelClient, int port, bool useEncrypt = true)
     {
         ArgumentNullException.ThrowIfNull(dcTravelClient);
@@ -96,6 +99,28 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
                   .WithMode(HttpListenerMode.EmbedIO)
             )
             .WithWebApi("/dctravel", m => m.WithController(() => new RpcController(this)));
+
+        webServer.StateChanged += (_, e) =>
+        {
+            if (e.NewState == WebServerState.Listening)
+                listening.TrySetResult(true);
+        };
+    }
+
+    /// <summary>
+    ///     等到真正开始监听; 端口被占等原因绑不上、或超时时返回 false。
+    ///     游戏命令行里的端口改不了, 绑不上就意味着游戏内跨区失联, 调用方必须知道
+    /// </summary>
+    public async Task<bool> WaitListeningAsync(TimeSpan timeout)
+    {
+        try
+        {
+            return await listening.Task.WaitAsync(timeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
     }
 
     #region Disposal
@@ -131,6 +156,20 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
         Interlocked.Exchange(ref webServer, null)?.Dispose();
     }
 
+    /// <summary>
+    ///     只关掉监听, 不登出、不结束跨区会话: 端口没绑上要换一个重试时, 或者把游戏交给另一个守护进程时用
+    ///     （会话还要接着用, 登出了对方就得重新登录）
+    /// </summary>
+    public void StopListening()
+    {
+        if (Interlocked.Exchange(ref stopState, 1) != 0)
+            return;
+
+        listenerCts.Cancel();
+        Interlocked.Exchange(ref webServer, null)?.Dispose();
+        listening.TrySetResult(false);
+    }
+
     public async Task StartAsync()
     {
         try
@@ -146,6 +185,10 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
         catch (Exception ex)
         {
             Log.Error(ex, "[DCTravelListener] 发生异常");
+        }
+        finally
+        {
+            listening.TrySetResult(false);
         }
     }
 

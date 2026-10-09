@@ -161,8 +161,10 @@ public static class RunningGameRegistry
             ENTRIES[process.Id] = new Entry(process, InGameAgents.Minion);
             Log.Information("[RunningGame] 认领了上次留下的客户端 PID={Pid}（模块管道仍在）", process.Id);
 
-            // 端口文件还是上一轮那个端口, 得改写成这一轮的, 否则游戏内 UI 打的是空号
-            WritePortFile(process.Id, CurrentDcTravelPort);
+            // 有守护记录的游戏由接管它的守护进程绑回原端口（游戏命令行里的那个）, 端口文件不能改;
+            // 没有记录的老游戏端口文件还是上一轮那个端口, 得改写成这一轮的, 否则游戏内 UI 打的是空号
+            if (GameRecords.Read(process.Id) is not { DcTravelPort: > 0 })
+                WritePortFile(process.Id, CurrentDcTravelPort);
         }
     }
 
