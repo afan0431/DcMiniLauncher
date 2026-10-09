@@ -651,13 +651,22 @@ namespace
     }
 
     // 退出游戏: 同一个处理函数, isExiting=true —— 游戏在「确定要结束游戏吗？」点了确定之后走的就是它,
-    // 先向服务器登出再退出进程。不在世界里时返回 0, 由调用方直接结束进程。
+    // 先向服务器登出再退出进程。不在世界里时返回 0, 由调用方直接结束进程;
+    // 读不到界面位置返回 -2, 登出函数没解析到返回 -3。
     int OpExitGame(const Pointers* p)
     {
         __try
         {
-            if (OpWhere(p) != 3)
+            const int where = OpWhere(p);
+
+            if (where < 0)
+                return -2;
+
+            if (where != 3)
                 return 0;
+
+            if (g_handleLogout == 0 || p->agentLobby == nullptr)
+                return -3;
 
             reinterpret_cast<HandleLogoutFn>(g_handleLogout)(p->agentLobby, true, 0);
             return 1;
@@ -883,6 +892,7 @@ std::string GameLogout(bool direct)
 // 下号退出游戏。只发起、不等: 进程退不退由启动器看。
 //   OK exiting       在世界里, 已调 HandleLogout(isExiting=true)
 //   OK not-in-world  标题 / 选角 / 片头, 没有要登出的角色
+// 主线程只等 3 秒: 下号时等不到就让启动器改发关闭消息, 不占着整个关闭时限
 std::string GameExit()
 {
     CallStatePtr state;
@@ -893,8 +903,14 @@ std::string GameExit()
 
     auto captured = state;
 
-    if (!MainThreadRun([captured] { captured->result = OpExitGame(&captured->pointers); }, 5000))
+    if (!MainThreadRun([captured] { captured->result = OpExitGame(&captured->pointers); }, 3000))
         return "FAIL mainthread-timeout";
+
+    if (state->result == -2)
+        return "FAIL where-unknown";
+
+    if (state->result == -3)
+        return "FAIL sigscan-failed";
 
     if (state->result < 0)
         return "FAIL exception";

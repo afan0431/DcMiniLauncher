@@ -41,7 +41,8 @@ public sealed class CatModuleGameExit : ICatGameExit
     private static readonly TimeSpan InjectTimeout   = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan GateTimeout     = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan GatePoll        = TimeSpan.FromMilliseconds(100);
-    private static readonly TimeSpan ResponseTimeout = TimeSpan.FromSeconds(6);
+    /// <summary>模块侧最坏: 首次解析特征码约 3 秒 + 主线程派发 3 秒</summary>
+    private static readonly TimeSpan ResponseTimeout = TimeSpan.FromSeconds(8);
 
     private const int PIPE_CONNECT_TIMEOUT_MS = 2_000;
 
@@ -53,6 +54,12 @@ public sealed class CatModuleGameExit : ICatGameExit
     public async Task<CatGameExitOutcome> RequestAsync(Process game, CancellationToken cancellationToken)
     {
         if (!MiniModuleInjector.ModulePath.Exists)
+            return CatGameExitOutcome.Unavailable;
+
+        // 窗口还没出来的游戏: 模块装不上主线程通道, 走关闭消息那条路（没有窗口时立即结束进程）
+        game.Refresh();
+
+        if (game.MainWindowHandle == IntPtr.Zero)
             return CatGameExitOutcome.Unavailable;
 
         if (!MiniModuleInjector.IsInjected(game))
