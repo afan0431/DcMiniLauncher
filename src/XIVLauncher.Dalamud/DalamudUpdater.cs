@@ -531,7 +531,11 @@ public class DalamudUpdater : IDalamudUpdater
         }
     }
 
-    private static void CleanUpOld(DirectoryInfo addonPath, string currentVer)
+    /// <summary>
+    ///     删掉旧版本目录, 但跳过还有游戏在用的: 在跑的游戏从自己那一版的目录加载程序集, 它的崩溃处理器重开游戏时
+    ///     也要用那里的 Dalamud.Injector.exe。整目录删会把没被锁住的文件删掉、锁住的留下, 剩下一个残缺的版本
+    /// </summary>
+    internal static void CleanUpOld(DirectoryInfo addonPath, string currentVer)
     {
         if (!addonPath.Exists)
             return;
@@ -539,6 +543,12 @@ public class DalamudUpdater : IDalamudUpdater
         foreach (var directory in addonPath.GetDirectories())
         {
             if (directory.Name == "dev" || directory.Name == currentVer) continue;
+
+            if (FirstFileInUse(directory) is { } inUse)
+            {
+                Log.Information("[DUPDATE] 旧版本 {Version} 还有文件在用（{File}）, 不删", directory.Name, Path.GetRelativePath(directory.FullName, inUse));
+                continue;
+            }
 
             try
             {
@@ -549,6 +559,35 @@ public class DalamudUpdater : IDalamudUpdater
                 // ignored
             }
         }
+    }
+
+    /// <summary>
+    ///     目录里第一个打不开独占读写的文件; 都打得开时为 null。游戏映射着的 DLL、运行中的 exe 都打不开
+    /// </summary>
+    internal static string? FirstFileInUse(DirectoryInfo directory)
+    {
+        try
+        {
+            // 枚举是惰性的, 子目录打不开的异常在遍历途中才抛出, 所以整个遍历都包在里面
+            foreach (var file in directory.EnumerateFiles("*", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    using var stream = file.Open(FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+                }
+                catch (Exception)
+                {
+                    return file.FullName;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[DUPDATE] 枚举 {Directory} 失败, 当作在用", directory.FullName);
+            return directory.FullName;
+        }
+
+        return null;
     }
 
     public async Task DownloadFile(string url, string path) =>

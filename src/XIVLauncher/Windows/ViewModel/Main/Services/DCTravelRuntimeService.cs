@@ -11,6 +11,12 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
 {
     private const int MAINTENANCE_RECOVERY_INTERVAL_MINUTES = 5;
 
+    /// <summary>不指定端口时, 随机取的端口没绑上最多再换几次</summary>
+    private const int RANDOM_PORT_ATTEMPTS = 3;
+
+    /// <summary>等监听器真正开始监听的上限</summary>
+    private static readonly TimeSpan ListenTimeout = TimeSpan.FromSeconds(5);
+
     private readonly Action<string> setSdoAreaAction;
 
     private CancellationTokenSource? recoveryCts;
@@ -70,14 +76,16 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
     ///     游戏内那半自己会挑执行者: 有 Dalamud → 插件读 <c>XL.DcTraveler</c> 端口;
     ///     只 Minion → 注入的 native 模块被启动器经命名管道驱动（F4），不走这个端口。
     /// </remarks>
-    public async Task<int> StartAsync()
+    /// <param name="port">
+    ///     要绑的端口: 接管在跑的游戏时必须是它命令行里那个（<c>XL.DcTraveler</c> 改不了）, 绑不上返回 0;
+    ///     不给时随机取, 绑不上换一个再试
+    /// </param>
+    public async Task<int> StartAsync(int? port = null)
     {
         Stop();
 
         Client.BeginSession();
         var version = Volatile.Read(ref sessionVersion);
-        DcTravelPort                            = APIHelper.GetAvailablePort();
-        RunningGameRegistry.CurrentDcTravelPort = DcTravelPort;
 
         // 上一轮被强杀时留下的端口文件会让游戏内那侧一直往死端口上撞, 先扫掉
         RunningGameRegistry.PruneStalePortFiles();
@@ -85,31 +93,35 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         // 无论初始化是否成功, 始终启动监听器 —— 游戏内插件可通过 RPC 错误区分维护状态
         var inGameTravel = new InGameTravelCoordinator(Client);
 
-        Listener = new DCTravelListener(Client, DcTravelPort, false)
-        {
-            // F4: 游戏内换大区的三条接口 —— bot / 游戏内 UI 用普通 HTTP 就能驱动:
-            //   POST /dctravel/ingame-travel          发起（默认立刻返回, 传 wait:true 才同步等）
-            //   GET  /dctravel/ingame-travel/status   查进度（游戏内 UI 显示「正在排队…」靠它）
-            //   GET  /dctravel/ingame-travel/areas    可选目标 + 拥挤度, 填下拉框用
-            InGameTravelHandler        = inGameTravel.HandleAsync,
-            // 没跑过的 pid 也要给个成形的对象 —— 直接把 null 序列化出去就是字面量 "null",
-            // 游戏内那侧 json.decode 得到 nil, 会当成「回应解析失败」而不是「还没跑过」
-            InGameTravelStatusProvider = pid => pid is { } id
-                                                    ? InGameTravelJobs.Get(id) ?? new InGameTravelStatus { Pid = id }
-                                                    : (object)InGameTravelJobs.All(),
-            InGameTravelAreasProvider  = inGameTravel.QueryTargetsAsync,
-            //   GET  /dctravel/ingame-travel/chara-list    选角列表(原生模块读), 换大区后按 contentId 查新序号
-            InGameCharaListProvider    = InGameTravelCoordinator.QueryCharaListAsync,
-            //   POST /dctravel/ingame-travel/switch-area   换登录大区(标题界面): 不动角色、不下单、无冷却
-            //   GET  /dctravel/ingame-travel/login-areas   可切换的大区列表
-            InGameSwitchAreaHandler    = inGameTravel.HandleSwitchAreaAsync,
-            InGameLoginAreasProvider   = InGameTravelCoordinator.QueryLoginAreasAsync,
-            //   GET/POST /dctravel/ingame-travel/settings  抄 DcTraveler 那四项设置
-            InGameTravelSettingsHandler = InGameTravelCoordinator.HandleSettings
-        };
+        var bound = 0;
 
-        _ = Listener.StartAsync();
-        Log.Information("[DCTravelListener] 打开监听端口: {DcTravelPort}", DcTravelPort);
+        for (var attempt = 1; attempt <= (port == null ? RANDOM_PORT_ATTEMPTS : 1) && bound == 0; attempt++)
+        {
+            var candidate = port ?? APIHelper.GetAvailablePort();
+            var listener  = CreateListener(candidate, inGameTravel);
+
+            _ = listener.StartAsync();
+
+            if (await listener.WaitListeningAsync(ListenTimeout).ConfigureAwait(false))
+            {
+                Listener = listener;
+                bound    = candidate;
+                break;
+            }
+
+            Log.Error("[DCTravelListener] 端口 {Port} 没绑上（第 {Attempt} 次）", candidate, attempt);
+            listener.StopListening();
+            listener.Dispose();
+        }
+
+        DcTravelPort                            = bound;
+        RunningGameRegistry.CurrentDcTravelPort = bound;
+
+        // 端口没开成也照样建立会话: 启动器自己的超域传送页面用同一个 Client, 不依赖这个端口
+        if (bound == 0)
+            Log.Error("[DCTravelListener] 跨区端口没能打开, 游戏内跨区不可用");
+        else
+            Log.Information("[DCTravelListener] 打开监听端口: {DcTravelPort}", DcTravelPort);
 
         try
         {
@@ -134,6 +146,30 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         MaintenanceStateChanged?.Invoke(Client.MaintenanceState);
         return DcTravelPort;
     }
+
+    private DCTravelListener CreateListener(int port, InGameTravelCoordinator inGameTravel) =>
+        new(Client, port, false)
+        {
+            // F4: 游戏内换大区的三条接口 —— bot / 游戏内 UI 用普通 HTTP 就能驱动:
+            //   POST /dctravel/ingame-travel          发起（默认立刻返回, 传 wait:true 才同步等）
+            //   GET  /dctravel/ingame-travel/status   查进度（游戏内 UI 显示「正在排队…」靠它）
+            //   GET  /dctravel/ingame-travel/areas    可选目标 + 拥挤度, 填下拉框用
+            InGameTravelHandler        = inGameTravel.HandleAsync,
+            // 没跑过的 pid 也要给个成形的对象 —— 直接把 null 序列化出去就是字面量 "null",
+            // 游戏内那侧 json.decode 得到 nil, 会当成「回应解析失败」而不是「还没跑过」
+            InGameTravelStatusProvider = pid => pid is { } id
+                                                    ? InGameTravelJobs.Get(id) ?? new InGameTravelStatus { Pid = id }
+                                                    : (object)InGameTravelJobs.All(),
+            InGameTravelAreasProvider  = inGameTravel.QueryTargetsAsync,
+            //   GET  /dctravel/ingame-travel/chara-list    选角列表(原生模块读), 换大区后按 contentId 查新序号
+            InGameCharaListProvider    = InGameTravelCoordinator.QueryCharaListAsync,
+            //   POST /dctravel/ingame-travel/switch-area   换登录大区(标题界面): 不动角色、不下单、无冷却
+            //   GET  /dctravel/ingame-travel/login-areas   可切换的大区列表
+            InGameSwitchAreaHandler    = inGameTravel.HandleSwitchAreaAsync,
+            InGameLoginAreasProvider   = InGameTravelCoordinator.QueryLoginAreasAsync,
+            //   GET/POST /dctravel/ingame-travel/settings  抄 DcTraveler 那四项设置
+            InGameTravelSettingsHandler = InGameTravelCoordinator.HandleSettings
+        };
 
     public void ConfigureQuickLoginRefresh
     (

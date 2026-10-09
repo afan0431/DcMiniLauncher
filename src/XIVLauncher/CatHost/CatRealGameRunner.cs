@@ -97,6 +97,18 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     /// <summary>等自动进入角色的后台任务收尾的上限（它们在游戏退出时已被取消, 这里只是不让事件落在 game.exited 后面）</summary>
     private static readonly TimeSpan AutoEnterShutdownTimeout = TimeSpan.FromSeconds(5);
 
+    /// <summary>本进程的创建时间, 写进守护记录的「守护者」</summary>
+    private static readonly DateTimeOffset SelfStartedAt = MinionOccupancy.GetProcessStartedAt(Process.GetCurrentProcess());
+
+    /// <summary>写过守护记录的游戏进程 → 它的创建时间（删记录时核对, 防进程号复用后误删）</summary>
+    private readonly Dictionary<int, DateTimeOffset> recordedGames = [];
+
+    /// <summary>本进程守着的游戏 → 它的守护锁（游戏结束时放掉）</summary>
+    private readonly Dictionary<int, IDisposable> guardClaims = [];
+
+    /// <summary>本进程对守护记录的写、改、删都经这把锁</summary>
+    private readonly SemaphoreSlim recordLock = new(1, 1);
+
     private bool IsCloseRequested
     {
         get
@@ -145,6 +157,277 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         finally
         {
             dcTravel?.Dispose();
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<int> AdoptAsync(CatAdoptRequest adoptRequest, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        var record = adoptRequest.Record;
+
+        request = new CatLaunchRequest
+        (
+            adoptRequest.OperationId,
+            record.AccountName,
+            record.DalamudRequested,
+            adoptRequest.MinionCard,
+            adoptRequest.CrashDialogTimeoutSeconds,
+            record.AreaName,
+            record.Channel == GameRecordChannels.WE_GAME ? XIVAccountType.WeGame : XIVAccountType.Sdo,
+            false,
+            null,
+            false,
+            null,
+            record.AutoEnter,
+            record.CharacterName,
+            record.CharacterHomeWorld
+        );
+
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, closeCts.Token);
+
+        try
+        {
+            var launched = await PrepareAdoptAsync(adoptRequest, reporter, linked.Token).ConfigureAwait(false);
+            var options  = new RestartMonitor.RestartOptions(record.RestartNoDalamud, record.RestartNoThirdPlugins, record.RestartNoPlugins);
+
+            using var final = await GuardAsync(launched, record.Dalamud, options, null, TimeSpan.Zero, reporter, linked.Token, cancellationToken).ConfigureAwait(false);
+
+            await WaitAutoEnterEndAsync().ConfigureAwait(false);
+
+            if (IsCloseRequested)
+                reporter.Exited(lastPid, lastExitCode, CatExitReasons.CLOSED);
+            else
+                reporter.Exited(lastPid, lastExitCode, exitReason, exitFailureCode, exitFailureMessage);
+
+            return CatHostRuntime.EXIT_OK;
+        }
+        catch (CatLaunchException ex) when (currentProcess == null)
+        {
+            reporter.Failed(ex.Code, ex.Message);
+            return CatLaunchHost.EXIT_LAUNCH_FAILED;
+        }
+        catch (OperationCanceledException) when (currentProcess == null && IsCloseRequested)
+        {
+            // 接管准备途中收到 close: 外壳要的是下号, 游戏照样关掉
+            Log.Information("[CatHost] 接管途中收到关闭请求, 直接关游戏 {Pid}", adoptRequest.Pid);
+            await CatGameCloser.CloseAsync(adoptRequest.Game, closeTimeout).ConfigureAwait(false);
+
+            int? exitCode = null;
+
+            try
+            {
+                exitCode = adoptRequest.Game.HasExited ? adoptRequest.Game.ExitCode : null;
+            }
+            catch (InvalidOperationException)
+            {
+                // 读不到退出码
+            }
+
+            RunningGameRegistry.Unregister(adoptRequest.Pid);
+            GameRecords.Delete(adoptRequest.Pid, adoptRequest.ProcessStartedAt);
+            reporter.Exited(adoptRequest.Pid, exitCode, CatExitReasons.CLOSED);
+            return CatHostRuntime.EXIT_OK;
+        }
+        catch (Exception ex) when (currentProcess != null)
+        {
+            return await GuardAfterErrorAsync(ex, reporter).ConfigureAwait(false);
+        }
+        finally
+        {
+            dcTravel?.Dispose();
+        }
+    }
+
+    /// <summary>
+    ///     接管前的准备: 按守护记录找回账号、设备、大区, 用记录里的 TGT/guid 重建登录刷新（不重新登录）,
+    ///     跨区服务绑回游戏命令行里的端口, 把守护者改成本进程。返回游戏进程。
+    /// </summary>
+    private async Task<FFXIVProcess> PrepareAdoptAsync(CatAdoptRequest adoptRequest, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        var record = adoptRequest.Record;
+
+        reporter.Stage(CatStages.PREPARING);
+
+        try
+        {
+            await ensureInitialized().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[CatHost] 初始化设置与账号库失败");
+            throw new CatLaunchException(CatCodes.LAUNCH_FAILED, $"DcMiniLauncher 初始化失败: {ex.Message}");
+        }
+
+        accountManager = App.AccountManager;
+
+        // 被强杀的守护进程留下的记录、临时文件、锁文件
+        GameRecords.PruneStale();
+
+        if (accountManager.CurrentCredType == CredType.WindowsHello)
+            throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "账号库使用 Windows Hello 加密, 无人值守时无法解密已保存的凭证");
+
+        account = accountManager.FindAccount(record.AccountUserName, request.Platform)
+                  ?? throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, $"账号库里找不到守护记录里的号 {record.AccountUserName}");
+
+        accountManager.RefreshFromDatabase(account);
+
+        gamePath = App.Settings.GetGamePath(request.Platform) is { Exists: true } path
+                       ? path
+                       : throw new CatLaunchException(CatCodes.INVALID_GAME_PATH, "DcMiniLauncher 设置里的游戏目录无效");
+
+        device = CatDeviceProfiles.Resolve(accountManager, account, out _)
+                 ?? throw new CatLaunchException(CatCodes.AUTHORIZATION_REQUIRED, "这个号开了独立设备, 但账号库里找不到它的设备信息");
+
+        var areas = await LoadAreasAsync(cancellationToken).ConfigureAwait(false);
+
+        // 账号库里的大区会随游戏内换大区更新, 比启动时写进记录的新
+        var area = ResolveArea(areas, account.AreaName, null, x => x.AreaName, out _)
+                   ?? ResolveArea(areas, record.AreaName, null, x => x.AreaName, out _);
+
+        if (area == null)
+        {
+            area = areas[0];
+            reporter.Log("warning", $"账号库和守护记录里都没有能用的大区, 崩溃重开时按列表第一个「{area.AreaName}」启动");
+        }
+
+        // 崩溃重开换票据用的凭证: 先用记录里的 TGT/guid（不算登录）, 过期了再用快速登录凭证 / WeGame 令牌
+        var tgt   = await DecryptOrNullAsync(record.Tgt).ConfigureAwait(false);
+        var guid  = await DecryptOrNullAsync(record.Guid).ConfigureAwait(false);
+        var oauth = new OAuthLoginResult { SndaID = record.SndaId ?? string.Empty, TGT = tgt, Guid = guid, DeviceProfile = device };
+
+        if (request.IsWeGame)
+            weGameToken = await DecryptOrNullAsync(accountManager.HasUnavailableSecrets(account) ? null : account.WeGameQuickLoginSecret).ConfigureAwait(false);
+        else
+            quickKey = await DecryptOrNullAsync(accountManager.HasUnavailableSecrets(account) ? null : account.SdoQuickLoginSecret).ConfigureAwait(false);
+
+        context = new GameLaunchContext(new LoginResult { State = LoginState.Ok, OAuthLogin = oauth }, area, areas, request.Platform);
+
+        dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel);
+
+        if (!string.IsNullOrEmpty(tgt) && !string.IsNullOrEmpty(guid))
+            new LoginChannelContext(device).BindLoginSessionRefresh(dcTravel, tgt, guid);
+
+        if (CanRefreshByLogin)
+            dcTravel.ConfigureQuickLoginRefresh(RefreshSessionIdByQuickLoginAsync);
+
+        if (record.DcTravelPort > 0)
+        {
+            context.DcTravelPort = await dcTravel.StartAsync(record.DcTravelPort).ConfigureAwait(false);
+
+            if (context.DcTravelPort == 0)
+                reporter.Log("error", $"跨区端口 {record.DcTravelPort} 没能绑回, 这个游戏的游戏内跨区不可用（崩溃重开照常）");
+        }
+
+        // 受理 adopt 时已打开并核对过的进程（一直拿着句柄, 进程号不会被复用）
+        var process = adoptRequest.Game;
+
+        if (process.HasExited)
+            throw new CatLaunchException(CatCodes.NOT_RUNNING, $"游戏 {adoptRequest.Pid} 已经退出");
+
+        var launched = new FFXIVProcess(process);
+        bool closeNow;
+
+        lock (closeLock)
+        {
+            currentProcess = launched;
+            closeNow       = closeRequested;
+        }
+
+        await WriteRecordLockedAsync
+        (
+            () => Task.FromResult<GameRecord?>
+            (
+                record with { OperationId = adoptRequest.OperationId, GuardPid = Environment.ProcessId, GuardStartedAt = SelfStartedAt, UpdatedAt = DateTimeOffset.UtcNow }
+            )
+        ).ConfigureAwait(false);
+
+        lock (cleanupLock)
+        {
+            recordedGames[process.Id] = record.ProcessStartedAt;
+
+            // 受理 adopt 时认领的守护锁: 这个游戏一退出（含崩溃重开换了新进程）就放掉, 不等整个接管流程结束
+            guardClaims[process.Id] = adoptRequest.GuardClaim;
+        }
+
+        context.InGameAgents = (record.Dalamud ? InGameAgents.Dalamud : InGameAgents.None) | (record.MinionFingerprint != null ? InGameAgents.Minion : InGameAgents.None);
+        RunningGameRegistry.Register(process, context.InGameAgents, context.DcTravelPort);
+
+        Log.Information
+        (
+            "[CatHost] 已接管游戏 {Pid}（原守护进程 {GuardPid}）, 跨区端口 {Port}, 盯崩溃处理器={Dalamud}, 有 TGT={HasTgt}, 有快速登录凭证={CanRefresh}",
+            process.Id,
+            record.GuardPid,
+            context.DcTravelPort,
+            record.Dalamud,
+            !string.IsNullOrEmpty(tgt) && !string.IsNullOrEmpty(guid),
+            CanRefreshByLogin
+        );
+
+        reporter.Adopted(process.Id, record.ProcessStartedAt);
+
+        // 接管来的游戏已经注好的东西照实报一次, status 才不会是空的
+        if (record.Dalamud)
+            reporter.Agent(CatAgentKinds.DALAMUD, IsDalamudLoaded(process));
+
+        if (record.MinionFingerprint != null)
+            reporter.Agent(CatAgentKinds.MINION, CatMinionReservations.IsAttached(process));
+
+        if (closeNow)
+        {
+            // 准备途中收到了 close: 接管下来再关, 之后照常发 game.exited{closed}
+            _ = CatGameCloser.CloseAsync(process, closeTimeout);
+            return launched;
+        }
+
+        reporter.Stage(CatStages.RUNNING);
+
+        // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色（编排早就做完了, 不再重做）
+        if (record.AutoEnter && !process.HasExited)
+            StartObserve(launched, reporter, cancellationToken);
+
+        return launched;
+    }
+
+    /// <summary>
+    ///     只看当前角色、不做编排（接管来的游戏已经进过游戏了）
+    /// </summary>
+    private void StartObserve(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken token)
+    {
+        var process      = launched.UnderlyingProcess;
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var game         = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea);
+        var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, null));
+        var observeToken = cancellation.Token;
+
+        autoEnter = flow;
+
+        lock (cleanupLock)
+        {
+            autoEnterCancellations[launched.ProcessID] = cancellation;
+            autoEnterTasks.Add
+            (
+                Task.Run
+                (async () =>
+                    {
+                        try
+                        {
+                            await flow.ObserveAsync(observeToken).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // 游戏退出或收到关闭请求
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, "[CatHost] 接管后看当前角色的后台任务出错（游戏不受影响）");
+                        }
+                        finally
+                        {
+                            game.Dispose();
+                        }
+                    }
+                )
+            );
         }
     }
 
@@ -261,6 +544,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
 
         accountManager = App.AccountManager;
+
+        // 被强杀的守护进程留下的记录、临时文件、锁文件
+        GameRecords.PruneStale();
 
         if (accountManager.CurrentCredType == CredType.WindowsHello)
         {
@@ -645,12 +931,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             if (oauth == null)
                 return string.Empty;
 
-            // 新 TGT 写回, 下次崩溃重启先用它换票据, 少登录一次
+            // 新 TGT 写回, 下次崩溃重启先用它换票据, 少登录一次; 守护记录也跟着换, 接管的进程拿到的是能用的那个
             if (!string.IsNullOrEmpty(oauth.TGT) && !string.IsNullOrEmpty(oauth.Guid) && context?.LoginResult.OAuthLogin is { } current)
             {
                 redactor.Register(oauth.TGT);
                 current.TGT  = oauth.TGT;
                 current.Guid = oauth.Guid;
+                await RewriteGameRecordCredentialsAsync().ConfigureAwait(false);
             }
 
             if (!string.IsNullOrEmpty(oauth.SessionID))
@@ -697,7 +984,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             }
         }
 
-        if (error != null && isRestart && CanRefreshByLogin && CatLoginFailures.Classify(error) != CatLoginFailureKind.Network)
+        // 崩溃重开: TGT 换票据失败（网络错误除外）, 或手里压根没有 TGT（接管来的游戏记录里没存或解不开）, 都用快速登录凭证刷新
+        var noTgt = string.IsNullOrEmpty(oauthLogin.TGT) || string.IsNullOrEmpty(oauthLogin.Guid);
+
+        if (isRestart && CanRefreshByLogin && (error != null ? CatLoginFailures.Classify(error) != CatLoginFailureKind.Network : noTgt))
         {
             try
             {
@@ -869,11 +1159,39 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     )
     {
         var (launched, dalamudOk, companionAppManager) = await StartOnceAsync(options, restartedFromPid, reporter, startToken).ConfigureAwait(false);
+
+        return await GuardAsync(launched, dalamudOk, options, companionAppManager, null, reporter, startToken, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     守护一个已经在跑的游戏到它退出（正常启动与接管共用）: 注入了 Dalamud 的盯崩溃处理器, 要重开时递归 <see cref="RunGameAsync" />。
+    ///     返回最后一个游戏进程（重开过则是新进程）。
+    /// </summary>
+    /// <param name="launched">游戏进程</param>
+    /// <param name="watchCrashHandler">游戏里有 Dalamud（有崩溃处理器可盯）</param>
+    /// <param name="options">本次的模式, 崩溃处理器回「按原模式重开」时用</param>
+    /// <param name="companionAppManager">伴随程序（接管来的游戏为 null）</param>
+    /// <param name="crashHandlerDiscoveryTimeout">找崩溃处理器的期限; null = 默认, 接管时给 0</param>
+    /// <param name="reporter">报告</param>
+    /// <param name="startToken">重开途中可被 close 取消</param>
+    /// <param name="cancellationToken">外部取消</param>
+    private async Task<FFXIVProcess> GuardAsync
+    (
+        FFXIVProcess                  launched,
+        bool                          watchCrashHandler,
+        RestartMonitor.RestartOptions options,
+        CompanionAppManager?          companionAppManager,
+        TimeSpan?                     crashHandlerDiscoveryTimeout,
+        ICatLaunchReporter            reporter,
+        CancellationToken             startToken,
+        CancellationToken             cancellationToken
+    )
+    {
         FFXIVProcess result = launched;
 
         try
         {
-            if (dalamudOk)
+            if (watchCrashHandler)
             {
                 await launcher.RestartMonitor
                               .MonitorAsync
@@ -909,10 +1227,11 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                                   cancellationToken,
                                   new RestartMonitor.MonitorOptions
                                   {
-                                      CrashHandlerExitTimeout  = request.CrashDialogTimeout,
-                                      CrashHandlerOutlivedGame = reporter.Crashed,
-                                      CrashHandlerTimedOut     = () => exitReason = CatExitReasons.CRASH_DIALOG_TIMEOUT,
-                                      StopToken                = closeCts.Token
+                                      CrashHandlerExitTimeout      = request.CrashDialogTimeout,
+                                      CrashHandlerOutlivedGame     = reporter.Crashed,
+                                      CrashHandlerTimedOut         = () => exitReason = CatExitReasons.CRASH_DIALOG_TIMEOUT,
+                                      StopToken                    = closeCts.Token,
+                                      CrashHandlerDiscoveryTimeout = crashHandlerDiscoveryTimeout
                                   }
                               )
                               .ConfigureAwait(false);
@@ -960,6 +1279,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             }
         }
 
+        // 接管时没能绑回原端口（或原来就没开成）: 新起的游戏换一个端口重新开跨区, 新进程的命令行会带上它
+        if (restartedFromPid != null && context.DcTravelPort == 0 && dcTravel != null)
+        {
+            context.DcTravelPort = await dcTravel.StartAsync().ConfigureAwait(false);
+            Log.Information("[CatHost] 崩溃重开前重新打开跨区服务, 端口 {Port}", context.DcTravelPort);
+        }
+
         // 票据单次有效且有时效, Dalamud 准备完再现取
         await EnsureFreshSessionIdAsync(restartedFromPid != null).ConfigureAwait(false);
 
@@ -982,6 +1308,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
 
         var startedAt = SafeProcessStartedAt(process);
+
+        // 先写守护记录再报 started: 外壳一拿到进程号, 这个游戏就必须是接管得了的
+        await WriteGameRecordAsync(process, startedAt, options, dalamudOk).ConfigureAwait(false);
 
         if (restartedFromPid is { } oldPid)
             reporter.Restarted(oldPid, launched.ProcessID, startedAt);
@@ -1234,6 +1563,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
 
         RunningGameRegistry.Unregister(launched.ProcessID);
+        DeleteGameRecord(launched.ProcessID);
 
         lastPid      = launched.ProcessID;
         lastExitCode = TryGetExitCode(launched);
@@ -1259,6 +1589,188 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
         catch (Exception)
         {
+            return null;
+        }
+    }
+
+    #endregion
+
+    #region 守护记录
+
+    /// <summary>
+    ///     写这个游戏的守护记录, 本进程死了之后新进程凭它接管（adopt）。写失败只记日志, 不影响游戏
+    /// </summary>
+    /// <param name="process">游戏进程</param>
+    /// <param name="startedAt">游戏进程创建时间</param>
+    /// <param name="options">本次启动的模式, 也是崩溃处理器回「按原模式重开」时用的模式</param>
+    /// <param name="dalamudOk">本次是否注入了 Dalamud（决定接管后要不要盯崩溃处理器）</param>
+    private async Task WriteGameRecordAsync(Process process, DateTimeOffset startedAt, RestartMonitor.RestartOptions options, bool dalamudOk)
+    {
+        // 先认领守护权: 拿着它, 别的进程就不能来接管这个游戏（本进程死了系统自动放掉）
+        var claim = GameRecords.TryClaimGuard(process.Id, startedAt);
+
+        if (claim == null)
+            Log.Warning("[CatHost] 游戏 {Pid} 的守护锁拿不到（不该发生）, 照常守护但别的进程可能也来接管", process.Id);
+        else
+        {
+            lock (cleanupLock)
+                guardClaims[process.Id] = claim;
+        }
+
+        var written = await WriteRecordLockedAsync(() => BuildRecordAsync(process, startedAt, options, dalamudOk)).ConfigureAwait(false);
+
+        if (written)
+        {
+            lock (cleanupLock)
+                recordedGames[process.Id] = startedAt;
+        }
+    }
+
+    private async Task<GameRecord?> BuildRecordAsync(Process process, DateTimeOffset startedAt, RestartMonitor.RestartOptions options, bool dalamudOk)
+    {
+        var oauth = context.LoginResult.OAuthLogin;
+
+        return new GameRecord
+            {
+                Pid                       = process.Id,
+                ProcessStartedAt          = startedAt,
+                OperationId               = request.OperationId,
+                Channel                   = request.IsWeGame ? GameRecordChannels.WE_GAME : GameRecordChannels.SDO,
+                AccountName               = request.AccountName,
+                AccountUserName           = account.UserName,
+                AreaName                  = context.Area.AreaName,
+                Dalamud                   = dalamudOk,
+                DalamudRequested          = request.Dalamud,
+                RestartNoDalamud          = options.ForceNoDalamud,
+                RestartNoThirdPlugins     = options.NoThirdPlugins,
+                RestartNoPlugins          = options.NoPlugins,
+                DcTravelPort              = context.DcTravelPort,
+                SndaId                    = oauth?.SndaID,
+                Tgt                       = await EncryptOrNullAsync(oauth?.TGT).ConfigureAwait(false),
+                Guid                      = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false),
+                MinionFingerprint         = request.CardFingerprint,
+                MinionVariant             = request.Variant,
+                AutoEnter                 = request.AutoEnter,
+                CharacterName             = request.CharacterName,
+                CharacterHomeWorld        = request.CharacterHomeWorld,
+                CrashDialogTimeoutSeconds = request.CrashDialogTimeoutSeconds,
+                GuardPid                  = Environment.ProcessId,
+                GuardStartedAt            = SelfStartedAt,
+                UpdatedAt                 = DateTimeOffset.UtcNow
+            };
+    }
+
+    /// <summary>
+    ///     在记录锁下生成并写一份记录（生成返回 null 则不写）。本进程所有对记录的写、改、删都经这把锁, 不会互相覆盖
+    /// </summary>
+    private async Task<bool> WriteRecordLockedAsync(Func<Task<GameRecord?>> build)
+    {
+        await recordLock.WaitAsync().ConfigureAwait(false);
+
+        try
+        {
+            return await build().ConfigureAwait(false) is { } record && GameRecords.Write(record);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 写守护记录失败（不影响游戏, 只是本进程死了之后接管不了）");
+            return false;
+        }
+        finally
+        {
+            recordLock.Release();
+        }
+    }
+
+    /// <summary>
+    ///     换到新 TGT 后更新当前游戏守护记录里的凭证; 只改本进程守着、而且还没删的那份（核对创建时间, 防进程号复用）
+    /// </summary>
+    private Task RewriteGameRecordCredentialsAsync() =>
+        WriteRecordLockedAsync
+        (async () =>
+            {
+                if (currentProcess is not { } process)
+                    return null;
+
+                DateTimeOffset startedAt;
+
+                lock (cleanupLock)
+                {
+                    if (!recordedGames.TryGetValue(process.ProcessID, out startedAt))
+                        return null;
+                }
+
+                if (GameRecords.ReadMatching(process.ProcessID, startedAt) is not { } record)
+                    return null;
+
+                var oauth = context.LoginResult.OAuthLogin;
+
+                return record with
+                {
+                    Tgt = await EncryptOrNullAsync(oauth?.TGT).ConfigureAwait(false),
+                    Guid = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false),
+                    UpdatedAt = DateTimeOffset.UtcNow
+                };
+            }
+        );
+
+    /// <summary>
+    ///     游戏退出（或崩溃重开换了新进程）时删掉它的守护记录并放掉守护锁
+    /// </summary>
+    private void DeleteGameRecord(int processId)
+    {
+        DateTimeOffset startedAt;
+        IDisposable?   claim;
+        bool           recorded;
+
+        lock (cleanupLock)
+        {
+            recorded = recordedGames.Remove(processId, out startedAt);
+            guardClaims.Remove(processId, out claim);
+        }
+
+        if (recorded)
+        {
+            recordLock.Wait();
+
+            try
+            {
+                GameRecords.Delete(processId, startedAt);
+            }
+            finally
+            {
+                recordLock.Release();
+            }
+        }
+
+        claim?.Dispose();
+    }
+
+    /// <summary>
+    ///     加密凭证写进记录; 账号库选了「不加密」时不存（记录目录本机所有用户可读）
+    /// </summary>
+    private async Task<string?> EncryptOrNullAsync(string? text) =>
+        string.IsNullOrEmpty(text) || accountManager.CurrentCredType == CredType.NoEncryption
+            ? null
+            : await accountManager.Encrypt(text).ConfigureAwait(false);
+
+    private async Task<string?> DecryptOrNullAsync(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return null;
+
+        try
+        {
+            var plain = await accountManager.Decrypt(text).ConfigureAwait(false);
+
+            if (!string.IsNullOrEmpty(plain))
+                redactor.Register(plain);
+
+            return plain;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 解密守护记录里的凭证失败");
             return null;
         }
     }

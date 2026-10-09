@@ -161,8 +161,24 @@ public static class RunningGameRegistry
             ENTRIES[process.Id] = new Entry(process, InGameAgents.Minion);
             Log.Information("[RunningGame] 认领了上次留下的客户端 PID={Pid}（模块管道仍在）", process.Id);
 
-            // 端口文件还是上一轮那个端口, 得改写成这一轮的, 否则游戏内 UI 打的是空号
-            WritePortFile(process.Id, CurrentDcTravelPort);
+            // 正被某个守护进程守着的游戏（有对得上的记录、守护锁在别人手里）: 它的端口由那个守护进程服务, 端口文件不能改;
+            // 其余的（没记录的老游戏、守护进程已不在又没人接管的）端口文件还是上一轮那个端口, 得改写成这一轮的, 否则游戏内 UI 打的是空号
+            if (!IsGuardedElsewhere(process))
+                WritePortFile(process.Id, CurrentDcTravelPort);
+        }
+    }
+
+    private static bool IsGuardedElsewhere(Process process)
+    {
+        try
+        {
+            var startedAt = MinionOccupancy.GetProcessStartedAt(process);
+            return GameRecords.ReadMatching(process.Id, startedAt) is { DcTravelPort: > 0 } record && GameRecords.IsGuarded(process.Id, record.ProcessStartedAt);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[RunningGame] 查 PID={Pid} 有没有守护进程失败, 按没有处理", process.Id);
+            return false;
         }
     }
 
