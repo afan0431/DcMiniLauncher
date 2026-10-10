@@ -110,6 +110,75 @@ public sealed class CatSimulatedGameRunnerTests
     }
 
     [Fact]
+    public async Task Run_AuthOnly_WithHandedOffAccount_ReportsAuthorized_WithoutStartingTheGame()
+    {
+        var reporter = new RecordingReporter();
+
+        var exitCode = await runner.RunAsync
+                                   (
+                                       new CatLaunchRequest
+                                       (
+                                           "op",
+                                           "123456",
+                                           true,
+                                           null,
+                                           Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame,
+                                           WeGameToken: new CatSecret("handed-off-token-1"),
+                                           WeGameAccountId: "76561197988926417",
+                                           AuthOnly: true
+                                       ),
+                                       reporter,
+                                       CancellationToken.None
+                                   )
+                                   .WaitAsync(Timeout);
+
+        Assert.Equal(CatHostRuntime.EXIT_OK, exitCode);
+        Assert.Equal(["stage:preparing", "authorized:76561197988926417:saved"], reporter.Entries);
+        Assert.Null(reporter.Pid);
+    }
+
+    [Fact]
+    public async Task Run_AuthOnly_WithWeGameLogin_WaitsForLogin_ThenReportsCaptured()
+    {
+        var reporter = new RecordingReporter();
+
+        var exitCode = await runner.RunAsync
+                                   (
+                                       new CatLaunchRequest("op", "123456", false, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true, AuthOnly: true),
+                                       reporter,
+                                       CancellationToken.None
+                                   )
+                                   .WaitAsync(Timeout);
+
+        Assert.Equal(CatHostRuntime.EXIT_OK, exitCode);
+        Assert.Equal
+        (
+            ["stage:preparing", "stage:waitingWeGameLogin", "stage:preparing", $"authorized:{CatSimulatedGameRunner.SIMULATED_WE_GAME_ACCOUNT_ID}:captured"],
+            reporter.Entries
+        );
+        Assert.Null(reporter.Pid);
+    }
+
+    [Theory]
+    [InlineData("fail:weGameLoginTimeout", "failed:weGameLoginTimeout")]
+    [InlineData("netfail", "failed:networkError")]
+    public async Task Run_AuthOnly_FailPrefixes_StillFail(string account, string expected)
+    {
+        var reporter = new RecordingReporter();
+
+        var exitCode = await runner.RunAsync
+                                   (
+                                       new CatLaunchRequest("op", account, false, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, AuthOnly: true),
+                                       reporter,
+                                       CancellationToken.None
+                                   )
+                                   .WaitAsync(Timeout);
+
+        Assert.Equal(CatLaunchHost.EXIT_LAUNCH_FAILED, exitCode);
+        Assert.Equal(["stage:preparing", expected], reporter.Entries);
+    }
+
+    [Fact]
     public async Task Run_WeGameLogin_CloseWhileWaiting_ReportsCancelled()
     {
         var waiting  = new CatSimulatedGameRunner { StepDelay = TimeSpan.FromMilliseconds(10), WeGameLoginDelay = TimeSpan.FromMinutes(5) };

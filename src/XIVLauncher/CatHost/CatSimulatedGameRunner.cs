@@ -20,6 +20,10 @@ namespace XIVLauncher.CatHost;
 ///             账号名以 <c>sms:</c> 开头: 二维码之后再发一条设备验证短信（kind=sms）, 一直等到收到 weGame.confirmSms 才发 weGame.challengeCleared 并继续
 ///         </item>
 ///         <item>
+///             launch 带了 authOnly（只登录）: 上面的等登录与失败前缀照旧, 之后发 launch.authorized 结束, 不起占位进程;
+///             weGameAccountId 取 launch 下发的用户号, 没带时为 <see cref="SIMULATED_WE_GAME_ACCOUNT_ID" />; captured = launch 带了 weGameLogin（模拟里一律当作在 WeGame 里登录过）
+///         </item>
+///         <item>
 ///             launch 带了 autoEnter（国际服除外）: running 之后按真实顺序发自动进入角色的事件; 带 Minion 的照常在 running 之前挂好。账号名前缀决定走哪种:
 ///             其它任何账号名 = 单角色直进（enteringLobby → game.characters → enteringWorld → game.character → inWorld）;
 ///             <c>chars:</c> = 三个角色等人选（awaitingCharacterChoice → game.characters{needsChoice} → 收到 selectCharacter 后继续进入）;
@@ -82,6 +86,9 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
     /// <summary>模拟的设备验证编号</summary>
     public const string SIMULATED_SMS_CHALLENGE_ID = "s-1";
+
+    /// <summary>只登录时 launch 没带 weGameAccountId 用的 WeGame 用户号</summary>
+    public const string SIMULATED_WE_GAME_ACCOUNT_ID = "10000000000000000";
 
     private readonly CancellationTokenSource closeCts = new();
     private readonly object                  stateLock = new();
@@ -239,6 +246,12 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         {
             reporter.Failed(CatCodes.MINION_NOT_CONFIGURED, "本机找不到 Minion 安装目录（模拟）");
             return CatLaunchHost.EXIT_LAUNCH_FAILED;
+        }
+
+        if (request.AuthOnly)
+        {
+            reporter.Authorized(request.WeGameAccountId ?? SIMULATED_WE_GAME_ACCOUNT_ID, request.WeGameLogin);
+            return CatHostRuntime.EXIT_OK;
         }
 
         var failAgent = account.StartsWith(AGENT_FAIL_PREFIX, StringComparison.Ordinal) ? account[AGENT_FAIL_PREFIX.Length..] : null;

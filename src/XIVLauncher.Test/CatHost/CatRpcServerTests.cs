@@ -205,6 +205,284 @@ public sealed class CatRpcServerTests : IDisposable
         Assert.False(runner.Request!.WeGameLogin);
     }
 
+    [Fact]
+    public async Task Launch_WeGame_WithHandedOffToken_PassesIt_AndNeverPrintsIt()
+    {
+        const string WE_GAME_TOKEN = "handed-off-wegame-token-7f3a";
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin = true, weGameToken = WE_GAME_TOKEN, weGameAccountId = " 76561197988926417 " }
+        );
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        var request = runner.Request!;
+        Assert.Equal(WE_GAME_TOKEN, request.WeGameToken!.Reveal());
+        Assert.Equal("76561197988926417", request.WeGameAccountId);
+        Assert.Equal
+        (
+            new CatLaunchRequest
+            (
+                "op1",
+                "123456",
+                false,
+                null,
+                Platform: XIVAccountType.WeGame,
+                WeGameLogin: true,
+                WeGameToken: new CatSecret(WE_GAME_TOKEN),
+                WeGameAccountId: "76561197988926417"
+            ),
+            request
+        );
+        Assert.DoesNotContain(WE_GAME_TOKEN, request.ToString());
+        Assert.DoesNotContain(WE_GAME_TOKEN, $"{request}");
+
+        // 已登记脱敏: 启动器不小心把它写进任何发给外壳的文字, 都会被遮住
+        runner.Reporter!.Log("error", $"登录失败 {WE_GAME_TOKEN}");
+        runner.Reporter.Failed(CatCodes.AUTHORIZATION_REQUIRED, $"WeGame 登录被拒绝: {WE_GAME_TOKEN}");
+
+        var seen = new List<(string Method, JsonNode? Params)>();
+        client.WaitForEvent("launch.failed", Timeout, seen);
+        Assert.All(seen, x => Assert.DoesNotContain(WE_GAME_TOKEN, x.Params?.ToJsonString(CatProtocol.JsonOptions) ?? string.Empty));
+    }
+
+    [Fact]
+    public async Task Launch_WeGame_WithoutHandedOffToken_IsUnchanged()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameToken = "", weGameAccountId = " " });
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.Equal(new CatLaunchRequest("op1", "123456", false, null, Platform: XIVAccountType.WeGame), runner.Request);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("shengqu")]
+    [InlineData("international")]
+    public async Task Launch_HandedOffToken_OnOtherPlatform_IsRejected(string? platform)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = platform == null
+                           ? await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, password = "pw-123456", weGameToken = "token-123456", weGameAccountId = "123" })
+                           : await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, platform, password = "pw-123456", weGameToken = "token-123456", weGameAccountId = "123" });
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+        Assert.DoesNotContain("token-123456", response.ToJsonString());
+        Assert.False(host.HasLaunch);
+    }
+
+    [Theory]
+    [InlineData("token-123456", null)]
+    [InlineData("token-123456", "")]
+    [InlineData(null, "76561197988926417")]
+    [InlineData(" ", "76561197988926417")]
+    public async Task Launch_HandedOffToken_WithOnlyOneField_IsRejected(string? weGameToken, string? weGameAccountId)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameToken, weGameAccountId });
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+        Assert.False(host.HasLaunch);
+    }
+
+    [Theory]
+    [InlineData("abc")]
+    [InlineData("7656119798892641x")]
+    [InlineData("-1")]
+    [InlineData("765 611")]
+    [InlineData("７６５６")]
+    public async Task Launch_HandedOffToken_AccountIdNotDigits_IsRejected(string weGameAccountId)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameToken = "token-123456", weGameAccountId });
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+        Assert.False(host.HasLaunch);
+    }
+
+    [Fact]
+    public async Task Launch_WeGame_AuthOnly_PassesIt_AndDropsMinionAndAutoEnter()
+    {
+        const string WE_GAME_TOKEN = "handed-off-wegame-token-auth-only";
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new
+            {
+                operationId     = "op1",
+                accountName     = "123456",
+                dalamud         = true,
+                minion          = MinionJson(MinionCards.VARIANT_CN),
+                platform        = "weGame",
+                weGameLogin     = true,
+                weGameScan      = "qq",
+                autoEnter       = true,
+                weGameToken     = WE_GAME_TOKEN,
+                weGameAccountId = "76561197988926417",
+                authOnly        = true
+            }
+        );
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        var request = runner.Request!;
+        Assert.True(request.AuthOnly);
+        Assert.Null(request.MinionCard);
+        Assert.False(request.AutoEnter);
+        Assert.Equal
+        (
+            new CatLaunchRequest
+            (
+                "op1",
+                "123456",
+                true,
+                null,
+                Platform: XIVAccountType.WeGame,
+                WeGameLogin: true,
+                WeGameScan: CatWeGameScan.Qq,
+                WeGameToken: new CatSecret(WE_GAME_TOKEN),
+                WeGameAccountId: "76561197988926417",
+                AuthOnly: true
+            ),
+            request
+        );
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(null)] // 不带 authOnly: 与加这个字段之前一样
+    public async Task Launch_WeGame_WithoutAuthOnly_IsUnchanged(bool? authOnly)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = authOnly == null
+                           ? await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", autoEnter = true })
+                           : await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", autoEnter = true, authOnly });
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.Equal(new CatLaunchRequest("op1", "123456", false, null, Platform: XIVAccountType.WeGame, AutoEnter: true), runner.Request);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("shengqu")]
+    [InlineData("international")]
+    public async Task Launch_AuthOnly_OnOtherPlatform_IsRejected(string? platform)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = platform == null
+                           ? await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, password = "pw-123456", authOnly = true })
+                           : await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, platform, password = "pw-123456", authOnly = true });
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+        Assert.False(host.HasLaunch);
+    }
+
+    [Fact]
+    public async Task AuthOnly_Authorized_IsPublishedWithTheAgreedFields_AndEndsTheLaunch()
+    {
+        const string WE_GAME_TOKEN = "handed-off-wegame-token-authorized";
+        await using var client = await ConnectAndHelloAsync();
+        await client.RequestAsync
+        (
+            "launch",
+            new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin = true, weGameToken = WE_GAME_TOKEN, weGameAccountId = "76561197988926417", authOnly = true }
+        );
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        runner.Reporter!.Stage(CatStages.PREPARING);
+        runner.Reporter.Authorized("76561197988926417", true);
+
+        var seen       = new List<(string Method, JsonNode? Params)>();
+        var authorized = client.WaitForEvent("launch.authorized", Timeout, seen).Params!;
+        Assert.Equal
+        (
+            """{"operationId":"op1","weGameAccountId":"76561197988926417","captured":true}""",
+            authorized.ToJsonString(CatProtocol.JsonOptions)
+        );
+        Assert.Equal(["game.stage", "launch.authorized"], seen.Select(x => x.Method));
+        Assert.All(seen, x => Assert.DoesNotContain(WE_GAME_TOKEN, x.Params?.ToJsonString(CatProtocol.JsonOptions) ?? string.Empty));
+        Assert.True(host.IsAuthorized);
+        Assert.False(host.HasStarted);
+
+        var status = await client.RequestAsync("status", new { });
+        Assert.Equal("authorized", status["result"]!["stage"]!.GetValue<string>());
+        Assert.Null(status["result"]!["pid"]);
+
+        // 已结束: 不再收设备验证、不能补注入或交接, close 直接回成功且不去关游戏
+        var sms = await client.RequestAsync("weGame.confirmSms", new { challengeId = "s-1" });
+        Assert.Equal("notRunning", sms["result"]!["code"]!.GetValue<string>());
+        Assert.Empty(runner.ConfirmedSms);
+
+        var inject = await client.RequestAsync("inject", new { dalamud = true });
+        Assert.Equal("notRunning", inject["result"]!["code"]!.GetValue<string>());
+
+        var handOff = await client.RequestAsync(CatHandOff.METHOD, new { });
+        Assert.Equal("notRunning", handOff["result"]!["code"]!.GetValue<string>());
+
+        var close = await client.RequestAsync("close", new { });
+        Assert.True(close["result"]!["accepted"]!.GetValue<bool>());
+        Assert.False(runner.Closed.Task.IsCompleted);
+
+        runner.Finish.TrySetResult(CatHostRuntime.EXIT_OK);
+        Assert.Equal(CatHostRuntime.EXIT_OK, await host.Completion.WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public void LaunchParams_DeserializeAuthOnly_AndPrintIt()
+    {
+        var parameters = JsonSerializer.Deserialize<CatLaunchParams>
+        (
+            """{"operationId":"op1","accountName":"123456","dalamud":false,"platform":"weGame","authOnly":true}""",
+            CatProtocol.JsonOptions
+        )!;
+
+        Assert.True(parameters.AuthOnly);
+        Assert.Contains("AuthOnly = True", parameters.ToString());
+    }
+
+    [Fact]
+    public void LaunchParams_ToString_DoesNotPrintWeGameToken()
+    {
+        var parameters = new CatLaunchParams("op1", "123456", false, null, Platform: "weGame", WeGameToken: "TopSecret-WeGame-1", WeGameAccountId: "76561197988926417");
+
+        Assert.DoesNotContain("TopSecret-WeGame-1", parameters.ToString());
+        Assert.DoesNotContain("TopSecret-WeGame-1", $"{parameters}");
+        Assert.Contains("76561197988926417", parameters.ToString());
+    }
+
+    [Fact]
+    public void LaunchParams_DeserializeHandedOffTokenFromCamelCaseFields()
+    {
+        var parameters = JsonSerializer.Deserialize<CatLaunchParams>
+        (
+            """{"operationId":"op1","accountName":"123456","dalamud":false,"platform":"weGame","weGameToken":"t-123456","weGameAccountId":"76561197988926417"}""",
+            CatProtocol.JsonOptions
+        )!;
+
+        Assert.Equal("t-123456", parameters.WeGameToken);
+        Assert.Equal("76561197988926417", parameters.WeGameAccountId);
+    }
+
     [Theory]
     [InlineData("qq", CatWeGameScan.Qq)]
     [InlineData("QQ", CatWeGameScan.Qq)]

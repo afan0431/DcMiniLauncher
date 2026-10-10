@@ -138,6 +138,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             await PrepareAsync(reporter, linked.Token).ConfigureAwait(false);
 
+            // 只登录: 登录成功即结束, 不取票据、不起游戏
+            if (request.AuthOnly)
+            {
+                reporter.Authorized(account.UserName, weGameLogin?.Captured == true);
+                return CatHostRuntime.EXIT_OK;
+            }
+
             using var final = await RunGameAsync(RestartMonitor.RestartOptions.Normal, null, reporter, linked.Token, cancellationToken).ConfigureAwait(false);
 
             if (await HandOffDecidedAsync().ConfigureAwait(false))
@@ -682,23 +689,27 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         // 其它进程可能刚更新过这个号的凭证和设备, 启动前从数据库刷新这一行
         accountManager.RefreshFromDatabase(account);
 
-        gamePath = App.Settings.GetGamePath(request.Platform) is { Exists: true } path
-                       ? path
-                       : throw new CatLaunchException
-                         (
-                             CatCodes.INVALID_GAME_PATH,
-                             request.IsWeGame
-                                 ? "DcMiniLauncher 设置里的 WeGame 版游戏目录无效, 请在界面版「设置」里重新选择"
-                                 : "DcMiniLauncher 设置里的国服游戏目录无效"
-                         );
-
-        await CheckGameUpdateAsync(cancellationToken).ConfigureAwait(false);
-
-        if (request.Minion)
+        // 只登录不起游戏: 不看游戏目录和补丁, 也不挂 Minion（拉起 WeGame 用的 sdologin 目录在就地登录时另外检查）
+        if (!request.AuthOnly)
         {
-            // 起游戏前先确认本机能挂 Minion; 占用检查与预占在挂载前加锁再做
-            if (CatMinionReservations.Check(request.MinionCard) is { } minionError)
-                throw new CatLaunchException(minionError.Code, minionError.Message);
+            gamePath = App.Settings.GetGamePath(request.Platform) is { Exists: true } path
+                           ? path
+                           : throw new CatLaunchException
+                             (
+                                 CatCodes.INVALID_GAME_PATH,
+                                 request.IsWeGame
+                                     ? "DcMiniLauncher 设置里的 WeGame 版游戏目录无效, 请在界面版「设置」里重新选择"
+                                     : "DcMiniLauncher 设置里的国服游戏目录无效"
+                             );
+
+            await CheckGameUpdateAsync(cancellationToken).ConfigureAwait(false);
+
+            if (request.Minion)
+            {
+                // 起游戏前先确认本机能挂 Minion; 占用检查与预占在挂载前加锁再做
+                if (CatMinionReservations.Check(request.MinionCard) is { } minionError)
+                    throw new CatLaunchException(minionError.Code, minionError.Message);
+            }
         }
 
         device = CatDeviceProfiles.Resolve(accountManager, account, out var isPerAccount)
@@ -715,6 +726,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         if (account.IsDeviceProfileRotation)
             reporter.Log("warning", "这个号开着「定期自动更换设备」: 无界面启动不会换设备, 但界面版到期会换, 换了就要客户重新验证; 请在 DcMiniLauncher 账号设备设置里关掉");
+
+        // 只登录: 登录成功即可, 不定大区（不回写账号库）、不开跨区服务
+        if (request.AuthOnly)
+        {
+            await LoginWithSavedCredentialAsync(reporter, cancellationToken).ConfigureAwait(false);
+            return;
+        }
 
         var areas = await LoadAreasAsync(cancellationToken).ConfigureAwait(false);
         var area  = ResolveArea(areas, account.AreaName, request.AreaName, x => x.AreaName, out var fromRequest);

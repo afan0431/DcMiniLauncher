@@ -13,6 +13,24 @@ namespace XIVLauncher.CatHost;
 public sealed record CatWeGameRow(string UserName, string? Note);
 
 /// <summary>
+///     能力标记: 这个版本认 launch 带来的 weGameToken / weGameAccountId（工作台下发的 WeGame 登录信息与用户号）,
+///     本机账号库没有这个号或存的不同时先写进账号库再登录。工作台按程序集里有没有这个类型判断能不能给它发这两个参数, 名字和命名空间不能改。
+/// </summary>
+public static class CatWeGameTokenHandoff
+{
+}
+
+/// <summary>
+///     能力标记: 这个版本认 launch 带来的 authOnly（只登录）: WeGame 号登录盛趣成功即发 <see cref="EVENT" /> 结束, 不取票据、不起游戏、不注入、不挂 Minion、不开跨区;
+///     没有可用的登录信息时照常拉起 WeGame 等登录。工作台按程序集里有没有这个类型判断能不能给它发 authOnly, 名字和命名空间不能改。
+/// </summary>
+public static class CatWeGameAuthOnly
+{
+    /// <summary>只登录成功后发的事件, 载荷 { operationId, weGameAccountId, captured }; 之后进程以 <see cref="CatHostRuntime.EXIT_OK" /> 退出</summary>
+    public const string EVENT = "launch.authorized";
+}
+
+/// <summary>
 ///     就地登录 WeGame 时对本机的操作（游戏目录、WeGame 客户端、取登录信息）, 单独抽出来好让测试替换
 /// </summary>
 public interface ICatWeGameLoginEnvironment
@@ -88,6 +106,9 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
 
     private volatile CatWeGameChallengeWatcher? watcher;
 
+    /// <summary>本次是否在 WeGame 里登录取到了新的登录信息</summary>
+    public bool Captured => capturedToken != null;
+
     /// <summary>拉起 WeGame 后等员工登录的上限</summary>
     public TimeSpan LoginTimeout { get; init; } = TimeSpan.FromMinutes(10);
 
@@ -108,10 +129,12 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
     /// <summary>
     ///     找上号请求指的那一行: 账号库里 WeGame 行的账号名是 WeGame 给的用户号, 请求带的通常是客户的 QQ 号或手机号,
     ///     所以按账号名找不到时再按备注找。都找不到且允许就地登录时, 等员工登录后建出这一行。
+    ///     launch 带了工作台下发的登录信息时先把它写进账号库（见 <see cref="ApplyHandedOffTokenAsync" />）。
     /// </summary>
     public async Task<CatWeGameRow> FindRowAsync(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
-        var row = CatRealGameRunner.ResolveWeGameAccount(store.ListRows(), request.AccountName, x => x.UserName, x => x.Note, out var match);
+        var rows = await ApplyHandedOffTokenAsync(request).ConfigureAwait(false) ?? store.ListRows();
+        var row  = CatRealGameRunner.ResolveWeGameAccount(rows, request.AccountName, x => x.UserName, x => x.Note, out var match);
 
         switch (match)
         {
@@ -197,6 +220,74 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             throw OnLoginFailed(row, ex, true);
+        }
+    }
+
+    /// <summary>
+    ///     把工作台下发的登录信息写进账号库, 返回写完后重新读出的 WeGame 行; launch 没带、对不上或出错时返回 null, 照本机原有的行和登录信息走。
+    ///     <para>
+    ///         按请求的号（规则同 <see cref="CatRealGameRunner.ResolveWeGameAccount{T}" />）和下发的用户号各找一行: 都没有就建行, 备注写请求的号;
+    ///         用户号那一行就是请求的号对着的那一行、或它的备注为空时, 存的不同才更新（备注为空时补上请求的号）;
+    ///         请求的号对着别的用户号、用户号那一行的备注写着别的客户、备注对上多行时不用下发的。
+    ///     </para>
+    ///     <para>写进去的与账号库里原来存的一样对待: 被盛趣拒绝时照常清掉, 允许就地登录时等员工登录。</para>
+    /// </summary>
+    private async Task<IReadOnlyList<CatWeGameRow>?> ApplyHandedOffTokenAsync(CatLaunchRequest request)
+    {
+        if (request.WeGameToken is not { } secret || string.IsNullOrEmpty(request.WeGameAccountId))
+            return null;
+
+        var requested = request.AccountName.Trim();
+        var userId    = request.WeGameAccountId;
+
+        try
+        {
+            var rows  = store.ReloadRows();
+            var bound = CatRealGameRunner.ResolveWeGameAccount(rows, requested, x => x.UserName, x => x.Note, out var match);
+            var owned = rows.FirstOrDefault(x => string.Equals(x.UserName, userId, StringComparison.Ordinal));
+
+            if (match == CatWeGameAccountMatch.AmbiguousNote)
+            {
+                Log.Warning("[CatHost] 账号库里有多行 WeGame 号的备注写着 {Requested}, 不用工作台下发的登录信息", requested);
+                return null;
+            }
+
+            if (bound != null && !string.Equals(bound.UserName, userId, StringComparison.Ordinal))
+            {
+                Log.Warning("[CatHost] 账号库里 {Requested} 对着 WeGame 用户号 {Bound}, 不是下发的 {UserId}, 不用工作台下发的登录信息", requested, bound.UserName, userId);
+                return null;
+            }
+
+            if (owned != null && bound == null && !string.IsNullOrWhiteSpace(owned.Note))
+            {
+                Log.Warning("[CatHost] WeGame 用户号 {UserId} 的备注是 {Note}, 对不上请求的号 {Requested}, 不用工作台下发的登录信息", userId, owned.Note, requested);
+                return null;
+            }
+
+            var token = secret.Reveal();
+
+            if (bound != null && string.Equals(await store.ReadTokenAsync(bound).ConfigureAwait(false), token, StringComparison.Ordinal))
+            {
+                Log.Information("[CatHost] 账号库里这个 WeGame 号存的登录信息与下发的相同: 请求的号={Requested}, 账号库里的账号名={UserName}", requested, userId);
+                return rows;
+            }
+
+            // 已对上请求的号时不动备注（员工可能在里面写了别的话）; 新建或备注为空时写上请求的号
+            await store.SaveCapturedAsync(userId, token, bound == null ? requested : null).ConfigureAwait(false);
+
+            Log.Information
+            (
+                "[CatHost] 已把工作台下发的 WeGame 登录信息写进账号库（{Action}）: 请求的号={Requested}, 账号库里的账号名={UserName}",
+                owned == null ? "新建这一行" : "更新这一行",
+                requested,
+                userId
+            );
+            return store.ReloadRows();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 写入工作台下发的 WeGame 登录信息失败, 照本机原有的登录信息走");
+            return null;
         }
     }
 
