@@ -17,6 +17,9 @@ public static class CatProtocol
     /// <summary>管道名前缀</summary>
     public const string PIPE_NAME_PREFIX = "cat-dml-";
 
+    /// <summary>界面版交接通道的管道名前缀</summary>
+    public const string UI_GUARD_PIPE_NAME_PREFIX = "dml-ui-guard-";
+
     /// <summary>崩溃对话框默认等待秒数: 游戏已退出而崩溃处理器还开着时, 等这么久没人选择就按不重启处理</summary>
     public const int DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS = 120;
 
@@ -51,6 +54,14 @@ public static class CatProtocol
         pipeName is { Length: 40 } &&
         pipeName.StartsWith(PIPE_NAME_PREFIX, StringComparison.Ordinal) &&
         pipeName[PIPE_NAME_PREFIX.Length..].All(Uri.IsHexDigit);
+
+    /// <summary>
+    ///     界面版交接通道的管道名是否合法: dml-ui-guard- 加 32 位十六进制
+    /// </summary>
+    public static bool IsValidUiGuardPipeName(string? pipeName) =>
+        pipeName is { Length: 45 } &&
+        pipeName.StartsWith(UI_GUARD_PIPE_NAME_PREFIX, StringComparison.Ordinal) &&
+        pipeName[UI_GUARD_PIPE_NAME_PREFIX.Length..].All(Uri.IsHexDigit);
 
     /// <summary>
     ///     令牌长度是否合法
