@@ -11,7 +11,7 @@
 #include <string>
 
 // 模块版本, 通过 pipe 的 VERSION 命令回给启动器, 便于确认注进去的是哪一版
-#define MINIMODULE_VERSION "0.6.1"
+#define MINIMODULE_VERSION "0.7.0"
 
 // ---- 日志 (log.cpp) ----------------------------------------------------------
 // 日志落在 %TEMP%\minilauncher-module-<pid>.log —— 游戏目录不保证可写, 且这里天然按 PID 分开
@@ -68,6 +68,8 @@ std::string GameSkipMovie(); // 给游戏窗口投 ESC 结束片头动画, 等�
 // 游戏内登出到角色选择界面。direct=false 走 /logout 文本命令 + 确认框（等同玩家操作, 最保守);
 // direct=true 直接调 AgentLobby::HandleLogout（更底层, 不弹确认框)
 std::string GameLogout(bool direct);
+// 下号退出游戏: 在世界里直调 AgentLobby::HandleLogout(isExiting=true)（登出后退出, 不弹确认框）; 只发起不等
+std::string GameExit();
 std::string GameSetHosts(const std::string& lobbyHost, const std::string& saveDataHost, const std::string& gmHost);
 std::string GameReleaseLobbyContext();
 std::string GameSetSid(const std::string& sid);

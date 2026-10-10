@@ -226,7 +226,7 @@ try
         $unknown = Send-ModuleCommand -Pipe $pipe -Command 'NOSUCHCOMMAND'
         if ($unknown -ne 'FAIL unknown-command') { $failures += "未知命令的回应不对: $unknown" }
 
-        if ($version -notmatch 'version=0\.6\.1 ') { $failures += "模块版本不是 0.6.1: $version" }
+        if ($version -notmatch 'version=0\.7\.0 ') { $failures += "模块版本不是 0.7.0: $version" }
 
         # 自动选角的命令: 假宿主不是游戏, 特征码一条都命中不了, 每条都必须安全地回 FAIL, 宿主不能挂
         $expected = [ordered]@{
