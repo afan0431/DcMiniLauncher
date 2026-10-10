@@ -44,6 +44,9 @@ internal sealed class GameLaunchFlow
         bool              noPlugins
     )
     {
+        // 起游戏到写好守护记录之间不交接（Cat 工作台请交接时回 busy）; 必须在第一个 await 之前: 崩溃重开时调用方拿到返回的任务就结束它自己的「正在启动」
+        using var starting = CatUiGuard.Current.BeginStarting();
+
         var loginResult = gameLaunchContext.LoginResult;
         var gamePath    = App.Settings.GetGamePath(gameLaunchContext.AccountType);
 
@@ -207,8 +210,10 @@ internal sealed class GameLaunchFlow
             vm.IsLoggingIn = false;
         }
 
+        CatMinionLaunch? attachedMinion = null;
+
         if (gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion))
-            await AttachMinionAsync(launched, gamePath, dalamudOk, minionSelection).ConfigureAwait(false);
+            attachedMinion = await AttachMinionAsync(launched, gamePath, dalamudOk, minionSelection).ConfigureAwait(false);
 
         // F4: 登记这个客户端, 好让外部触发（bot 的 HTTP 请求 / 游戏内 UI）能找到它;
         //     端口一并落盘 —— 游戏内 UI 读不到 XL.DcTraveler 那个游戏参数
@@ -220,7 +225,14 @@ internal sealed class GameLaunchFlow
         if (gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion))
             await RunMiniModuleGateAsync(launched).ConfigureAwait(false);
 
+        // 写守护记录、开交接通道: Cat 工作台更新启动器时可以请本进程把游戏交给它的无界面副本守护
+        await CatUiGuard.Current.EnterAsync(NewUiGuardGame(gameLaunchContext, launched, dalamudOk, forceNoDalamud, noThird, noPlugins, attachedMinion))
+                        .ConfigureAwait(false);
+        starting.Dispose();
+
         Log.Debug("等待游戏进程退出");
+
+        var handedOff = false;
 
         try
         {
@@ -236,13 +248,23 @@ internal sealed class GameLaunchFlow
                                 noThird,
                                 noPlugins
                             ),
-                            options => StartGameAndCompanionApp
-                            (
-                                gameLaunchContext,
-                                options.ForceNoDalamud,
-                                options.NoThirdPlugins,
-                                options.NoPlugins
-                            ),
+                            options =>
+                            {
+                                // 崩溃处理器要求重开: 旧游戏先结束守护（重开的游戏另写记录）, 期间按「正在启动」不交接;
+                                // 本进程已交接时不在这里重开
+                                using var restarting = CatUiGuard.Current.BeginStarting();
+
+                                if (!CatUiGuard.Current.Leave(launched.ProcessID))
+                                    return Task.FromResult<FFXIVProcess?>(null);
+
+                                return StartGameAndCompanionApp
+                                (
+                                    gameLaunchContext,
+                                    options.ForceNoDalamud,
+                                    options.NoThirdPlugins,
+                                    options.NoPlugins
+                                );
+                            },
                             vm.LoginFlow.LoginCancellationToken
                         )
                         .ConfigureAwait(false);
@@ -252,8 +274,16 @@ internal sealed class GameLaunchFlow
         }
         finally
         {
-            companionAppService.StopCompanionApps(launched.ProcessID, companionAppManager);
+            // 已交接: 游戏、伴随程序、登记、占用记录都留给接管的进程
+            handedOff = !CatUiGuard.Current.Leave(launched.ProcessID);
+
+            if (!handedOff)
+                companionAppService.StopCompanionApps(launched.ProcessID, companionAppManager);
         }
+
+        // 已交接: 本进程马上以交接退出码退出, 不再做任何收尾
+        if (handedOff)
+            await Task.Delay(Timeout.InfiniteTimeSpan).ConfigureAwait(false);
 
         RunningGameRegistry.Unregister(launched.ProcessID);
 
@@ -275,19 +305,21 @@ internal sealed class GameLaunchFlow
 
     /// <summary>
     ///     起完游戏后把启动页选中的 Minion 卡挂到游戏进程上（F3）。卡来自本机 Cat 工作台的卡文件或 MINIONAPP 的 Accounts.json（见 <see cref="MinionCardSource" />）,
-    ///     与 Cat 上号走同一套预占、挂载和占用记录。挂不上只提示, 不影响已经在跑的游戏。
+    ///     与 Cat 上号走同一套预占、挂载和占用记录。挂不上只提示, 不影响已经在跑的游戏。返回挂上的卡, 没挂上返回 null。
     ///     ⚠ 判据纪律: launcher 自报 "Attaching Successfull" 不算数, bot 有没有真跑看游戏内 overlay / 新 bot 日志。
     /// </summary>
-    private async Task AttachMinionAsync(FFXIVProcess launched, DirectoryInfo gamePath, bool dalamudInjected, MinionSelection selection)
+    private async Task<CatMinionLaunch?> AttachMinionAsync(FFXIVProcess launched, DirectoryInfo gamePath, bool dalamudInjected, MinionSelection selection)
     {
         var process  = launched.UnderlyingProcess;
         var reserved = false;
         var ok       = false;
 
+        CatMinionLaunch? minion = null;
+
         try
         {
             // 界面版只起国服游戏
-            var (minion, error) = MinionCardSource.Resolve
+            (minion, var error) = MinionCardSource.Resolve
             (
                 MinionCardSource.Load(),
                 selection,
@@ -300,7 +332,7 @@ internal sealed class GameLaunchFlow
             if (minion == null)
             {
                 ShowMinionFailure(error ?? "没有可用的 Minion 卡");
-                return;
+                return null;
             }
 
             var accountName = App.AccountManager.CurrentAccount?.UserName ?? string.Empty;
@@ -310,7 +342,7 @@ internal sealed class GameLaunchFlow
             if (reserveError is { } failure)
             {
                 ShowMinionFailure(failure.Code == CatCodes.ALREADY_ATTACHED ? "这张卡已挂在本机另一个游戏上" : failure.Message);
-                return;
+                return null;
             }
 
             var result = await MinionAttacher.AttachAsync
@@ -344,6 +376,59 @@ internal sealed class GameLaunchFlow
             if (reserved && !ok)
                 MinionOccupancy.Delete(launched.ProcessID);
         }
+
+        return ok ? minion : null;
+    }
+
+    /// <summary>
+    ///     这个游戏交给 <see cref="CatUiGuard" /> 的守护信息: 与无界面启动同一格式的守护记录（操作号为 null）,
+    ///     交接时现取的登录凭证（登录后续期过的 TGT）与跨区网页会话
+    /// </summary>
+    private CatUiGuardGame NewUiGuardGame
+    (
+        GameLaunchContext gameLaunchContext,
+        FFXIVProcess      launched,
+        bool              dalamudOk,
+        bool              forceNoDalamud,
+        bool              noThird,
+        bool              noPlugins,
+        CatMinionLaunch?  minion
+    )
+    {
+        var process  = launched.UnderlyingProcess;
+        var userName = App.AccountManager.CurrentAccount?.UserName ?? string.Empty;
+        var dcTravel = vm.DCTravelRuntimeService;
+
+        return new CatUiGuardGame
+        {
+            Process = process,
+            Record = new GameRecord
+            {
+                Pid                       = launched.ProcessID,
+                ProcessStartedAt          = SafeProcessStartedAt(process),
+                OperationId               = null,
+                Channel                   = gameLaunchContext.AccountType == XIVAccountType.WeGame ? GameRecordChannels.WE_GAME : GameRecordChannels.SDO,
+                AccountName               = userName,
+                AccountUserName           = userName,
+                AreaName                  = gameLaunchContext.Area.AreaName,
+                Dalamud                   = dalamudOk,
+                DalamudRequested          = App.Settings.DalamudEnabled,
+                RestartNoDalamud          = forceNoDalamud,
+                RestartNoThirdPlugins     = noThird,
+                RestartNoPlugins          = noPlugins,
+                DcTravelPort              = gameLaunchContext.DcTravelPort,
+                SndaId                    = gameLaunchContext.LoginResult.OAuthLogin?.SndaID,
+                MinionFingerprint         = minion?.Fingerprint,
+                MinionVariant             = minion?.Variant,
+                CrashDialogTimeoutSeconds = CatProtocol.DEFAULT_CRASH_DIALOG_TIMEOUT_SECONDS,
+                GuardPid                  = Environment.ProcessId,
+                GuardStartedAt            = GameRecordWriter.SelfStartedAt,
+                UpdatedAt                 = DateTimeOffset.UtcNow
+            },
+            Credentials     = () => (gameLaunchContext.LoginResult.OAuthLogin?.TGT, gameLaunchContext.LoginResult.OAuthLogin?.Guid),
+            TravelSession   = () => dcTravel.Client.TryGetNSessionId(),
+            TravelListening = () => dcTravel.Listener != null
+        };
     }
 
     private void ShowMinionFailure(string error)

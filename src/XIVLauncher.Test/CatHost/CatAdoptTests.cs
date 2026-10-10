@@ -299,6 +299,40 @@ public sealed class CatAdoptTests : IDisposable
         Assert.Equal(0, await host.Completion.WaitAsync(Timeout));
     }
 
+    /// <summary>
+    ///     界面版写的记录（没有上号操作号）照样能接管, 接管后用请求里的操作号
+    /// </summary>
+    [Fact]
+    public async Task RecordWrittenByTheUiLauncher_CanBeAdopted()
+    {
+        var game      = StartSleeper();
+        var startedAt = MinionOccupancy.GetProcessStartedAt(game);
+        var record    = WriteRecord(game.Id, startedAt) with { OperationId = null, AutoEnter = false, CharacterName = null };
+        Assert.True(GameRecords.Write(record));
+
+        var runner = new AdoptingRunner();
+        var host   = NewHost(runner);
+
+        var result = host.Adopt(new CatAdoptParams("ui-0123456789abcdef0123456789abcdef", game.Id, Iso(startedAt)));
+        Assert.True(result.Accepted, result.Message);
+
+        await WaitUntilAsync(() => runner.Adopt != null);
+        Assert.Null(runner.Adopt!.Record.OperationId);
+        Assert.Equal("ui-0123456789abcdef0123456789abcdef", runner.Adopt.OperationId);
+        Assert.Equal("ui-0123456789abcdef0123456789abcdef", host.OperationId);
+
+        await host.DrainEventsAsync(Timeout);
+
+        lock (events)
+        {
+            var adopted = Assert.Single(events, x => x.Method == "game.adopted");
+            Assert.Contains("\"operationId\":\"ui-0123456789abcdef0123456789abcdef\"", adopted.Json);
+        }
+
+        runner.Finish.SetResult(0);
+        Assert.Equal(0, await host.Completion.WaitAsync(Timeout));
+    }
+
     [Fact]
     public void LaunchThenAdopt_IsRejected()
     {

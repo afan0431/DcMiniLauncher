@@ -150,10 +150,10 @@ internal class UpdateOrchestrator
         }
     }
 
-    /// <summary>无界面更新的结果: 有启动器正守着游戏, 没有更新</summary>
+    /// <summary>无界面更新的结果: 有新版本, 但有启动器正守着游戏, 没装</summary>
     internal const string SILENT_GUARDED = "guarded";
 
-    /// <summary>无界面更新的结果: 安装目录下还有别的启动器开着, 没有更新</summary>
+    /// <summary>无界面更新的结果: 有新版本, 但安装目录下还有别的启动器开着, 没装</summary>
     internal const string SILENT_IN_USE = "inUse";
 
     /// <summary>无界面更新的结果: 本进程不在 Velopack 安装目录里, 无从更新</summary>
@@ -171,19 +171,34 @@ internal class UpdateOrchestrator
     internal static Func<bool> IsInstallInUse { get; set; } = IsInstallInUseByOthers;
 
     /// <summary>
-    ///     不显示任何窗口地检查、下载并安装启动器更新, 装完不重启启动器。
-    ///     安装会结束安装目录下的所有启动器进程, 所以有启动器正守着游戏、或安装目录下还有别的启动器开着时都不装
-    ///     （已下载的留到下次）; 从安装目录之外的副本运行的无界面进程不受影响。返回结果代码。
+    ///     无界面更新用的更新器（检查、下载、退出后安装）。测试时可替换
     /// </summary>
-    internal static async Task<string> RunSilentAsync()
+    internal static Func<ISilentUpdater> CreateSilentUpdater { get; set; } = () => new VelopackSilentUpdater();
+
+    /// <summary>
+    ///     无界面更新的更新器: 认安装目录、查新版本、下载、本进程退出后安装
+    /// </summary>
+    internal interface ISilentUpdater
     {
-        if (WouldKillGameGuard())
-            return SILENT_GUARDED;
+        /// <summary>本进程是否在 Velopack 安装目录里</summary>
+        bool IsInstalled { get; }
 
-        if (IsInstallInUse())
-            return SILENT_IN_USE;
+        /// <summary>查有没有新版本, 有则返回版本号, 没有返回 null</summary>
+        Task<string?> CheckAsync();
 
-        var updateManager = new UpdateManager
+        /// <summary>下载上一次查到的新版本</summary>
+        Task DownloadAsync();
+
+        /// <summary>本进程退出后安装已下载的新版本, 装完不重启启动器</summary>
+        void ApplyAfterExit();
+    }
+
+    /// <summary>
+    ///     按发行源走 Velopack 的更新器
+    /// </summary>
+    private sealed class VelopackSilentUpdater : ISilentUpdater
+    {
+        private readonly UpdateManager updateManager = new
         (
             new SimpleWebSource(Links.LAUNCHER_DISTRIBUTE_BASE_URL, new XLHttpClientFileDownloader()),
             new UpdateOptions
@@ -193,16 +208,52 @@ internal class UpdateOrchestrator
             }
         );
 
-        if (!updateManager.IsInstalled)
+        private UpdateInfo? newRelease;
+
+        public bool IsInstalled => updateManager.IsInstalled;
+
+        public async Task<string?> CheckAsync()
+        {
+            newRelease = await updateManager.CheckForUpdatesAsync().ConfigureAwait(false);
+            return newRelease?.TargetFullRelease.Version.ToString();
+        }
+
+        public Task DownloadAsync() =>
+            updateManager.DownloadUpdatesAsync(newRelease ?? throw new InvalidOperationException("还没有查到新版本"));
+
+        public void ApplyAfterExit() =>
+            updateManager.WaitExitThenApplyUpdates(newRelease ?? throw new InvalidOperationException("还没有查到新版本"), true, false);
+    }
+
+    /// <summary>
+    ///     不显示任何窗口地检查、下载并安装启动器更新, 装完不重启启动器。先查有没有新版本, 没有就不看别的;
+    ///     有新版本时, 安装会结束安装目录下的所有启动器进程, 所以有启动器正守着游戏、或安装目录下还有别的启动器开着时都不装
+    ///     （下载后才发现的, 已下载的留到下次）; 从安装目录之外的副本运行的无界面进程不受影响。返回结果代码。
+    /// </summary>
+    internal static async Task<string> RunSilentAsync()
+    {
+        var updater = CreateSilentUpdater();
+
+        if (!updater.IsInstalled)
             return SILENT_NOT_INSTALLED;
 
-        var newRelease = await updateManager.CheckForUpdatesAsync().ConfigureAwait(false);
-
-        if (newRelease == null)
+        if (await updater.CheckAsync().ConfigureAwait(false) is not { } version)
             return SILENT_UP_TO_DATE;
 
-        Log.Information("[CatUpdate] 发现新版本 {Version}, 开始下载", newRelease.TargetFullRelease.Version);
-        await updateManager.DownloadUpdatesAsync(newRelease).ConfigureAwait(false);
+        if (WouldKillGameGuard())
+        {
+            Log.Information("[CatUpdate] 发现新版本 {Version}, 有启动器正守着游戏, 本次不装", version);
+            return SILENT_GUARDED;
+        }
+
+        if (IsInstallInUse())
+        {
+            Log.Information("[CatUpdate] 发现新版本 {Version}, 安装目录下还有别的启动器开着, 本次不装", version);
+            return SILENT_IN_USE;
+        }
+
+        Log.Information("[CatUpdate] 发现新版本 {Version}, 开始下载", version);
+        await updater.DownloadAsync().ConfigureAwait(false);
 
         // 下载期间可能有游戏刚起来、或有人打开了启动器
         if (WouldKillGameGuard())
@@ -211,7 +262,7 @@ internal class UpdateOrchestrator
         if (IsInstallInUse())
             return SILENT_IN_USE;
 
-        updateManager.WaitExitThenApplyUpdates(newRelease, true, false);
+        updater.ApplyAfterExit();
         return SILENT_APPLYING;
     }
 

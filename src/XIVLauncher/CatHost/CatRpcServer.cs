@@ -55,7 +55,7 @@ public sealed class CatRpcServer : IDisposable
     /// </summary>
     public CatRpcServer(string pipeName, string token, ICatRpcHandler handler, string launcherVersion)
     {
-        if (!CatProtocol.IsValidPipeName(pipeName))
+        if (!CatProtocol.IsValidPipeName(pipeName) && !CatProtocol.IsValidUiGuardPipeName(pipeName))
             throw new ArgumentException("管道名无效", nameof(pipeName));
 
         if (!CatProtocol.IsValidToken(token))
