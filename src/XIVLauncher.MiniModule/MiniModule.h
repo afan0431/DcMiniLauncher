@@ -11,7 +11,7 @@
 #include <string>
 
 // 模块版本, 通过 pipe 的 VERSION 命令回给启动器, 便于确认注进去的是哪一版
-#define MINIMODULE_VERSION "0.8.0"
+#define MINIMODULE_VERSION "0.9.0"
 
 // ---- 模式 (dllmain.cpp) -------------------------------------------------------
 // 只读模式: 启动器只为读角色和等级而注入时, 注入前写 <ProgramData>\DcMiniLauncher\module-<pid>.mode（readonly）,
@@ -67,6 +67,7 @@ std::string GameLobbyState();   // 只读: 界面位置、当前服务器、选�
 std::string GameCharas();       // 只读: 整个大区的角色, 格式同 WHOLIST
 std::string GameWhoAmI();       // 只读: 游戏内当前角色名、ContentId、当前/原始世界
 std::string GameLevels();       // 只读: 全部职业等级（下标为 ClassJob 表的 ExpArrayIndex）
+std::string GameDuty();         // 只读: 角色是否在副本中（Conditions 的 BoundByDuty 类标志）
 std::string GameSelectCharacter(const std::string& who); // 当前服务器的角色列表里选中（高亮）, 不进入
 std::string GameEnterCharacter(const std::string& who);  // 选中并回读确认后左键点击角色: 客户端自己检查并弹登录确认框
 std::string GameDialog(const std::string& arguments);    // "YES <contentId>" 点登录确认框的「是」; "NO"; "OK" 点错误框或确定框（排队提示不点）

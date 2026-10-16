@@ -232,7 +232,7 @@ try
         $unknown = Send-ModuleCommand -Pipe $pipe -Command 'NOSUCHCOMMAND'
         if ($unknown -ne 'FAIL unknown-command') { $failures += "未知命令的回应不对: $unknown" }
 
-        if ($version -notmatch 'version=0\.8\.0 ') { $failures += "模块版本不是 0.8.0: $version" }
+        if ($version -notmatch 'version=0\.9\.0 ') { $failures += "模块版本不是 0.9.0: $version" }
         if ($version -notmatch 'mode=readonly ') { $failures += "模块没有读到只读模式文件: $version" }
 
         # 自动选角的命令: 假宿主不是游戏, 特征码一条都命中不了, 每条都必须安全地回 FAIL, 宿主不能挂
@@ -241,6 +241,7 @@ try
             'CHARAS'                = 'FAIL sigscan-failed'
             'WHOAMI'                = 'FAIL sigscan-failed'
             'LEVELS'                = 'FAIL sigscan-failed'
+            'DUTY'                  = 'FAIL sigscan-failed'
             'FOCUSCHARA 测试角色'   = 'FAIL sigscan-failed'
             'SELECTCHARA 测试角色'  = 'FAIL sigscan-failed'
             'SELECTCHARA 123456'    = 'FAIL sigscan-failed'

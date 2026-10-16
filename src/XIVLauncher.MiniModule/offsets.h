@@ -192,6 +192,22 @@ namespace offsets
     inline constexpr uintptr_t PLAYER_STATE_CURRENT_LEVEL     = 0x88;   // short
     inline constexpr uintptr_t PLAYER_STATE_IS_LEVEL_SYNCED   = 0x15E;  // bool
 
+    // ---- Conditions（Client/Game/Conditions.cs）-----------------------------
+    // 出处: 国服 Dalamud（Soil）Hooks\26-10-14-01\FFXIVClientStructs.dll 元数据:
+    //   Conditions.Instance() [StaticAddress("48 8D 0D ?? ?? ?? ?? 66 2B D8", 3)] 直接是结构体地址（不是指针）, Size 0x74,
+    //   _flags = FixedSizeArray112<bool> @0, 每个标志一个字节, 下标即 Dalamud 的 ConditionFlag。
+    // 静态: 本机 E:\最终幻想XIV\game\ffxiv_dx11.exe（2026-10-16）唯一命中, 指令 RVA 0x87591A → 结构体 RVA 0x2AED050。
+    // 不在必中集合里: 命中不了只让 DUTY 返回 FAIL sigscan-failed:Conditions。
+    inline constexpr const char* CONDITIONS_SIG        = "48 8D 0D ?? ?? ?? ?? 66 2B D8";
+    inline constexpr int         CONDITIONS_SIG_OFFSET = 3;
+    inline constexpr int         CONDITION_COUNT       = 112;
+
+    // 「正在副本中」= 下面三个任一为真（Dalamud 插件判断在不在副本的通用写法）。出处同上:
+    //   BoundByDuty @0x22、BoundByDuty56 @0x38、BoundByDuty95 @0x5F
+    inline constexpr int CONDITION_BOUND_BY_DUTY    = 34;
+    inline constexpr int CONDITION_BOUND_BY_DUTY_56 = 56;
+    inline constexpr int CONDITION_BOUND_BY_DUTY_95 = 95;
+
     // ---- AtkUnitBase / 对话框（Component/GUI/AtkUnitBase.cs）----------------
     // 以下各项静态: 否  实机: 否（0x1E4 紧挨着右键菜单已在用的 BlockedParentId 0x1EA, 仅此旁证）
     inline constexpr uintptr_t ATK_UNIT_BASE_ATK_VALUES       = 0x178;  // :30 AtkValue*

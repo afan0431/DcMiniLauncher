@@ -1154,6 +1154,8 @@ namespace
     bool      g_fireCallbackTried = false;
     uintptr_t g_playerState       = 0;
     bool      g_playerStateTried  = false;
+    uintptr_t g_conditions        = 0;
+    bool      g_conditionsTried   = false;
 
     bool ResolveFireCallback()
     {
@@ -1181,6 +1183,20 @@ namespace
         }
 
         return g_playerState != 0;
+    }
+
+    bool ResolveConditions()
+    {
+        if (!g_conditionsTried)
+        {
+            g_conditionsTried = true;
+            g_conditions      = ScanStaticAddress(offsets::CONDITIONS_SIG, offsets::CONDITIONS_SIG_OFFSET);
+
+            LogF("[game]   Conditions 静态地址     RVA=0x%llX",
+                 static_cast<unsigned long long>(g_conditions ? g_conditions - ModuleBase() : 0));
+        }
+
+        return g_conditions != 0;
     }
 
     // 堆对象指针的合理性: 非空、落在用户态地址范围内、按 8 字节对齐
@@ -2293,6 +2309,64 @@ namespace
         }
     }
 
+    // ---- DUTY ----------------------------------------------------------------
+
+    struct DutyData
+    {
+        int status; // 1=正常 -1=异常 -2=PlayerState 或 Conditions 读歪
+        int loaded;
+        int boundByDuty;
+        int boundByDuty56;
+        int boundByDuty95;
+    };
+
+    void OpDuty(DutyData* out)
+    {
+        memset(out, 0, sizeof(DutyData));
+        out->status = -1;
+
+        __try
+        {
+            const auto state  = reinterpret_cast<uint8_t*>(g_playerState);
+            const auto flags  = reinterpret_cast<uint8_t*>(g_conditions);
+            const auto loaded = ReadAt<unsigned char>(state, offsets::PLAYER_STATE_IS_LOADED);
+
+            if (loaded > 1)
+            {
+                out->status = -2;
+                return;
+            }
+
+            // 与 WHOAMI 同一判据: 没有载入角色时副本标志没有意义, 回未知
+            if (loaded == 0 || ReadAt<unsigned long long>(state, offsets::PLAYER_STATE_CONTENT_ID) == 0)
+            {
+                out->status = 1;
+                return;
+            }
+
+            // 每个标志是一个 bool 字节: 出现 0 / 1 以外的值 = 地址读歪了
+            for (int i = 0; i < offsets::CONDITION_COUNT; i++)
+            {
+                if (ReadAt<unsigned char>(flags, static_cast<uintptr_t>(i)) > 1)
+                {
+                    out->status = -2;
+                    return;
+                }
+            }
+
+            out->boundByDuty   = ReadAt<unsigned char>(flags, offsets::CONDITION_BOUND_BY_DUTY);
+            out->boundByDuty56 = ReadAt<unsigned char>(flags, offsets::CONDITION_BOUND_BY_DUTY_56);
+            out->boundByDuty95 = ReadAt<unsigned char>(flags, offsets::CONDITION_BOUND_BY_DUTY_95);
+            out->loaded        = 1;
+            out->status        = 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] DUTY 异常 code=0x%08X", GetExceptionCode());
+            out->status = -1;
+        }
+    }
+
     // 操作命令共用的前置; 失败时 failure 是要回给启动器的那一行
     bool PrepareAction(CallStatePtr& state, std::string& failure)
     {
@@ -2574,6 +2648,57 @@ std::string GameLevels()
     }
 
     return response;
+}
+
+// 角色是否在副本中, 只读。响应只有一行:
+//   OK loaded=1 inDuty=<0|1> flags=<置位的副本标志下标, 逗号分隔>
+//   OK loaded=0                     （没有载入角色: 不知道在不在副本）
+// inDuty = Conditions 的 BoundByDuty(34) / BoundByDuty56(56) / BoundByDuty95(95) 任一为真; flags 只列这三个里置位的, 供核对。
+std::string GameDuty()
+{
+    if (!GameResolve())
+        return "FAIL sigscan-failed";
+
+    if (!ResolvePlayerState())
+        return "FAIL sigscan-failed:PlayerState";
+
+    if (!ResolveConditions())
+        return "FAIL sigscan-failed:Conditions";
+
+    auto data = std::make_shared<DutyData>();
+
+    if (!MainThreadRun([data] { OpDuty(data.get()); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    switch (data->status)
+    {
+        case 1:  break;
+        case -2: return "FAIL bad-state";
+        default: return "FAIL exception";
+    }
+
+    if (data->loaded == 0)
+        return "OK loaded=0";
+
+    std::string flags;
+    const std::pair<int, int> bits[] = {
+        { offsets::CONDITION_BOUND_BY_DUTY,    data->boundByDuty   },
+        { offsets::CONDITION_BOUND_BY_DUTY_56, data->boundByDuty56 },
+        { offsets::CONDITION_BOUND_BY_DUTY_95, data->boundByDuty95 },
+    };
+
+    for (const auto& [index, value] : bits)
+    {
+        if (value == 0)
+            continue;
+
+        if (!flags.empty())
+            flags += ',';
+
+        flags += std::to_string(index);
+    }
+
+    return std::string("OK loaded=1 inDuty=") + (flags.empty() ? "0" : "1") + " flags=" + flags;
 }
 
 // 参数: 角色名, 或纯数字的 ContentId。角色在整个大区的列表里找。
