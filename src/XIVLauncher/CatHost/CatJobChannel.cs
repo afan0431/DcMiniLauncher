@@ -68,6 +68,12 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     /// <summary>必须带 reason 的 state</summary>
     public static readonly IReadOnlySet<string> StatesWithReason = new HashSet<string>(StringComparer.Ordinal) { "blocked", "mismatch" };
 
+    /// <summary>
+    ///     回报 shots[].kind 的取值: start = 开工图, completion = 完成图, progress = 进度图。
+    ///     一张图对应多项时每项各带一条、file 相同, 不按 file 去重
+    /// </summary>
+    public static readonly IReadOnlyList<string> ShotKinds = ["start", "completion", "progress"];
+
     private readonly Func<string?>          operationId;
     private readonly Action<string, object> publish;
     private readonly object                 stateLock = new();
@@ -433,7 +439,8 @@ public sealed class CatJobChannel : ICatLocalEndpoints
 
     /// <summary>
     ///     解析并校验一条回报; 通过返回 null, 否则返回 400 的原因。seq 是 Unix 毫秒起算的大数（13 位）, 全程按 long 处理;
-    ///     shots 里的图只能是 <paramref name="shotsDirectory" /> 下、文件名为 <c>&lt;本条回报的 pid&gt;-&lt;seq&gt;.png</c> 的文件
+    ///     shots 里的图只能是 <paramref name="shotsDirectory" /> 下、文件名为 <c>&lt;本条回报的 pid&gt;-&lt;数字&gt;.png</c> 的文件
+    ///     （数字不必是本条回报的 seq, 按 file 取图; 一张图挂多项时多条共用同一个 file）
     /// </summary>
     internal static string? ParseProgress(string body, string shotsDirectory, out JsonObject? progress, out int pid, out long seq)
     {
@@ -498,8 +505,8 @@ public sealed class CatJobChannel : ICatLocalEndpoints
                 if (shot is not JsonObject entry || StringOf(entry, "itemId") is not { Length: > 0 })
                     return "shots 里每一项都要有 itemId";
 
-                if (StringOf(entry, "kind") is not ("completion" or "progress"))
-                    return "shots 的 kind 只能是 completion / progress";
+                if (StringOf(entry, "kind") is not { } kind || !ShotKinds.Contains(kind))
+                    return $"shots 的 kind 只能是 {string.Join(" / ", ShotKinds)}";
 
                 if (!IsShotFile(StringOf(entry, "file"), (int)pidValue, shotsDirectory))
                     return $"shots 的 file 只能是 {shotsDirectory} 下的 {pidValue}-<seq>.png";

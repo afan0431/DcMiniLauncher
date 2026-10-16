@@ -120,6 +120,103 @@ public sealed class CatSimulatedAfanTests : IDisposable
         Assert.Equal(count, Reports().Length);
     }
 
+    private JsonNode[] StartShots() =>
+        Reports().Where(x => x["shots"] != null).SelectMany(x => x["shots"]!.AsArray().Select(s => s!)).Where(x => x["kind"]!.GetValue<string>() == "start").ToArray();
+
+    [Fact]
+    public void StartShots_InTheFirstRunningReport_OnePicturePerScreen_OnEachItem()
+    {
+        channel.SetJob(CatJobChannelTests.JobWithStartShots(3));
+        Run(NewAfan(), DateTime.UtcNow, 40);
+
+        var reports = Reports();
+        var states  = States();
+
+        Assert.Equal("waiting", states[0]);
+        Assert.Null(reports[0]["shots"]);
+        Assert.Equal("running", states[1]);
+        Assert.Equal("done", states[^1]);
+
+        // 第一条 running 只带开工图、还没推进: 数值是开工前的
+        var first = reports[1];
+        Assert.Equal("a", first["activeItemId"]!.GetValue<string>());
+        Assert.Equal(["a", "b", "d", "e"], first["items"]!.AsArray().Select(x => x!["itemId"]!.GetValue<string>()));
+        Assert.Equal([18L, 35L, 0L], first["items"]!.AsArray().Take(3).Select(x => x!["current"]!.GetValue<long>()));
+
+        // 练级两项（含人做的骑士）共用一张, 金碟币与声誉共用一张; 勾选类、主线和 startShot 为 false 的不拍
+        var shots = first["shots"]!.AsArray();
+        Assert.Equal(["a", "b", "c", "d"], shots.Select(x => x!["itemId"]!.GetValue<string>()));
+        Assert.All(shots, x => Assert.Equal("start", x!["kind"]!.GetValue<string>()));
+
+        var files = shots.Select(x => x!["file"]!.GetValue<string>()).ToArray();
+        Assert.Equal(files[0], files[2]);
+        Assert.Equal(files[1], files[3]);
+        Assert.NotEqual(files[0], files[1]);
+        Assert.All(files, x => Assert.Matches($@"\\{PID}-\d+\.png$", x));
+        Assert.All(files.Distinct(), x => Assert.True(new FileInfo(x).Length > 100));
+
+        // 之后照常推进, 不再拍开工图; seq 严格递增
+        Assert.True(reports[2]["items"]![0]!["current"]!.GetValue<long>() > 18);
+        Assert.Equal(4, StartShots().Length);
+
+        var seqs = reports.Select(x => x["seq"]!.GetValue<long>()).ToArray();
+        Assert.All(seqs.Zip(seqs.Skip(1)), x => Assert.True(x.Second > x.First));
+    }
+
+    [Fact]
+    public void StartShots_WaitForRun_AndAreTakenOnlyOncePerGame()
+    {
+        channel.SetJob(CatJobChannelTests.JobWithStartShots(3, desired: "pause"));
+        var afan = NewAfan();
+        var now  = Run(afan, DateTime.UtcNow, 3);
+
+        Assert.Equal(["waiting", "paused"], States());
+        Assert.Empty(StartShots());
+
+        channel.SetJob(CatJobChannelTests.JobWithStartShots(4));
+        now = Run(afan, now, 2);
+
+        Assert.Equal(["waiting", "paused", "running", "running"], States());
+        Assert.Equal(4, Reports()[2]["shots"]!.AsArray().Count);
+
+        // 服务器还没把 startShot 改成 false 时暂停再继续: 这个游戏里不再补拍
+        channel.SetJob(CatJobChannelTests.JobWithStartShots(5, desired: "pause"));
+        now = Run(afan, now, 2);
+        channel.SetJob(CatJobChannelTests.JobWithStartShots(6));
+        Run(afan, now, 40);
+
+        Assert.Equal(4, StartShots().Length);
+        Assert.Equal("done", States()[^1]);
+    }
+
+    [Fact]
+    public void StartShots_NothingToShoot_StartsRightAway()
+    {
+        var job = JsonNode.Parse(CatJobChannelTests.JobWithStartShots(3).GetRawText())!.AsObject();
+
+        // 只剩勾选类与主线要拍: 都不知道开哪个界面, 不拍
+        foreach (var item in job["items"]!.AsArray().Where(x => x!["itemId"]!.GetValue<string>() is "a" or "b" or "c" or "d"))
+            item!["startShot"] = false;
+
+        channel.SetJob(JsonDocument.Parse(job.ToJsonString()).RootElement.Clone());
+        Run(NewAfan(), DateTime.UtcNow, 2);
+
+        Assert.Equal(["waiting", "running"], States());
+        Assert.Null(Reports()[1]["shots"]);
+        Assert.True(Reports()[1]["items"]![0]!["current"]!.GetValue<long>() > 18);
+    }
+
+    [Theory]
+    [InlineData("leveling", "bst-level", "jobs")]
+    [InlineData("leveling", null, "jobs")]
+    [InlineData("collect", "mgp", "currency")]
+    [InlineData("collect", "fallguys-rep", "currency")]
+    [InlineData("periodic", "allsaints-2026", null)]
+    [InlineData("msq", null, null)]
+    [InlineData("other", null, null)]
+    public void StartShotScreen_LevelingTogether_MgpAndFallGuysTogether_OthersNone(string kind, string? routine, string? screen) =>
+        Assert.Equal(screen, CatSimulatedAfan.StartShotScreen(kind, routine));
+
     [Fact]
     public void Heartbeat_ResendsTheSameStateAfterTheInterval()
     {

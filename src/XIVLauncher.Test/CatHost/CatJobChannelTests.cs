@@ -51,6 +51,34 @@ public sealed class CatJobChannelTests
               """
         ).RootElement.Clone();
 
+    /// <summary>startShot 各项: a 驯兽师 / c 骑士（人做）为练级、b 金碟币 / d 糖豆人声誉为货币一组、e 守护天节为勾选类、f 主线不知道开哪个界面, 都为 true; g 白魔法师为 false</summary>
+    internal static readonly bool[] StartShotFlags = [true, true, true, true, true, true, false];
+
+    internal static JsonElement JobWithStartShots(long revision, string desired = "run") =>
+        JsonDocument.Parse
+        (
+            $$"""
+              {
+                "schema": "{{CatJobChannel.JOB_SCHEMA}}",
+                "sessionId": "{{OPERATION}}",
+                "taskId": "t-1",
+                "revision": {{revision}},
+                "desired": "{{desired}}",
+                "character": { "name": "七色花", "homeWorld": "萌芽池", "homeWorldId": 1167 },
+                "items": [
+                  { "itemId": "a", "order": 0, "kind": "leveling", "title": "驯兽师", "classJobId": 43, "start": 1, "current": 18, "target": 30, "unit": null, "done": false, "routine": "bst-level", "startShot": true },
+                  { "itemId": "b", "order": 1, "kind": "collect", "title": "金碟币", "classJobId": null, "start": 0, "current": 35, "target": 120, "unit": "万", "done": false, "routine": "mgp", "startShot": true },
+                  { "itemId": "c", "order": 2, "kind": "leveling", "title": "骑士", "classJobId": 19, "start": 90, "current": 94, "target": 100, "unit": null, "done": false, "routine": null, "startShot": true },
+                  { "itemId": "d", "order": 3, "kind": "collect", "title": "糖豆人声誉", "classJobId": null, "start": 0, "current": 0, "target": 5000, "unit": null, "done": false, "routine": "fallguys-rep", "startShot": true },
+                  { "itemId": "e", "order": 4, "kind": "periodic", "title": "守护天节", "classJobId": null, "start": null, "current": null, "target": null, "unit": null, "done": false, "routine": "allsaints-2026", "startShot": true },
+                  { "itemId": "f", "order": 5, "kind": "msq", "title": "主线", "classJobId": null, "start": 600, "current": 655, "target": 700, "unit": null, "done": false, "routine": null, "startShot": true },
+                  { "itemId": "g", "order": 6, "kind": "leveling", "title": "白魔法师", "classJobId": 24, "start": 90, "current": 90, "target": 100, "unit": null, "done": false, "routine": null, "startShot": false }
+                ],
+                "shots": { "completion": true, "progressAt": null }
+              }
+              """
+        ).RootElement.Clone();
+
     internal static string Progress(int pid, long seq, string state = "running", string? reason = null, long revision = 1) =>
         $$"""
           {"schema":"cat-progress/1","pid":{{pid}},"revision":{{revision}},"seq":{{seq}},"state":"{{state}}","reason":{{reason ?? "null"}},"activeItemId":"a",
@@ -247,6 +275,9 @@ public sealed class CatJobChannelTests
     [Theory]
     [InlineData(true, "1234-1797000000000.png", "completion")]
     [InlineData(true, "1234-17.PNG", "progress")]
+    [InlineData(true, "1234-17.png", "start")]
+    [InlineData(false, "1234-17.png", "Start")]
+    [InlineData(false, "1234-17.png", "")]
     [InlineData(false, "999-1797000000000.png", "completion")]
     [InlineData(false, "1234-abc.png", "completion")]
     [InlineData(false, "1234-17.jpg", "completion")]
@@ -274,6 +305,56 @@ public sealed class CatJobChannelTests
 
         Assert.Equal(400, channel.PostProgress(ProgressWithShot(1234, 1, file)).StatusCode);
         Assert.Empty(events);
+    }
+
+    [Fact]
+    public void PostProgress_OneShotForSeveralItems_EachItemCarriesTheSameFile_IsPublishedAsIs()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        // 开工图: 练级两项共用一张、金碟币与声誉共用一张; 文件名里的数字不必是这条回报的 seq
+        const long seq    = 1797000000002;
+        var        jobs   = JsonSerializer.Serialize(Path.Combine(ShotsDirectory, "1234-1797000000000.png"));
+        var        wallet = JsonSerializer.Serialize(Path.Combine(ShotsDirectory, "1234-1797000000001.png"));
+        var body = Progress(1234, seq).TrimEnd()[..^1] +
+                   $$"""
+                     ,"shots":[
+                       {"itemId":"a","kind":"start","file":{{jobs}},"at":"2026-10-16T14:02:11Z"},
+                       {"itemId":"b","kind":"start","file":{{wallet}},"at":"2026-10-16T14:02:11Z"},
+                       {"itemId":"c","kind":"start","file":{{jobs}},"at":"2026-10-16T14:02:11Z"},
+                       {"itemId":"d","kind":"start","file":{{wallet}},"at":"2026-10-16T14:02:11Z"}]}
+                     """;
+
+        Assert.Equal(200, channel.PostProgress(body).StatusCode);
+
+        var shots = JsonNode.Parse(Assert.Single(events, x => x.Method == CatJobChannel.PROGRESS_EVENT).Json)!["shots"]!.AsArray();
+        Assert.Equal(["a", "b", "c", "d"], shots.Select(x => x!["itemId"]!.GetValue<string>()));
+        Assert.All(shots, x => Assert.Equal("start", x!["kind"]!.GetValue<string>()));
+        Assert.Equal(shots[0]!["file"]!.GetValue<string>(), shots[2]!["file"]!.GetValue<string>());
+        Assert.Equal(shots[1]!["file"]!.GetValue<string>(), shots[3]!["file"]!.GetValue<string>());
+        Assert.NotEqual(shots[0]!["file"]!.GetValue<string>(), shots[1]!["file"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Job_ItemFieldsLikeStartShot_ComeBackAsIs_FromGetJobAndAfterRestore()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        var job = JobWithStartShots(3);
+        Assert.True(channel.SetJob(job).Accepted);
+
+        // 登录器不改任务单: /cat/job 原样返回
+        var served = channel.GetJob(1234).Json!;
+        Assert.Equal(job.GetRawText(), served);
+        Assert.Equal(StartShotFlags, JsonNode.Parse(served)!["items"]!.AsArray().Select(x => x!["startShot"]!.GetValue<bool>()));
+
+        // 接管: 从守护记录里的任务单恢复后照样原样
+        var adopted = NewChannel();
+        adopted.GameStarted(1234);
+        Assert.True(adopted.Restore(channel.JobElement));
+        Assert.Equal(job.GetRawText(), adopted.GetJob(1234).Json);
     }
 
     [Fact]

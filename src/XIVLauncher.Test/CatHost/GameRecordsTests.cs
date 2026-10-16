@@ -80,7 +80,7 @@ public sealed class GameRecordsTests : IDisposable
 
         try
         {
-            var job = CatJobChannelTests.Job(9);
+            var job = CatJobChannelTests.JobWithStartShots(9);
 
             Assert.True(GameRecords.Write(NewRecord(game) with { CatJob = job }));
 
@@ -88,6 +88,7 @@ public sealed class GameRecordsTests : IDisposable
             Assert.NotNull(read?.CatJob);
             Assert.Equal(9, read.CatJob.Value.GetProperty("revision").GetInt64());
             Assert.Equal("七色花", read.CatJob.Value.GetProperty("character").GetProperty("name").GetString());
+            Assert.Equal(CatJobChannelTests.StartShotFlags, read.CatJob.Value.GetProperty("items").EnumerateArray().Select(x => x.GetProperty("startShot").GetBoolean()));
 
             // 文件里是嵌套的 JSON 对象, 不是转义的字符串
             Assert.Contains("\"catJob\": {", File.ReadAllText(GameRecords.FilePath(game.Id)));

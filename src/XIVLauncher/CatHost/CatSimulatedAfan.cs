@@ -65,6 +65,7 @@ internal sealed class CatSimulatedAfan
     private long      seq = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     private long?     lastRevision;
     private bool      characterChecked;
+    private bool      startShotsTaken;
     private bool      progressShotTaken;
     private long?     blockedAtRevision;
     private bool      blockedOnce;
@@ -237,9 +238,9 @@ internal sealed class CatSimulatedAfan
     }
 
     /// <summary>推进一步; progressed = 这一步有没有让某一项往前走</summary>
-    private (string State, JsonObject? Reason, string? Active, List<(string ItemId, string Kind)> Shots, bool Progressed) Advance(SimJob? job)
+    private (string State, JsonObject? Reason, string? Active, List<SimShot> Shots, bool Progressed) Advance(SimJob? job)
     {
-        var shots = new List<(string, string)>();
+        var shots = new List<SimShot>();
 
         if (job == null)
             return ("waiting", null, null, shots, false);
@@ -281,6 +282,16 @@ internal sealed class CatSimulatedAfan
         if (job.Desired == "finish" && !inRound)
             return ("stopped", null, null, shots, false);
 
+        // 开工前先拍开工图（换职业、开例程之前）, 这个游戏进程里只拍这一次: 这一步只带开工图、不推进
+        if (!startShotsTaken && job.Desired == "run")
+        {
+            startShotsTaken = true;
+            var start = StartShots(job);
+
+            if (start.Count > 0)
+                return ("running", null, active.ItemId, start, false);
+        }
+
         var local = progress[active.ItemId];
 
         // 第一项的例程"认不出": 报一次 blocked（unsupported）, 跳过它做下一项
@@ -313,14 +324,37 @@ internal sealed class CatSimulatedAfan
         if (!progressShotTaken && job.ProgressAt != null)
         {
             progressShotTaken = true;
-            shots.Add((active.ItemId, "progress"));
+            shots.Add(SimShot.Single(active.ItemId, "progress"));
         }
 
         if (local.Done && job.CompletionShots)
-            shots.Add((active.ItemId, "completion"));
+            shots.Add(SimShot.Single(active.ItemId, "completion"));
 
         return FirstPending(job) == null ? ("done", null, null, shots, true) : ("running", null, FirstPending(job)!.ItemId, shots, true);
     }
+
+    /// <summary>
+    ///     开工图: startShot 为 true 的项按要打开的界面分组, 一组一张图, 组里每项各带一条（file 相同）, 按 order 排
+    /// </summary>
+    private static List<SimShot> StartShots(SimJob job)
+    {
+        var shots = new List<SimShot>();
+
+        foreach (var item in job.Items.Where(x => x.StartShot).OrderBy(x => x.Order))
+        {
+            if (StartShotScreen(item.Kind, item.Routine) is { } screen)
+                shots.Add(new SimShot(item.ItemId, "start", $"start:{screen}"));
+        }
+
+        return shots;
+    }
+
+    /// <summary>
+    ///     开工图打开哪组界面: 练级项（含 routine 为 null 的）= 职业页 <c>jobs</c>; 金碟币、糖豆人声誉 = 冒险者铭牌 + 货币一览 <c>currency</c>;
+    ///     其余（勾选类、不知道该开哪个界面的）不拍, 为 null
+    /// </summary>
+    internal static string? StartShotScreen(string? kind, string? routine) =>
+        kind == "leveling" ? "jobs" : routine is "mgp" or "fallguys-rep" ? "currency" : null;
 
     /// <summary>按 order 第一个还没做完（也没被跳过）的可自动做的项</summary>
     private SimItem? FirstPending(SimJob job) =>
@@ -333,7 +367,7 @@ internal sealed class CatSimulatedAfan
     private static string Short(string text) =>
         text.Length <= 20 ? text : text[..20];
 
-    private void Send(SimJob? job, string state, JsonObject? reason, string? active, List<(string ItemId, string Kind)> shots, DateTime nowUtc)
+    private void Send(SimJob? job, string state, JsonObject? reason, string? active, List<SimShot> shots, DateTime nowUtc)
     {
         var items = new JsonArray();
 
@@ -353,7 +387,13 @@ internal sealed class CatSimulatedAfan
         if (shots.Count == 0 && fingerprint == lastFingerprint && nowUtc - lastSentAt < Heartbeat)
             return;
 
-        var number = ++seq;
+        // 每张图占一个 seq 作文件名（同一游戏里文件名不重复）, 回报用最后一个; 只有一张图时文件名与回报的 seq 相同
+        var images = new Dictionary<string, long>(StringComparer.Ordinal);
+
+        foreach (var shot in shots)
+            images.TryAdd(shot.Image, ++seq);
+
+        var number = images.Count > 0 ? seq : ++seq;
         var at     = CatProtocol.FormatTimestamp(nowUtc);
         var report = new JsonObject
         {
@@ -369,12 +409,20 @@ internal sealed class CatSimulatedAfan
 
         if (shots.Count > 0)
         {
+            var files = new Dictionary<string, string?>(StringComparer.Ordinal);
+
+            foreach (var (image, imageNumber) in images)
+            {
+                var covered = shots.Where(x => x.Image == image).ToArray();
+                files[image] = WriteShot(covered[0].Kind, covered.Select(x => x.ItemId), imageNumber);
+            }
+
             var list = new JsonArray();
 
-            foreach (var (itemId, kind) in shots)
+            foreach (var shot in shots)
             {
-                if (WriteShot(itemId, kind, number) is { } file)
-                    list.Add(new JsonObject { ["itemId"] = itemId, ["kind"] = kind, ["file"] = file, ["at"] = at });
+                if (files[shot.Image] is { } file)
+                    list.Add(new JsonObject { ["itemId"] = shot.ItemId, ["kind"] = shot.Kind, ["file"] = file, ["at"] = at });
             }
 
             if (list.Count > 0)
@@ -396,14 +444,14 @@ internal sealed class CatSimulatedAfan
         lastSentAt      = nowUtc;
     }
 
-    /// <summary>写一张模拟截图（二维码图, 内容是 pid、项与种类）, 返回完整路径; 写不了返回 null</summary>
-    private string? WriteShot(string itemId, string kind, long number)
+    /// <summary>写一张模拟截图（二维码图, 内容是 pid、种类与这张图对应的项）, 返回完整路径; 写不了返回 null</summary>
+    private string? WriteShot(string kind, IEnumerable<string> itemIds, long number)
     {
         try
         {
             System.IO.Directory.CreateDirectory(ShotsDirectory);
             var path = Path.Combine(ShotsDirectory, $"{pid}-{number}.png");
-            File.WriteAllBytes(path, new CatZxingQrCodec().EncodePng($"cat-sim pid={pid} item={itemId} kind={kind} seq={number}"));
+            File.WriteAllBytes(path, new CatZxingQrCodec().EncodePng($"cat-sim pid={pid} kind={kind} items={string.Join(',', itemIds)} seq={number}"));
             return path;
         }
         catch (Exception ex)
@@ -431,7 +479,15 @@ internal sealed class CatSimulatedAfan
         public bool Skipped { get; set; }
     }
 
-    private sealed record SimItem(string ItemId, int Order, string? Kind, int? ClassJobId, long? Current, long? Target, bool Done, string? Routine)
+    /// <summary>回报 shots 里的一条: image = 是哪张图（同一 image 的多条共用一个文件）</summary>
+    private sealed record SimShot(string ItemId, string Kind, string Image)
+    {
+        /// <summary>只挂这一项的图（完成图、进度图）</summary>
+        public static SimShot Single(string itemId, string kind) =>
+            new(itemId, kind, $"{kind}:{itemId}");
+    }
+
+    private sealed record SimItem(string ItemId, int Order, string? Kind, int? ClassJobId, long? Current, long? Target, bool Done, string? Routine, bool StartShot)
     {
         public bool Reached => Current is { } current && Target is { } target && current >= target;
     }
@@ -465,7 +521,8 @@ internal sealed class CatSimulatedAfan
                             Number(item["current"]),
                             Number(item["target"]),
                             item["done"] is JsonValue done && done.GetValueKind() == JsonValueKind.True,
-                            Text(item["routine"])
+                            Text(item["routine"]),
+                            item["startShot"] is JsonValue startShot && startShot.GetValueKind() == JsonValueKind.True
                         )
                     );
                 }
