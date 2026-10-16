@@ -197,7 +197,7 @@ namespace offsets
     //   Conditions.Instance() [StaticAddress("48 8D 0D ?? ?? ?? ?? 66 2B D8", 3)] 直接是结构体地址（不是指针）, Size 0x74,
     //   _flags = FixedSizeArray112<bool> @0, 每个标志一个字节, 下标即 Dalamud 的 ConditionFlag。
     // 静态: 本机 E:\最终幻想XIV\game\ffxiv_dx11.exe（2026-10-16）唯一命中, 指令 RVA 0x87591A → 结构体 RVA 0x2AED050。
-    // 不在必中集合里: 命中不了只让 DUTY 返回 FAIL sigscan-failed:Conditions。
+    // 不在必中集合里: 命中不了只让 DUTY 返回 FAIL sigscan-failed:Conditions。要求唯一命中（扫完整个 .text 节）, 多于一处同样当作没命中。
     inline constexpr const char* CONDITIONS_SIG        = "48 8D 0D ?? ?? ?? ?? 66 2B D8";
     inline constexpr int         CONDITIONS_SIG_OFFSET = 3;
     inline constexpr int         CONDITION_COUNT       = 112;

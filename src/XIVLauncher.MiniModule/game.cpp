@@ -1190,7 +1190,8 @@ namespace
         if (!g_conditionsTried)
         {
             g_conditionsTried = true;
-            g_conditions      = ScanStaticAddress(offsets::CONDITIONS_SIG, offsets::CONDITIONS_SIG_OFFSET);
+            // 要求唯一命中: 这条特征码只有 10 字节, 游戏更新后若多出一处相同的指令, 取第一个可能读到别的静态变量
+            g_conditions      = ScanStaticAddressUnique(offsets::CONDITIONS_SIG, offsets::CONDITIONS_SIG_OFFSET);
 
             LogF("[game]   Conditions 静态地址     RVA=0x%llX",
                  static_cast<unsigned long long>(g_conditions ? g_conditions - ModuleBase() : 0));
@@ -2318,6 +2319,7 @@ namespace
         int boundByDuty;
         int boundByDuty56;
         int boundByDuty95;
+        int set;           // 112 个标志里置位的个数（载入了角色时至少有 NormalConditions, 为 0 多半是地址读歪了）
     };
 
     void OpDuty(DutyData* out)
@@ -2347,11 +2349,15 @@ namespace
             // 每个标志是一个 bool 字节: 出现 0 / 1 以外的值 = 地址读歪了
             for (int i = 0; i < offsets::CONDITION_COUNT; i++)
             {
-                if (ReadAt<unsigned char>(flags, static_cast<uintptr_t>(i)) > 1)
+                const auto value = ReadAt<unsigned char>(flags, static_cast<uintptr_t>(i));
+
+                if (value > 1)
                 {
                     out->status = -2;
                     return;
                 }
+
+                out->set += value;
             }
 
             out->boundByDuty   = ReadAt<unsigned char>(flags, offsets::CONDITION_BOUND_BY_DUTY);
@@ -2651,9 +2657,10 @@ std::string GameLevels()
 }
 
 // 角色是否在副本中, 只读。响应只有一行:
-//   OK loaded=1 inDuty=<0|1> flags=<置位的副本标志下标, 逗号分隔>
+//   OK loaded=1 inDuty=<0|1> set=<112 个标志里置位的个数> flags=<置位的副本标志下标, 逗号分隔>
 //   OK loaded=0                     （没有载入角色: 不知道在不在副本）
 // inDuty = Conditions 的 BoundByDuty(34) / BoundByDuty56(56) / BoundByDuty95(95) 任一为真; flags 只列这三个里置位的, 供核对。
+// set=0 不在这里判失败: 载入了角色时不该全为 0, 由启动器连续几次看到才算读歪。
 std::string GameDuty()
 {
     if (!GameResolve())
@@ -2698,7 +2705,7 @@ std::string GameDuty()
         flags += std::to_string(index);
     }
 
-    return std::string("OK loaded=1 inDuty=") + (flags.empty() ? "0" : "1") + " flags=" + flags;
+    return std::string("OK loaded=1 inDuty=") + (flags.empty() ? "0" : "1") + " set=" + std::to_string(data->set) + " flags=" + flags;
 }
 
 // 参数: 角色名, 或纯数字的 ContentId。角色在整个大区的列表里找。

@@ -44,6 +44,7 @@ DWORD ProcessMainThreadId();    // 本进程创建时间最早的线程 = 主线
 uintptr_t ModuleBase();
 uintptr_t ScanText(const char* signature);                     // 命中 E8/E9 时自动跟进目标
 uintptr_t ScanStaticAddress(const char* signature, int offset); // RIP 相对寻址的静态地址
+uintptr_t ScanStaticAddressUnique(const char* signature, int offset); // 同上, 但扫完整个 .text 节, 命中不止一处时返回 0
 uintptr_t ScanTextRaw(const char* signature);                  // 不跟进 E8/E9, 给通配符开头的特征码用
 
 // ---- 游戏结构体 (game.cpp) --------------------------------------------------
