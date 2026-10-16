@@ -208,6 +208,26 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         false;
 
     /// <summary>
+    ///     硬件自动登录要用到的页面判断（账号密码页、密码错误、等手机确认）。这几项的图像特征（密码框边框、「登录」橙块、错误/确认提示的位置与颜色）
+    ///     要在接了 CH9329 的挂机电脑上对 StartFor 拉起的 1210×680 窗口实机核对后再定阈值（见 window-geometry.md 待实测项）。
+    ///     核对前一律返回「认不出」的保守值: 导航时按在页上继续试、不误报密码错 / 等确认, 自动登录走不通就按超时退回员工手动。
+    /// </summary>
+    public bool? OnQqPasswordPage() =>
+        null;
+
+    /// <inheritdoc />
+    public bool AccountMatches(string account) =>
+        false;
+
+    /// <inheritdoc />
+    public bool PasswordRejected() =>
+        false;
+
+    /// <inheritdoc />
+    public bool AwaitingPhoneConfirm() =>
+        false;
+
+    /// <summary>
     ///     鼠标消息的坐标参数: 低 16 位是横坐标, 高 16 位是纵坐标
     /// </summary>
     internal static IntPtr PackPoint(int x, int y) =>

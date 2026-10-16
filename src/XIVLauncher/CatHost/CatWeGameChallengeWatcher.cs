@@ -54,6 +54,9 @@ public static class CatWeGameChallengeKinds
 
     /// <summary>设备验证, 要客户用密保手机发一条短信</summary>
     public const string SMS = "sms";
+
+    /// <summary>首次在新设备用 QQ 账号密码登录, 要客户在手机 QQ 上点确认（不是扫码、不是短信）</summary>
+    public const string QQ_CONFIRM = "qqConfirm";
 }
 
 /// <summary>
@@ -150,6 +153,30 @@ public interface ICatWeGameScreen
     ///     点设备验证窗口上的「确定」; 窗口不在时返回 false
     /// </summary>
     bool ConfirmSmsPrompt();
+
+    /// <summary>
+    ///     当前登录窗口在不在 QQ 账号密码页（密码框可见）: true = 在, false = 明确不在, null = 认不出（硬件自动登录用, 图像特征阈值留实机核对）
+    /// </summary>
+    bool? OnQqPasswordPage() =>
+        null;
+
+    /// <summary>
+    ///     账号下拉框当前是不是已经填着这个号（是就不用清空重输）; 认不出时返回 false, 宁可清空重输（硬件自动登录用）
+    /// </summary>
+    bool AccountMatches(string account) =>
+        false;
+
+    /// <summary>
+    ///     登录窗口上有没有「密码错误」之类的提示（硬件自动登录用, 真实图像识别阈值留实机核对）
+    /// </summary>
+    bool PasswordRejected() =>
+        false;
+
+    /// <summary>
+    ///     登录窗口是不是停在「等客户在手机 QQ 上确认登录」的画面（硬件自动登录用, 真实图像识别阈值留实机核对）
+    /// </summary>
+    bool AwaitingPhoneConfirm() =>
+        false;
 }
 
 /// <summary>

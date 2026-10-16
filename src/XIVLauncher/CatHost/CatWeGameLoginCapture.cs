@@ -121,6 +121,14 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
     public TimeSpan? WatchInterval { get; init; }
 
     /// <summary>
+    ///     本机外接的硬件键鼠; 设了才会对 QQ 账号密码方式的号自动输入账号密码（见 <see cref="CatWeGameHwLogin" />）, 为 null 时一律等员工手动
+    /// </summary>
+    public ICatHidKeyboard? Keyboard { get; init; }
+
+    /// <summary>硬件自动登录时用到的前台窗口操作; 与 <see cref="Keyboard" /> 一起设才生效</summary>
+    public ICatWeGameForeground? Foreground { get; init; }
+
+    /// <summary>
     ///     客户说设备验证的短信已经发了; 不在等登录时回 notRunning
     /// </summary>
     public CatAcceptResult ConfirmSms(string challengeId) =>
@@ -353,7 +361,9 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
                                () =>
                                {
                                    reporter.Stage(CatStages.WAITING_WE_GAME_LOGIN);
-                                   watch = StartWatcher(request, reporter, watching.Token);
+                                   watch = ShouldHwLogin(request)
+                                               ? StartHwLogin(request, reporter, watching.Token)
+                                               : StartWatcher(request, reporter, watching.Token);
                                },
                                timeout.Token
                            ).ConfigureAwait(false);
@@ -450,6 +460,80 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
         capturedUserName = saved.UserName;
         capturedToken    = captured.Token;
         return saved;
+    }
+
+    /// <summary>
+    ///     这次等登录要不要走硬件自动输入: QQ 账号密码方式（WeGame 号、没要自动切扫码页）、下发了密码、本机接了硬件键鼠且能看窗口。
+    ///     其余（微信、QQ 扫码、没下发密码、没接硬件）一律照旧等员工手动
+    /// </summary>
+    private bool ShouldHwLogin(CatLaunchRequest request) =>
+        request.IsWeGame
+        && request.WeGameScan == null
+        && request.Password != null
+        && Keyboard != null
+        && Foreground != null
+        && Screen != null;
+
+    /// <summary>
+    ///     WeGame 已拉起: 用硬件键鼠自动输入账号密码登录; 停在等手机确认时提醒客户、登录成功后清除; 走不通则退回员工手动（报原因, 不判上号失败）
+    /// </summary>
+    private Task StartHwLogin(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        if (Keyboard is not { } keyboard || Foreground is not { } foreground || Screen is not { } screen || request.Password is not { } password)
+            return Task.CompletedTask;
+
+        var flow = new CatWeGameHwLoginFlow(keyboard, screen, foreground);
+        return Task.Run(() => RunHwLoginAsync(flow, request, password, reporter, cancellationToken), CancellationToken.None);
+    }
+
+    private async Task RunHwLoginAsync(CatWeGameHwLoginFlow flow, CatLaunchRequest request, CatSecret password, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        try
+        {
+            Log.Information("[CatHost] 本机接了硬件键鼠, 对 QQ 账号密码方式的 WeGame 号自动输入账号密码: 请求的号={Requested}", request.AccountName);
+
+            var result = await flow.RunAsync(request.AccountName, password, cancellationToken).ConfigureAwait(false);
+
+            if (result.Outcome == CatWeGameHwLoginOutcome.NeedsPhoneConfirm)
+            {
+                const string challengeId = "qq-confirm";
+                reporter.WeGameChallenge(new CatWeGameChallenge(CatWeGameChallengeKinds.QQ_CONFIRM, challengeId));
+
+                try
+                {
+                    result = await flow.ResumeAfterPhoneConfirmAsync(cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    reporter.WeGameChallengeCleared(challengeId);
+                }
+            }
+
+            switch (result.Outcome)
+            {
+                case CatWeGameHwLoginOutcome.Success:
+                    // 登录窗口已点过「启动」, 接下来由 version.dll 在 sdologin 里抓令牌, 照现有流程继续
+                    Log.Information("[CatHost] WeGame 硬件自动登录完成, 等取登录信息");
+                    break;
+
+                case CatWeGameHwLoginOutcome.PasswordRejected:
+                    reporter.WeGameHwLoginFallback("WeGame 提示密码错误, 请联系客户核对密码后重新上号");
+                    break;
+
+                default: // FallBackToManual
+                    reporter.WeGameHwLoginFallback(result.Reason ?? "硬件自动登录未成功, 请在这台电脑手动登录");
+                    break;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 超时或收到关闭请求: 正常收尾, 不报
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] WeGame 硬件自动登录出错, 退回员工手动");
+            reporter.WeGameHwLoginFallback("硬件自动登录出错, 请在这台电脑手动登录");
+        }
     }
 
     /// <summary>

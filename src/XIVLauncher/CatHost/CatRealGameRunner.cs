@@ -761,7 +761,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         weGameLogin = new CatWeGameLoginCapture(new CatWeGameLoginRealEnvironment(() => App.Settings.WeGamePath?.FullName), store, redactor)
         {
-            Screen = new CatWeGameRealScreen(new CatZxingQrCodec())
+            Screen     = new CatWeGameRealScreen(new CatZxingQrCodec()),
+            // 接了 CH9329 硬件键鼠时, QQ 账号密码方式的号就地自动输入账号密码（没接会自动找不到、退回员工手动）
+            Keyboard   = new CatHid9329(),
+            Foreground = new CatWeGameRealForeground()
         };
         weGameRow   = await weGameLogin.FindRowAsync(request, reporter, cancellationToken).ConfigureAwait(false);
 

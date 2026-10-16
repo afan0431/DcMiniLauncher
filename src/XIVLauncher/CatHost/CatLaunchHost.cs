@@ -7,7 +7,8 @@ using XIVLauncher.Minion;
 namespace XIVLauncher.CatHost;
 
 /// <summary>
-///     一次 launch 的参数（已校验）; MinionCard = 要挂的 Minion 卡, 不挂为 null; WeGameLogin = WeGame 号在本机没有可用的登录信息时拉起 WeGame 等员工登录, 为 false 时直接报 authorizationRequired;
+///     一次 launch 的参数（已校验）; MinionCard = 要挂的 Minion 卡, 不挂为 null; Password = 国际服的账号密码, 或 WeGame QQ 账号密码方式下发来给硬件键鼠自动输入的密码（盛趣号不带）;
+///     WeGameLogin = WeGame 号在本机没有可用的登录信息时拉起 WeGame 等员工登录, 为 false 时直接报 authorizationRequired;
 ///     AutoEnter = 游戏起来后自动经标题、选角进入游戏; CharacterName / CharacterHomeWorld = 要登录的角色（可为空）;
 ///     WeGameToken / WeGameAccountId = 工作台下发的 WeGame 登录信息与 WeGame 用户号（只有 WeGame 号会带, 两个同时有或同时为 null）;
 ///     AuthOnly = 只登录: 登录成功即报 <see cref="ICatLaunchReporter.Authorized" /> 结束, 不起游戏（只有 WeGame 号会带, 此时 MinionCard 为 null、AutoEnter 为 false）
@@ -138,6 +139,13 @@ public interface ICatLaunchReporter
 
     /// <summary>点了设备验证的「确定」之后的结果（目前只报没通过; 通过时那项验证直接消失）</summary>
     void WeGameSmsResult(string challengeId, bool passed);
+
+    /// <summary>
+    ///     本机硬件自动输入 WeGame 账号密码没走通, 退回员工手动登录; reason 是给工作室员工看的原因（不含密码）。不算上号失败, 员工照旧看明文密码手输
+    /// </summary>
+    void WeGameHwLoginFallback(string reason)
+    {
+    }
 }
 
 /// <summary>
@@ -480,7 +488,10 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 string.IsNullOrWhiteSpace(parameters.AreaName) ? null : parameters.AreaName.Trim(),
                 channel == CatPlatform.WeGame ? XIVAccountType.WeGame : XIVAccountType.Sdo,
                 isInternational,
-                isInternational ? new CatSecret(parameters.Password!) : null,
+                // 国际服必带密码; WeGame 号带了密码就留着（接了硬件键鼠时用它自动输入, 否则不碰）; 盛趣号的密码一律丢掉
+                !string.IsNullOrEmpty(parameters.Password) && (isInternational || channel == CatPlatform.WeGame)
+                    ? new CatSecret(parameters.Password!)
+                    : null,
                 weGameLogin,
                 weGameScan,
                 autoEnter,
@@ -1054,6 +1065,13 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     /// <inheritdoc />
     public void WeGameSmsResult(string challengeId, bool passed) =>
         Publish("weGame.smsResult", new { operationId = OperationId, challengeId, passed });
+
+    /// <inheritdoc />
+    public void WeGameHwLoginFallback(string reason)
+    {
+        Serilog.Log.Information("[CatHost] WeGame 硬件自动登录退回员工手动: {Reason}", reason);
+        Publish("weGame.hwLoginFallback", new { operationId = OperationId, reason = Redact(reason) });
+    }
 
     #endregion
 
