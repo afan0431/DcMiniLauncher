@@ -371,21 +371,25 @@ public sealed class CatJobChannelTests
         host.Started(4321, DateTimeOffset.UtcNow);
         Assert.Equal(200, host.Jobs.PostProgress(Progress(4321, 1)).StatusCode);
         host.Levels(0, Seven, [90, 80]);
+        host.Duty(0, true, DateTimeOffset.UtcNow);
 
         host.Exited(4321, 0);
 
         Assert.Equal(404, host.Jobs.PostProgress(Progress(4321, 2)).StatusCode);
         host.Levels(4321, Seven, [91, 80]);
         host.Levels(0, Seven, [92, 80]);
+        host.Duty(4321, false, DateTimeOffset.UtcNow);
+        host.Duty(0, false, DateTimeOffset.UtcNow);
 
         Assert.True(await host.DrainEventsAsync(TimeSpan.FromSeconds(5)));
         var order = published.ToArray();
         var exitedAt = Array.IndexOf(order, "game.exited");
 
         Assert.True(exitedAt >= 0);
-        Assert.DoesNotContain(order[(exitedAt + 1)..], x => x is CatJobChannel.PROGRESS_EVENT or CatJobChannel.LEVELS_EVENT);
+        Assert.DoesNotContain(order[(exitedAt + 1)..], x => x is CatJobChannel.PROGRESS_EVENT or CatJobChannel.LEVELS_EVENT or CatJobChannel.DUTY_EVENT);
         Assert.Equal(1, order.Count(x => x == CatJobChannel.PROGRESS_EVENT));
         Assert.Equal(1, order.Count(x => x == CatJobChannel.LEVELS_EVENT));
+        Assert.Equal(1, order.Count(x => x == CatJobChannel.DUTY_EVENT));
 
         runner.Finish.TrySetResult(0);
     }
@@ -477,6 +481,49 @@ public sealed class CatJobChannelTests
 
         channel.GameEnded(1234);
         channel.ReportLevels(1234, Seven, [1, 2, 3]);
+
+        Assert.Empty(events);
+    }
+
+    [Fact]
+    public void ReportDuty_FirstReadingAndEachChange_AndAgainForANewGame()
+    {
+        var channel = NewChannel();
+        var at      = new DateTimeOffset(2026, 10, 16, 22, 2, 11, 345, TimeSpan.FromHours(8));
+        channel.GameStarted(1234);
+
+        channel.ReportDuty(1234, false, at);
+        channel.ReportDuty(0, false, at);
+        channel.ReportDuty(0, true, at);
+        channel.ReportDuty(1234, true, at);
+        channel.ReportDuty(0, false, at);
+
+        // 崩溃重开 / 接管: 新的游戏第一次读到照样发
+        channel.GameStarted(5678);
+        channel.ReportDuty(0, false, at);
+
+        var published = events.Where(x => x.Method == CatJobChannel.DUTY_EVENT).Select(x => JsonNode.Parse(x.Json)!.AsObject()).ToArray();
+
+        Assert.Equal(4, published.Length);
+        Assert.Equal([false, true, false, false], published.Select(x => x["inDuty"]!.GetValue<bool>()));
+        Assert.Equal([1234, 1234, 1234, 5678], published.Select(x => x["pid"]!.GetValue<int>()));
+        Assert.All(published, x => Assert.Equal(["operationId", "pid", "inDuty", "at"], x.Select(p => p.Key)));
+        Assert.All(published, x => Assert.Equal(OPERATION, x["operationId"]!.GetValue<string>()));
+        Assert.Equal("2026-10-16T14:02:11.345Z", published[0]["at"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void ReportDuty_ForAnotherPidOrWithoutAGame_IsDropped()
+    {
+        var channel = NewChannel();
+        channel.ReportDuty(0, true, DateTimeOffset.UtcNow);
+
+        channel.GameStarted(1234);
+        channel.ReportDuty(999, true, DateTimeOffset.UtcNow);
+
+        channel.GameEnded(1234);
+        channel.ReportDuty(1234, true, DateTimeOffset.UtcNow);
+        channel.ReportDuty(0, false, DateTimeOffset.UtcNow);
 
         Assert.Empty(events);
     }

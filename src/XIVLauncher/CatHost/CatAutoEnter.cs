@@ -164,6 +164,7 @@ public sealed class CatAutoEnter
     private string?                       enteredContentId;
     private TimeSpan?                     lobbyUnreadableSince;
     private CatLevelReader?               levelReader;
+    private CatDutyReader?                dutyReader;
 
     /// <summary>
     ///     创建一次编排
@@ -258,7 +259,7 @@ public sealed class CatAutoEnter
 
     /// <summary>
     ///     编排结束或停手之后: 隔一段时间看一次游戏里当前是谁, 角色变了（人手动进了游戏、换了角色）就再报一次;
-    ///     角色在世界里时顺带读一次全部职业等级（有变化才发 game.levels, 模块太旧就不读）。
+    ///     角色在世界里时顺带读一次全部职业等级与是否在副本中（有变化才发 game.levels / game.duty, 模块太旧就不读）。
     ///     管道被别的操作占着时跳过这一次; 游戏退出或取消即结束。
     /// </summary>
     public async Task ObserveAsync(CancellationToken cancellationToken)
@@ -285,7 +286,11 @@ public sealed class CatAutoEnter
                         ReportEntered(who);
 
                     levelReader ??= new CatLevelReader(reporter, game.ProcessId, timings.ReadTimeout);
-                    await levelReader.ReadAsync(game, who, cancellationToken).ConfigureAwait(false);
+                    dutyReader  ??= new CatDutyReader(reporter, game.ProcessId, timings.ReadTimeout);
+
+                    // 读等级超时了, 这一轮就不再读副本状态
+                    if (await levelReader.ReadAsync(game, who, cancellationToken).ConfigureAwait(false))
+                        await dutyReader.ReadAsync(game, cancellationToken).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException)

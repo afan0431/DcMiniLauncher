@@ -15,7 +15,8 @@ public sealed record CatLevelsCharacter(string Name, string ContentId, int HomeW
 
 /// <summary>
 ///     Cat 上号自动开工的任务单通道（约定 cat-job/1）: 工作台经管道方法 setJob 交来任务单, 游戏内 Afan 经本机接口
-///     <c>GET /cat/job?pid=</c> 取、<c>POST /cat/progress</c> 报进度; 回报原样转成 game.jobProgress, 小模块读到的职业等级转成 game.levels。
+///     <c>GET /cat/job?pid=</c> 取、<c>POST /cat/progress</c> 报进度; 回报原样转成 game.jobProgress, 小模块读到的职业等级转成 game.levels,
+///     读到的"是否在副本中"转成 game.duty。
 ///     一个无界面进程一份, 只认它守着的那个游戏的 pid。
 ///     工作台按这个类型（<c>XIVLauncher.CatHost.CatJobChannel</c>）在不在程序集里判断登录器支不支持 setJob, 改名要同步改工作台外壳的探测。
 /// </summary>
@@ -35,6 +36,9 @@ public sealed class CatJobChannel : ICatLocalEndpoints
 
     /// <summary>等级读数事件</summary>
     public const string LEVELS_EVENT = "game.levels";
+
+    /// <summary>是否在副本中的事件</summary>
+    public const string DUTY_EVENT = "game.duty";
 
     /// <summary>任务单原文上限</summary>
     public const int MAX_JOB_BYTES = 256 * 1024;
@@ -57,6 +61,9 @@ public sealed class CatJobChannel : ICatLocalEndpoints
 
     /// <summary>每个游戏进程上次发的等级读数（角色 + 数组）</summary>
     private readonly Dictionary<int, (string ContentId, int[] Levels)> lastLevels = [];
+
+    /// <summary>每个游戏进程上次发的"是否在副本中"</summary>
+    private readonly Dictionary<int, bool> lastDuty = [];
 
     /// <summary>每个游戏进程上一次经本机接口收下回报的时刻（Environment.TickCount64）</summary>
     private readonly Dictionary<int, long> lastPostedAt = [];
@@ -99,7 +106,7 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     /// </summary>
     /// <param name="operationId">本实例的 operationId（还没 launch / adopt 时为 null）</param>
     /// <param name="publish">
-    ///     发事件（方法名, 参数）。<b>必须非阻塞</b>（只入队）: 回报与等级在本类的锁里发, 这样 <see cref="GameEnded" /> 之后（game.exited 之前）
+    ///     发事件（方法名, 参数）。<b>必须非阻塞</b>（只入队）: 回报、等级与副本状态在本类的锁里发, 这样 <see cref="GameEnded" /> 之后（game.exited 之前）
     ///     不会再有这个游戏的事件插进来
     /// </param>
     public CatJobChannel(Func<string?> operationId, Action<string, object> publish)
@@ -237,6 +244,9 @@ public sealed class CatJobChannel : ICatLocalEndpoints
             foreach (var other in lastLevels.Keys.Where(x => x != pid).ToArray())
                 lastLevels.Remove(other);
 
+            foreach (var other in lastDuty.Keys.Where(x => x != pid).ToArray())
+                lastDuty.Remove(other);
+
             foreach (var other in lastPostedAt.Keys.Where(x => x != pid).ToArray())
                 lastPostedAt.Remove(other);
         }
@@ -339,6 +349,39 @@ public sealed class CatJobChannel : ICatLocalEndpoints
                     pid         = current,
                     character   = new { name = character.Name, contentId = character.ContentId, homeWorldId = character.HomeWorldId },
                     levels      = copy
+                }
+            );
+        }
+    }
+
+    /// <summary>
+    ///     小模块读到的"是否在副本中"（Conditions 的 BoundByDuty 类标志）: 与这个游戏上次发的不同才发 game.duty（第一次读到也发）。
+    ///     at = 读到的时刻; pid ≤ 0 = 当前守护的游戏, 给了 pid 但不是当前守护的游戏（含游戏已退出）时丢掉
+    /// </summary>
+    public void ReportDuty(int pid, bool inDuty, DateTimeOffset at)
+    {
+        var operation = operationId();
+
+        lock (stateLock)
+        {
+            if (gamePid is not { } current || (pid > 0 && pid != current))
+                return;
+
+            if (lastDuty.TryGetValue(current, out var last) && last == inDuty)
+                return;
+
+            lastDuty[current] = inDuty;
+            Log.Information("[CatHost] 副本状态 pid={Pid}: {InDuty}", current, inDuty ? "在副本中" : "不在副本中");
+
+            publish
+            (
+                DUTY_EVENT,
+                new
+                {
+                    operationId = operation,
+                    pid         = current,
+                    inDuty,
+                    at          = CatProtocol.FormatTimestamp(at)
                 }
             );
         }

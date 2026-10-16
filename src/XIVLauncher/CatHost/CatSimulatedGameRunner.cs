@@ -39,13 +39,17 @@ namespace XIVLauncher.CatHost;
 ///             由 <see cref="CatSimulatedAfan" /> 每 <see cref="AfanStep" /> 推进一步: 没有任务单报 waiting; 有任务单先报一次 waiting（核对角色）,
 ///             再按 order 把 routine 不为 null 的项一项项做完（running, current 每步加 (target − 起点)/5, 勾选类三步完成）, 一项做完且 shots.completion
 ///             为 true 时在截图目录写 <c>&lt;pid&gt;-&lt;seq&gt;.png</c> 并带在回报的 shots 里（progressAt 不为空时开工后先带一张 progress 图）,
-///             全部做完报 done; desired 为 pause / stop 报 paused / stopped; 没有可自动做的项报 idle; 没有变化时每 <see cref="AfanHeartbeat" /> 心跳一次。
+///             全部做完报 done; desired 为 pause / stop 报 paused / stopped; desired 为 finish 时走完正在做的这一把再报 stopped（不在一把里立即报）;
+///             没有可自动做的项报 idle; 没有变化时每 <see cref="AfanHeartbeat" /> 心跳一次。
 ///             职业等级按任务单里练级项的当前值（ClassJob → ExpArrayIndex 用国服表）连同当前角色每步报一次, 有变化才发 game.levels;
 ///             不自动进入角色时与真实启动一样, 进世界先报一次 game.character（模拟角色, 名字取 launch 的 character.name）。
+///             是否在副本中每步报一次, 有变化才发 game.duty（进世界后第一步必发）: 例程进行中每走 <see cref="CatSimulatedAfan.DUTY_ROUND_STEPS" /> 步算一把、
+///             在副本中, 两把之间隔一步不在副本中; 其它状态（没有任务单、waiting、paused、stopped、blocked、done 等）不在副本中。
 ///             账号名前缀 <c>blocked:</c> = 第一项走两步后报 blocked（noProgress）, 直到任务单 revision 变了才接着做;
 ///             <c>manual:</c> = 不产生回报（由测试工具往 /cat/progress 发, pid 用占位进程号）, 只报等级;
 ///             <c>mismatch:</c> = waiting 之后一直报 mismatch（reason.code=error, text 写进的是哪个角色）;
-///             <c>unsupported:</c> = 第一项报一次 blocked（reason.code=unsupported, 例程认不出）, 跳过它接着做后面的项。
+///             <c>unsupported:</c> = 第一项报一次 blocked（reason.code=unsupported, 例程认不出）, 跳过它接着做后面的项;
+///             <c>induty:</c> = 是否在副本中一直报 true（任务单照常推进）, 可放在上面四个前缀前面连用（如 <c>induty:blocked:</c>）。
 ///             seq 与真 Afan 一样以 Unix 毫秒为起点（13 位）
 ///         </item>
 ///     </list>
@@ -117,6 +121,9 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
     /// <summary>上号自动开工: 第一项例程认不出（报一次 blocked + unsupported, 跳过它接着做）的前缀</summary>
     public const string JOB_UNSUPPORTED_PREFIX = "unsupported:";
+
+    /// <summary>是否在副本中一直报 true 的前缀（可放在上面几个上号自动开工的前缀前面连用）</summary>
+    public const string IN_DUTY_PREFIX = "induty:";
 
     private readonly CancellationTokenSource closeCts = new();
     private readonly object                  stateLock = new();
@@ -587,7 +594,12 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
             reporter.Character(entered);
         }
 
-        var account = request.AccountName;
+        var account      = request.AccountName;
+        var alwaysInDuty = account.StartsWith(IN_DUTY_PREFIX, StringComparison.Ordinal);
+
+        if (alwaysInDuty)
+            account = account[IN_DUTY_PREFIX.Length..];
+
         var behavior = account.StartsWith(JOB_BLOCKED_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Blocked
                        : account.StartsWith(JOB_MANUAL_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Manual
                        : account.StartsWith(JOB_MISMATCH_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Mismatch
@@ -602,7 +614,8 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         {
             Step           = AfanStep,
             Heartbeat      = AfanHeartbeat,
-            ShotsDirectory = ShotsDirectory ?? CatShots.Directory
+            ShotsDirectory = ShotsDirectory ?? CatShots.Directory,
+            AlwaysInDuty   = alwaysInDuty
         };
 
         var task = Task.Run

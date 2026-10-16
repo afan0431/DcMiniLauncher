@@ -20,25 +20,25 @@ internal sealed class CatLevelReader(ICatLaunchReporter reporter, int processId,
     public bool Unsupported => unsupported;
 
     /// <summary>
-    ///     读一次。who = 同一轮读到的当前角色（必须已载入）。模块不支持时返回 false（之后调用直接返回 false）;
-    ///     超时返回 true（这一轮不算数）; 通话失败照常抛异常, 由调用方决定跳过这一次。调用方事后要放开管道（超时后管道里可能还留着半条回应）
+    ///     读一次。who = 同一轮读到的当前角色（必须已载入）。返回 false = 这一次超时（管道里可能还留着半条回应）, 这一轮不要再发别的命令;
+    ///     其余（读到、没读成、模块不支持）返回 true。通话失败照常抛异常, 由调用方决定跳过这一次。调用方事后要放开管道
     /// </summary>
     public async Task<bool> ReadAsync(IMiniModuleChannel module, CatModuleReplies.WhoAmI who, CancellationToken cancellationToken)
     {
         if (unsupported)
-            return false;
+            return true;
 
         if (await SendWithTimeoutAsync(module, COMMAND, timeout, cancellationToken).ConfigureAwait(false) is not { } response)
         {
             Log.Debug("[CatHost] 读职业等级 {Seconds} 秒没有回应, 跳过这一次", timeout.TotalSeconds);
-            return true;
+            return false;
         }
 
         if (response.Contains("unknown-command", StringComparison.Ordinal))
         {
             unsupported = true;
             Log.Information("[CatHost] 游戏 {Pid} 里的游戏内模块是旧版, 读不了职业等级（下次启动游戏才会换上新模块）", processId);
-            return false;
+            return true;
         }
 
         if (CatModuleReplies.ParseLevels(response) is not { } reading)
@@ -93,6 +93,55 @@ internal sealed class CatLevelReader(ICatLaunchReporter reporter, int processId,
 }
 
 /// <summary>
+///     向游戏内模块读一次角色是否在副本中（<c>DUTY</c>, Conditions 的 BoundByDuty 类标志）并报告; 报不报 game.duty 由 <see cref="CatJobChannel" />
+///     按有没有变化决定。读不到（没载入角色、读歪、超时）不报。游戏里注着的是不认识这条命令的旧模块（0.9.0 之前）时记一次日志, 之后不再读。
+///     每次读都有上限（<see cref="CatAutoEnterTimings.ReadTimeout" />）
+/// </summary>
+internal sealed class CatDutyReader(ICatLaunchReporter reporter, int processId, TimeSpan timeout)
+{
+    /// <summary>模块命令</summary>
+    public const string COMMAND = "DUTY";
+
+    private bool unsupported;
+
+    /// <summary>模块不认识 <c>DUTY</c>, 不再读</summary>
+    public bool Unsupported => unsupported;
+
+    /// <summary>
+    ///     读一次。返回值与 <see cref="CatLevelReader.ReadAsync" /> 相同: false = 这一次超时, 这一轮不要再发别的命令; 通话失败照常抛异常
+    /// </summary>
+    public async Task<bool> ReadAsync(IMiniModuleChannel module, CancellationToken cancellationToken)
+    {
+        if (unsupported)
+            return true;
+
+        if (await CatLevelReader.SendWithTimeoutAsync(module, COMMAND, timeout, cancellationToken).ConfigureAwait(false) is not { } response)
+        {
+            Log.Debug("[CatHost] 读副本状态 {Seconds} 秒没有回应, 跳过这一次", timeout.TotalSeconds);
+            return false;
+        }
+
+        if (response.Contains("unknown-command", StringComparison.Ordinal))
+        {
+            unsupported = true;
+            Log.Information("[CatHost] 游戏 {Pid} 里的游戏内模块是旧版, 读不了是否在副本中（下次启动游戏才会换上新模块）", processId);
+            return true;
+        }
+
+        if (CatModuleReplies.ParseDuty(response) is not { } inDuty)
+        {
+            if (!CatModuleReplies.IsOk(response))
+                Log.Debug("[CatHost] 这一次没读成副本状态: {Response}", CatModuleReplies.FirstLine(response));
+
+            return true;
+        }
+
+        reporter.Duty(processId, inDuty, DateTimeOffset.UtcNow);
+        return true;
+    }
+}
+
+/// <summary>
 ///     游戏内模块的注入策略
 /// </summary>
 public static class CatModuleInjection
@@ -119,7 +168,7 @@ public static class CatModuleInjection
 /// <summary>
 ///     不自动进入角色的盛趣 / WeGame 游戏（含接管来的）: 等游戏窗口、注入游戏内模块（已在就跳过; 失败隔
 ///     <see cref="CatAutoEnterTimings.AttachRetryInterval" /> 再试, 最多 <see cref="CatAutoEnterTimings.AttachAttempts" /> 次）, 之后每隔
-///     <see cref="CatAutoEnterTimings.ObserveInterval" /> 先看当前角色（WHOAMI, 角色变了报 game.character）再读全部职业等级。
+///     <see cref="CatAutoEnterTimings.ObserveInterval" /> 先看当前角色（WHOAMI, 角色变了报 game.character）再读全部职业等级与是否在副本中。
 ///     自动进入角色的游戏在 <see cref="CatAutoEnter.ObserveAsync" /> 里做同样的事。管道被别的操作（换大区等）占着时跳过这一次; 游戏退出或取消即结束
 /// </summary>
 internal sealed class CatLevelWatch(ICatAutoEnterGame game, ICatLaunchReporter reporter, CatAutoEnterTimings? timings = null)
@@ -140,7 +189,8 @@ internal sealed class CatLevelWatch(ICatAutoEnterGame game, ICatLaunchReporter r
         // 服务器中文名表要联网查, 在占模块闸之前查好（查不到只是 game.character 不带中文名）
         worlds = await game.LoadWorldsAsync(cancellationToken).ConfigureAwait(false);
 
-        var reader = new CatLevelReader(reporter, game.ProcessId, timings.ReadTimeout);
+        var reader     = new CatLevelReader(reporter, game.ProcessId, timings.ReadTimeout);
+        var dutyReader = new CatDutyReader(reporter, game.ProcessId, timings.ReadTimeout);
 
         while (!cancellationToken.IsCancellationRequested && !game.HasExited)
         {
@@ -169,7 +219,9 @@ internal sealed class CatLevelWatch(ICatAutoEnterGame game, ICatLaunchReporter r
                 if (who.ContentId != reportedContentId)
                     ReportCharacter(who);
 
-                await reader.ReadAsync(game, who, cancellationToken).ConfigureAwait(false);
+                // 读等级超时了, 这一轮就不再读副本状态
+                if (await reader.ReadAsync(game, who, cancellationToken).ConfigureAwait(false))
+                    await dutyReader.ReadAsync(game, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -316,6 +368,28 @@ internal static partial class CatModuleReplies
             return null;
 
         return new LevelsReading(levels, OptionalInt(fields, "job"), OptionalInt(fields, "level"), Flag(fields, "synced"));
+    }
+
+    /// <summary>
+    ///     DUTY 的回应（<c>OK loaded=1 inDuty=1 flags=34,56</c>）: 在世界里时返回是否在副本中;
+    ///     没有载入角色（loaded=0）、回应不是 OK、或没带 inDuty（0 / 1 以外）返回 null = 不知道
+    /// </summary>
+    public static bool? ParseDuty(string response)
+    {
+        if (!IsOk(response))
+            return null;
+
+        var fields = ParseFields(FirstLine(response));
+
+        if (!Flag(fields, "loaded") || !fields.TryGetValue("inDuty", out var value))
+            return null;
+
+        return value switch
+        {
+            "1" => true,
+            "0" => false,
+            _   => null
+        };
     }
 
     private static int? OptionalInt(Dictionary<string, string> fields, string key) =>

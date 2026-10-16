@@ -5,8 +5,8 @@ using Xunit;
 namespace XIVLauncher.Test.CatHost;
 
 /// <summary>
-///     职业等级读数: 模块 LEVELS 回应的解析、不自动进入角色的游戏的观察循环
-///     （注入失败隔一段时间重试, 之后每 15 秒先 WHOAMI 再 LEVELS, 角色变了报 game.character, 管道被占跳过, 旧模块不再问, 读超时跳过这一轮）
+///     职业等级与副本状态读数: 模块 LEVELS / DUTY 回应的解析、不自动进入角色的游戏的观察循环
+///     （注入失败隔一段时间重试, 之后每 15 秒先 WHOAMI 再 LEVELS 再 DUTY, 角色变了报 game.character, 管道被占跳过, 旧模块不再问, 读超时跳过这一轮）
 /// </summary>
 public sealed class CatLevelWatchTests
 {
@@ -21,6 +21,10 @@ public sealed class CatLevelWatchTests
     private const string WHO_OTHER = "OK loaded=1 cid=40000000000000099 world=1042 home=1167 worldName=LaNuoXiYa homeName=LaNuoXiYa loggedIn=1 inZone=1 lobbyCid=40000000000000099 name=别的 角色";
 
     private const string WHO_NOBODY = "OK loaded=0 cid=0 world=0 home=0 worldName= homeName= loggedIn=0 inZone=0 lobbyCid=0 name=";
+
+    private const string DUTY_OUT = "OK loaded=1 inDuty=0 flags=";
+
+    private const string DUTY_IN = "OK loaded=1 inDuty=1 flags=34,56";
 
     [Fact]
     public void ParseLevels_ReadsTheWholeArray_AndTheCurrentJob()
@@ -66,6 +70,26 @@ public sealed class CatLevelWatchTests
     [Fact]
     public void ParseLevels_WithoutCount_StillReads() =>
         Assert.Equal([1, 2, 3], CatModuleReplies.ParseLevels("OK loaded=1 levels=1,2,3")!.Levels);
+
+    [Theory]
+    [InlineData("OK loaded=1 inDuty=1 flags=34", true)]
+    [InlineData("OK loaded=1 inDuty=1 flags=34,56,95", true)]
+    [InlineData("OK loaded=1 inDuty=0 flags=", false)]
+    [InlineData("OK loaded=1 inDuty=0", false)]
+    public void ParseDuty_InWorld_ReadsTheFlag(string response, bool inDuty) =>
+        Assert.Equal(inDuty, CatModuleReplies.ParseDuty(response));
+
+    [Theory]
+    [InlineData("OK loaded=0")]
+    [InlineData("OK loaded=0 inDuty=1 flags=34")]
+    [InlineData("OK loaded=1")]
+    [InlineData("OK loaded=1 inDuty=2 flags=")]
+    [InlineData("OK loaded=1 inDuty= flags=")]
+    [InlineData("FAIL bad-state")]
+    [InlineData("FAIL sigscan-failed:Conditions")]
+    [InlineData("FAIL unknown-command")]
+    public void ParseDuty_NotInWorldOrMalformed_IsUnknown(string response) =>
+        Assert.Null(CatModuleReplies.ParseDuty(response));
 
     [Fact]
     public async Task Watch_InconsistentReading_IsNotReported()
@@ -114,9 +138,10 @@ public sealed class CatLevelWatchTests
         await new CatLevelWatch(game, reporter).RunAsync(CancellationToken.None).WaitAsync(Timeout);
 
         Assert.Equal(1, game.Attaches);
-        // 第 1、3、4 次读了（先 WHOAMI 再 LEVELS）, 第 2 次管道被占着跳过, 第 5 次游戏退出
-        Assert.Equal(["WHOAMI", "LEVELS", "WHOAMI", "LEVELS", "WHOAMI", "LEVELS"], game.Commands);
+        // 第 1、3、4 次读了（先 WHOAMI 再 LEVELS 再 DUTY）, 第 2 次管道被占着跳过, 第 5 次游戏退出
+        Assert.Equal(["WHOAMI", "LEVELS", "DUTY", "WHOAMI", "LEVELS", "DUTY", "WHOAMI", "LEVELS", "DUTY"], game.Commands);
         Assert.Equal(3, reporter.LevelReports.Count);
+        Assert.Equal([(4242, false), (4242, false), (4242, false)], reporter.DutyReports);
         Assert.All(reporter.LevelReports, x => Assert.Equal(4242, x.Pid));
         Assert.All(reporter.LevelReports, x => Assert.Equal(new CatLevelsCharacter("七色花", "40000000000000017", 1167), x.Character));
         Assert.Equal(3, game.Releases);
@@ -188,7 +213,7 @@ public sealed class CatLevelWatchTests
     [Fact]
     public async Task Watch_OldModule_StopsAskingForLevels_ButKeepsWatchingTheCharacter()
     {
-        var game     = new FakeLevelGame { Levels = "FAIL unknown-command" };
+        var game     = new FakeLevelGame { Levels = "FAIL unknown-command", Duty = "FAIL unknown-command" };
         var reporter = new RecordingReporter();
         var ticks    = 0;
 
@@ -200,9 +225,102 @@ public sealed class CatLevelWatchTests
 
         await new CatLevelWatch(game, reporter).RunAsync(CancellationToken.None).WaitAsync(Timeout);
 
-        Assert.Equal(["WHOAMI", "LEVELS", "WHOAMI", "WHOAMI"], game.Commands);
+        Assert.Equal(["WHOAMI", "LEVELS", "DUTY", "WHOAMI", "WHOAMI"], game.Commands);
         Assert.Empty(reporter.LevelReports);
+        Assert.Empty(reporter.DutyReports);
         Assert.Single(reporter.EnteredCharacters);
+    }
+
+    [Fact]
+    public async Task Watch_ModuleWithoutDuty_StopsAskingForDuty_ButKeepsReadingLevels()
+    {
+        // 0.8.0 的模块: 认 LEVELS, 不认 DUTY
+        var game     = new FakeLevelGame { Duty = "FAIL unknown-command" };
+        var reporter = new RecordingReporter();
+        var ticks    = 0;
+
+        game.OnDelay = g =>
+        {
+            if (++ticks == 4)
+                g.HasExited = true;
+        };
+
+        await new CatLevelWatch(game, reporter).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(["WHOAMI", "LEVELS", "DUTY", "WHOAMI", "LEVELS", "WHOAMI", "LEVELS"], game.Commands);
+        Assert.Equal(3, reporter.LevelReports.Count);
+        Assert.Empty(reporter.DutyReports);
+    }
+
+    [Fact]
+    public async Task Watch_ReportsEveryDutyReading_AndSkipsUnknownOnes()
+    {
+        var game     = new FakeLevelGame { Duty = DUTY_OUT };
+        var reporter = new RecordingReporter();
+        var ticks    = 0;
+
+        // 第 1 轮不在副本, 第 2 轮在, 第 3 轮读歪了, 第 4 轮还没载入, 第 5 轮出来了
+        game.OnDelay = g =>
+        {
+            switch (++ticks)
+            {
+                case 2:
+                    g.Duty = DUTY_IN;
+                    break;
+
+                case 3:
+                    g.Duty = "FAIL bad-state";
+                    break;
+
+                case 4:
+                    g.Duty = "OK loaded=0";
+                    break;
+
+                case 5:
+                    g.Duty = DUTY_OUT;
+                    break;
+
+                case 6:
+                    g.HasExited = true;
+                    break;
+            }
+        };
+
+        await new CatLevelWatch(game, reporter).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        // 去重是任务单通道的事: 这里每读到一次就报一次, 读不到的不报
+        Assert.Equal([(4242, false), (4242, true), (4242, false)], reporter.DutyReports);
+        Assert.Equal(5, game.Commands.Count(x => x == "DUTY"));
+    }
+
+    [Fact]
+    public async Task Watch_SlowDuty_TimesOutAndIsAskedAgainNextTurn()
+    {
+        var game     = new FakeLevelGame { Hang = command => command == "DUTY" };
+        var reporter = new RecordingReporter();
+        var ticks    = 0;
+        var timings  = new CatAutoEnterTimings { ReadTimeout = TimeSpan.FromMilliseconds(100) };
+
+        game.OnDelay = g =>
+        {
+            switch (++ticks)
+            {
+                case 2:
+                    g.Hang = null;
+                    g.Duty = DUTY_IN;
+                    break;
+
+                case 3:
+                    g.HasExited = true;
+                    break;
+            }
+        };
+
+        await new CatLevelWatch(game, reporter, timings).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(["WHOAMI", "LEVELS", "DUTY", "WHOAMI", "LEVELS", "DUTY"], game.Commands);
+        Assert.Equal([(4242, true)], reporter.DutyReports);
+        Assert.Equal(2, game.Releases);
     }
 
     [Fact]
@@ -261,8 +379,8 @@ public sealed class CatLevelWatchTests
 
         await new CatLevelWatch(game, reporter, timings).RunAsync(CancellationToken.None).WaitAsync(Timeout);
 
-        // 第一次 LEVELS 卡住超时, 这一轮跳过（管道照样放开）; 第二次读到
-        Assert.Equal(["WHOAMI", "LEVELS", "WHOAMI", "LEVELS"], game.Commands);
+        // 第一次 LEVELS 卡住超时, 这一轮跳过、不再读 DUTY（管道照样放开）; 第二次读到
+        Assert.Equal(["WHOAMI", "LEVELS", "WHOAMI", "LEVELS", "DUTY"], game.Commands);
         Assert.Single(reporter.LevelReports);
         Assert.Equal(2, game.Releases);
     }
@@ -287,7 +405,7 @@ public sealed class CatLevelWatchTests
         Assert.Equal(TimeSpan.FromSeconds(60), game.Delays[0]);
         Assert.Equal(TimeSpan.FromSeconds(60), game.Delays[1]);
         Assert.Empty(reporter.Messages);
-        Assert.Equal(["WHOAMI", "LEVELS"], game.Commands);
+        Assert.Equal(["WHOAMI", "LEVELS", "DUTY"], game.Commands);
     }
 
     [Fact]
@@ -320,6 +438,8 @@ public sealed class CatLevelWatchTests
         public string WhoAmI { get; set; } = WHO_SEVEN;
 
         public string Levels { get; set; } = LEVELS_35;
+
+        public string Duty { get; set; } = DUTY_OUT;
 
         /// <summary>改写某条命令的回应（可抛异常）; 返回 null 用默认回应</summary>
         public Func<string, string?>? Intercept { get; set; }
@@ -370,6 +490,7 @@ public sealed class CatLevelWatchTests
             {
                 "WHOAMI" => WhoAmI,
                 "LEVELS" => Levels,
+                "DUTY"   => Duty,
                 _        => "FAIL unknown-command"
             };
         }

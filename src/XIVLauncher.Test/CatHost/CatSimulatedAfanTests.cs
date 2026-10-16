@@ -48,6 +48,12 @@ public sealed class CatSimulatedAfanTests : IDisposable
     private int[][] Levels() =>
         events.Where(x => x.Method == CatJobChannel.LEVELS_EVENT).Select(x => x.Params["levels"]!.AsArray().Select(v => v!.GetValue<int>()).ToArray()).ToArray();
 
+    private bool[] Duty() =>
+        events.Where(x => x.Method == CatJobChannel.DUTY_EVENT).Select(x => x.Params["inDuty"]!.GetValue<bool>()).ToArray();
+
+    private string[] States() =>
+        Reports().Select(x => x["state"]!.GetValue<string>()).ToArray();
+
     /// <summary>推进到 done 或步数用完, 每步间隔 1 秒（不触发心跳）</summary>
     private static DateTime Run(CatSimulatedAfan afan, DateTime start, int steps)
     {
@@ -271,6 +277,79 @@ public sealed class CatSimulatedAfanTests : IDisposable
     }
 
     [Fact]
+    public void Duty_GoesInAndOutWhileRunning_AndIsOutOnceDone()
+    {
+        channel.SetJob(CatJobChannelTests.Job(3));
+        Run(NewAfan(), DateTime.UtcNow, 30);
+
+        // waiting → 驯兽师 3 步（一把两步 + 一步在外）→ 金碟币 → done; 有变化才发
+        Assert.Equal([false, true, false, true, false, true, false], Duty());
+
+        var first = events.First(x => x.Method == CatJobChannel.DUTY_EVENT).Params;
+        Assert.Equal(PID, first["pid"]!.GetValue<int>());
+        Assert.Equal("op-1", first["operationId"]!.GetValue<string>());
+        Assert.Matches(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$", first["at"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Duty_WithoutJobOrWhilePaused_IsOut()
+    {
+        Run(NewAfan(), DateTime.UtcNow, 3);
+        Assert.Equal([false], Duty());
+
+        channel.SetJob(CatJobChannelTests.Job(3, desired: "pause"));
+        Run(NewAfan(), DateTime.UtcNow, 3);
+        Assert.Equal([false], Duty());
+    }
+
+    [Fact]
+    public void AlwaysInDuty_StaysInWhateverTheJobDoes()
+    {
+        channel.SetJob(CatJobChannelTests.Job(3));
+        var afan = new CatSimulatedAfan(channel, PID, CatSimulatedAfan.Behavior.Normal, Entered) { ShotsDirectory = shots, SeqStart = 0, AlwaysInDuty = true };
+
+        Run(afan, DateTime.UtcNow, 30);
+
+        Assert.Equal([true], Duty());
+        Assert.Equal("done", States()[^1]);
+    }
+
+    [Fact]
+    public void Finish_InTheMiddleOfARound_FinishesThatRoundThenStops()
+    {
+        channel.SetJob(CatJobChannelTests.Job(3));
+        var afan = NewAfan();
+        var now  = Run(afan, DateTime.UtcNow, 2);
+
+        Assert.Equal([false, true], Duty());
+
+        // 这一把还差一步: 再走一步（仍在副本中）, 走完出来, 然后停下
+        channel.SetJob(CatJobChannelTests.Job(4, desired: "finish"));
+        now = Run(afan, now, 1);
+        Assert.Equal("running", States()[^1]);
+        Assert.Equal([false, true], Duty());
+
+        now = Run(afan, now, 1);
+        Assert.Equal("running", States()[^1]);
+        Assert.Equal([false, true, false], Duty());
+
+        Run(afan, now, 3);
+        Assert.Equal(["waiting", "running", "running", "running", "stopped"], States());
+        Assert.Equal([false, true, false], Duty());
+        Assert.Equal(27L, Reports()[^1]["items"]![0]!["current"]!.GetValue<long>());
+    }
+
+    [Fact]
+    public void Finish_OutsideARound_StopsRightAway()
+    {
+        channel.SetJob(CatJobChannelTests.Job(3, desired: "finish"));
+        Run(NewAfan(), DateTime.UtcNow, 4);
+
+        Assert.Equal(["waiting", "stopped"], States());
+        Assert.Equal([false], Duty());
+    }
+
+    [Fact]
     public void ExpArrayIndex_MatchesTheChineseClient()
     {
         Assert.Equal(32, CatSimulatedAfan.ExpArrayIndex[43]); // 驯兽师
@@ -346,7 +425,58 @@ public sealed class CatSimulatedAfanTests : IDisposable
         Wait(received, "game.exited");
         Assert.Equal(0, await host.Completion.WaitAsync(Timeout));
         Assert.False(File.Exists(portFile));
-        Assert.True(received.All(x => x.Method != CatJobChannel.PROGRESS_EVENT));
+        Assert.True(received.All(x => x.Method is not (CatJobChannel.PROGRESS_EVENT or CatJobChannel.LEVELS_EVENT or CatJobChannel.DUTY_EVENT)));
+    }
+
+    [Fact]
+    public async Task SimulatedRunner_InDutyPrefix_StaysInDuty_AndCombinesWithTheJobPrefixes()
+    {
+        var received = new BlockingCollection<(string Method, JsonNode Params)>();
+        var duty     = new ConcurrentQueue<bool>();
+        var runner = new CatSimulatedGameRunner
+        {
+            StepDelay         = TimeSpan.FromMilliseconds(10),
+            AfanStep          = TimeSpan.FromMilliseconds(30),
+            ShotsDirectory    = shots,
+            PortFileDirectory = Path.Combine(shots, "ports")
+        };
+        var host = new CatLaunchHost
+        (
+            runner,
+            (method, parameters) =>
+            {
+                var node = JsonNode.Parse(JsonSerializer.Serialize(parameters, CatProtocol.JsonOptions))!;
+
+                if (method == CatJobChannel.DUTY_EVENT)
+                    duty.Enqueue(node["inDuty"]!.GetValue<bool>());
+
+                received.Add((method, node));
+                return Task.CompletedTask;
+            },
+            new CatLogRedactor()
+        );
+
+        Assert.True(host.Launch(new CatLaunchParams("op-1", CatSimulatedGameRunner.IN_DUTY_PREFIX + CatSimulatedGameRunner.JOB_BLOCKED_PREFIX + "acc", false, null)).Accepted);
+
+        var job = JsonDocument.Parse(JsonSerializer.Serialize(new { job = CatJobChannelTests.Job(1) })).RootElement.Clone();
+        Assert.True(((CatSetJobResult)(await host.HandleAsync(CatJobChannel.METHOD, job, CancellationToken.None))!).Accepted);
+
+        var pid   = Wait(received, "game.started")["pid"]!.GetValue<int>();
+        var first = Wait(received, CatJobChannel.DUTY_EVENT);
+
+        Assert.True(first["inDuty"]!.GetValue<bool>());
+        Assert.Equal(pid, first["pid"]!.GetValue<int>());
+        Assert.Equal("op-1", first["operationId"]!.GetValue<string>());
+
+        // blocked: 照样生效
+        Wait(received, CatJobChannel.PROGRESS_EVENT, x => x["state"]!.GetValue<string>() == "blocked");
+
+        using (var placeholder = Process.GetProcessById(pid))
+            placeholder.Kill();
+
+        Wait(received, "game.exited");
+        Assert.Equal(0, await host.Completion.WaitAsync(Timeout));
+        Assert.Equal([true], duty);
     }
 
     private static JsonNode Wait(BlockingCollection<(string Method, JsonNode Params)> received, string method, Func<JsonNode, bool>? match = null)

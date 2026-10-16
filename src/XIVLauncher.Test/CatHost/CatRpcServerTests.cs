@@ -1288,6 +1288,29 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Fact]
+    public async Task Buffer_KeepsOnlyTheLatestDuty_AlongsideTheLatestLevels()
+    {
+        await server.NotifyAsync("game.started", new { pid = 1 });
+        await server.NotifyAsync(CatJobChannel.DUTY_EVENT, new { pid = 1, inDuty = false, at = "2026-10-16T14:00:00.000Z" });
+        await server.NotifyAsync(CatJobChannel.LEVELS_EVENT, new { pid = 1, levels = new[] { 1 } });
+        await server.NotifyAsync(CatJobChannel.DUTY_EVENT, new { pid = 1, inDuty = true, at = "2026-10-16T14:00:15.000Z" });
+        await server.NotifyAsync(CatJobChannel.LEVELS_EVENT, new { pid = 1, levels = new[] { 2 } });
+        await server.NotifyAsync(CatJobChannel.DUTY_EVENT, new { pid = 1, inDuty = false, at = "2026-10-16T14:00:30.000Z" });
+        await server.NotifyAsync("game.exited", new { pid = 1 });
+
+        Assert.Equal(4, server.BufferedEventCount);
+
+        await using var client = await ConnectAndHelloAsync();
+        var seen = new List<(string Method, JsonNode? Params)>();
+        client.WaitForEvent("game.exited", Timeout, seen);
+
+        Assert.Equal(["game.started", CatJobChannel.LEVELS_EVENT, CatJobChannel.DUTY_EVENT, "game.exited"], seen.Select(x => x.Method));
+        Assert.Equal(2, seen[1].Params!["levels"]![0]!.GetValue<int>());
+        Assert.False(seen[2].Params!["inDuty"]!.GetValue<bool>());
+        Assert.Equal("2026-10-16T14:00:30.000Z", seen[2].Params!["at"]!.GetValue<string>());
+    }
+
+    [Fact]
     public async Task Host_DoesNotBlockReporter_WhenPublishingHangs()
     {
         var never = new TaskCompletionSource();

@@ -463,14 +463,14 @@ public sealed class CatRpcServer : IDisposable
 
     private void Buffer(string method, byte[] frame)
     {
-        // 等级读数只有最新一条有用: 新的进来就去掉缓存里旧的
-        if (method == CatJobChannel.LEVELS_EVENT)
+        // 等级读数与副本状态都只有最新一条有用: 新的进来就去掉缓存里同一类的旧的
+        if (method is CatJobChannel.LEVELS_EVENT or CatJobChannel.DUTY_EVENT)
         {
             for (var node = bufferedEvents.First; node != null;)
             {
                 var next = node.Next;
 
-                if (node.Value.Method == CatJobChannel.LEVELS_EVENT)
+                if (node.Value.Method == method)
                     bufferedEvents.Remove(node);
 
                 node = next;
@@ -500,14 +500,14 @@ public sealed class CatRpcServer : IDisposable
     }
 
     /// <summary>
-    ///     缓存满时先丢谁（小的先丢, 同级丢最旧的）: 日志 → 不带截图的进度回报 → 等级读数 → 带截图的进度回报（丢了截图就传不上去）→ 其它（阶段、起停、退出等）
+    ///     缓存满时先丢谁（小的先丢, 同级丢最旧的）: 日志 → 不带截图的进度回报 → 等级读数与副本状态 → 带截图的进度回报（丢了截图就传不上去）→ 其它（阶段、起停、退出等）
     /// </summary>
     private static int EvictionRank(string method, byte[] frame) =>
         method switch
         {
             LOG_EVENT_METHOD                                                     => 0,
             CatJobChannel.PROGRESS_EVENT when frame.AsSpan().IndexOf("\"shots\""u8) < 0 => 1,
-            CatJobChannel.LEVELS_EVENT                                           => 2,
+            CatJobChannel.LEVELS_EVENT or CatJobChannel.DUTY_EVENT               => 2,
             CatJobChannel.PROGRESS_EVENT                                         => 3,
             _                                                                    => 4
         };

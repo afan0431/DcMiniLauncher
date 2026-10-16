@@ -785,6 +785,36 @@ public sealed class CatAutoEnterTests
     }
 
     [Fact]
+    public async Task Observe_ReadsDutyAfterLevels_AndStopsAskingAModuleWithoutIt()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null));
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+        Assert.DoesNotContain("DUTY", game.Commands);
+
+        var ticks = 0;
+        game.Intercept = command => command switch
+        {
+            "LEVELS" => "OK loaded=1 n=3 levels=90,80,0",
+            "DUTY"   => ticks < 4 ? (ticks == 2 ? "OK loaded=1 inDuty=1 flags=34" : "OK loaded=1 inDuty=0 flags=") : "FAIL unknown-command",
+            _        => null
+        };
+        game.OnDelay = g =>
+        {
+            if (++ticks == 6)
+                g.HasExited = true;
+        };
+
+        await flow.ObserveAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal([false, true, false], reporter.DutyReports.Select(x => x.InDuty));
+        // 第 4 次回 unknown-command 之后不再问; 每次都排在 LEVELS 之后
+        Assert.Equal(4, game.Commands.Count(x => x == "DUTY"));
+        Assert.All(game.Commands.Select((x, i) => (x, i)).Where(x => x.x == "DUTY"), x => Assert.Equal("LEVELS", game.Commands[x.i - 1]));
+    }
+
+    [Fact]
     public async Task Observe_AfterAStop_ReportsTheCharacterOnceSomeoneEntersByHand()
     {
         var (game, reporter) = Setup(Chara("11", "小白"));

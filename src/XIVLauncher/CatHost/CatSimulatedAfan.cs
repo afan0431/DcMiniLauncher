@@ -8,7 +8,8 @@ namespace XIVLauncher.CatHost;
 /// <summary>
 ///     模拟模式里的游戏内 Afan（供 Cat 不开游戏联调上号自动开工）: 每一步按当前任务单推进一次, 回报经
 ///     <see cref="CatJobChannel.PostProgress" />（与真 Afan 的 <c>POST /cat/progress</c> 同一条路, 一样校验、去重、发 game.jobProgress）,
-///     职业等级经 <see cref="CatJobChannel.ReportLevels" />（有变化才发 game.levels）。规则见 <see cref="CatSimulatedGameRunner" />。
+///     职业等级经 <see cref="CatJobChannel.ReportLevels" />（有变化才发 game.levels）, 是否在副本中经 <see cref="CatJobChannel.ReportDuty" />
+///     （有变化才发 game.duty; 真实启动时这两样由小模块读, 模拟里一起在这里产生）。规则见 <see cref="CatSimulatedGameRunner" />。
 /// </summary>
 internal sealed class CatSimulatedAfan
 {
@@ -37,6 +38,9 @@ internal sealed class CatSimulatedAfan
     /// <summary>回报里的 afan 版本号</summary>
     public const string VERSION = "sim";
 
+    /// <summary>模拟的"一把"（在副本中）有几步; 两把之间隔一步不在副本中</summary>
+    public const int DUTY_ROUND_STEPS = 2;
+
     /// <summary>ClassJob 表行号 → ExpArrayIndex（国服表, 见 <see cref="CatClassJobs.ExpArrayIndex" />）</summary>
     public static IReadOnlyDictionary<int, int> ExpArrayIndex => CatClassJobs.ExpArrayIndex;
 
@@ -60,6 +64,8 @@ internal sealed class CatSimulatedAfan
     private bool      unsupportedReported;
     private string?   lastFingerprint;
     private DateTime  lastSentAt = DateTime.MinValue;
+    private bool      inRound;
+    private int       roundSteps;
 
     /// <summary>
     ///     创建
@@ -84,6 +90,9 @@ internal sealed class CatSimulatedAfan
 
     /// <summary>模拟截图写到哪里（要与任务单通道的 <see cref="CatJobChannel.ShotsDirectory" /> 一致, 否则回报被拒）</summary>
     public string ShotsDirectory { get; init; } = CatShots.Directory;
+
+    /// <summary>副本状态一直报"在副本中"（账号名前缀 <c>induty:</c>）; 任务单的推进照常</summary>
+    public bool AlwaysInDuty { get; init; }
 
     /// <summary>第一条回报的 seq 减 1（测试用; 默认是创建时的 Unix 毫秒）</summary>
     public long SeqStart
@@ -113,7 +122,7 @@ internal sealed class CatSimulatedAfan
     }
 
     /// <summary>
-    ///     推进一步: 按任务单推进并在有变化（或到了心跳时间）时回报一次, 再按推进后的进度报等级
+    ///     推进一步: 按任务单推进并在有变化（或到了心跳时间）时回报一次, 再按推进后的进度报等级与是否在副本中
     /// </summary>
     internal void Tick(DateTime nowUtc)
     {
@@ -127,13 +136,32 @@ internal sealed class CatSimulatedAfan
 
         if (behavior != Behavior.Manual)
         {
-            var (state, reason, active, shots) = Advance(job);
+            var (state, reason, active, shots, progressed) = Advance(job);
+            UpdateRound(state, progressed);
             Send(job, state, reason, active, shots, nowUtc);
         }
 
         // 模拟里没有服务器 Id: 原始服务器 Id 取任务单里的（没有为 0）
         var homeWorldId = (job?.Character as JsonObject)?["homeWorldId"] is JsonValue id && id.TryGetValue(out int value) ? value : 0;
         jobs.ReportLevels(pid, new CatLevelsCharacter(character.Name, character.ContentId, homeWorldId), Levels(job));
+        jobs.ReportDuty(pid, AlwaysInDuty || inRound, nowUtc);
+    }
+
+    /// <summary>
+    ///     模拟"一把": 例程进行中（running 且这一步有进展）每 <see cref="DUTY_ROUND_STEPS" /> 步为一把、在副本中, 两把之间隔一步不在副本中;
+    ///     其它状态（等待、暂停、停下、blocked、做完等）都不在副本中, 下次开工从新的一把算起
+    /// </summary>
+    private void UpdateRound(string state, bool progressed)
+    {
+        if (state != "running" || !progressed)
+        {
+            inRound    = false;
+            roundSteps = 0;
+            return;
+        }
+
+        roundSteps++;
+        inRound = roundSteps % (DUTY_ROUND_STEPS + 1) != 0;
     }
 
     /// <summary>任务单里练级项的当前等级填进 35 项数组（按 ExpArrayIndex）, 其余为 0; 没有任务单时用 <see cref="SampleLevels" /></summary>
@@ -181,45 +209,50 @@ internal sealed class CatSimulatedAfan
             progress.Remove(removed);
     }
 
-    private (string State, JsonObject? Reason, string? Active, List<(string ItemId, string Kind)> Shots) Advance(SimJob? job)
+    /// <summary>推进一步; progressed = 这一步有没有让某一项往前走</summary>
+    private (string State, JsonObject? Reason, string? Active, List<(string ItemId, string Kind)> Shots, bool Progressed) Advance(SimJob? job)
     {
         var shots = new List<(string, string)>();
 
         if (job == null)
-            return ("waiting", null, null, shots);
+            return ("waiting", null, null, shots, false);
 
         // 进世界后先核对角色: 第一步只报 waiting
         if (!characterChecked)
         {
             characterChecked = true;
-            return ("waiting", null, null, shots);
+            return ("waiting", null, null, shots, false);
         }
 
         // 角色不符: 什么也不做, 一直报 mismatch（text 写进的是哪个角色）
         if (behavior == Behavior.Mismatch)
-            return ("mismatch", Reason("error", Short($"进的是{character.Name}")), null, shots);
+            return ("mismatch", Reason("error", Short($"进的是{character.Name}")), null, shots, false);
 
         if (blockedAtRevision is { } blockedRevision)
         {
             if (job.Revision <= blockedRevision)
-                return ("blocked", Reason("noProgress", "30 分钟没有进展"), FirstPending(job)?.ItemId, shots);
+                return ("blocked", Reason("noProgress", "30 分钟没有进展"), FirstPending(job)?.ItemId, shots, false);
 
             blockedAtRevision = null;
         }
 
         if (job.Desired == "pause")
-            return ("paused", null, FirstPending(job)?.ItemId, shots);
+            return ("paused", null, FirstPending(job)?.ItemId, shots, false);
 
         if (job.Desired == "stop")
-            return ("stopped", null, null, shots);
+            return ("stopped", null, null, shots, false);
 
         if (!job.Items.Any(x => x.Routine != null))
-            return ("idle", null, null, shots);
+            return ("idle", null, null, shots, false);
 
         var active = FirstPending(job);
 
         if (active == null)
-            return ("done", null, null, shots);
+            return ("done", null, null, shots, false);
+
+        // 做完这一把就停: 正在一把里时接着走完这一把, 不在一把里（或这一把走完了）就停下
+        if (job.Desired == "finish" && !inRound)
+            return ("stopped", null, null, shots, false);
 
         var local = progress[active.ItemId];
 
@@ -228,14 +261,14 @@ internal sealed class CatSimulatedAfan
         {
             unsupportedReported = true;
             local.Skipped       = true;
-            return ("blocked", Reason("unsupported", Short($"不认识例程 {active.Routine}")), active.ItemId, shots);
+            return ("blocked", Reason("unsupported", Short($"不认识例程 {active.Routine}")), active.ItemId, shots, false);
         }
 
         if (behavior == Behavior.Blocked && !blockedOnce && local.Steps >= 2)
         {
             blockedOnce       = true;
             blockedAtRevision = job.Revision;
-            return ("blocked", Reason("noProgress", "30 分钟没有进展"), active.ItemId, shots);
+            return ("blocked", Reason("noProgress", "30 分钟没有进展"), active.ItemId, shots, false);
         }
 
         local.Steps++;
@@ -259,7 +292,7 @@ internal sealed class CatSimulatedAfan
         if (local.Done && job.CompletionShots)
             shots.Add((active.ItemId, "completion"));
 
-        return FirstPending(job) == null ? ("done", null, null, shots) : ("running", null, FirstPending(job)!.ItemId, shots);
+        return FirstPending(job) == null ? ("done", null, null, shots, true) : ("running", null, FirstPending(job)!.ItemId, shots, true);
     }
 
     /// <summary>按 order 第一个还没做完（也没被跳过）的可自动做的项</summary>
