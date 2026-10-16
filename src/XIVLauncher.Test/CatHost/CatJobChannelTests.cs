@@ -313,7 +313,7 @@ public sealed class CatJobChannelTests
         var channel = NewChannel();
         channel.GameStarted(1234);
 
-        // 开工图: 练级两项共用一张、金碟币与声誉共用一张; 文件名里的数字不必是这条回报的 seq
+        // 开工图: 练级两项（都是战斗职业）共用一张、金碟币与声誉共用一张; 文件名里的数字不必是这条回报的 seq
         const long seq    = 1797000000002;
         var        jobs   = JsonSerializer.Serialize(Path.Combine(ShotsDirectory, "1234-1797000000000.png"));
         var        wallet = JsonSerializer.Serialize(Path.Combine(ShotsDirectory, "1234-1797000000001.png"));

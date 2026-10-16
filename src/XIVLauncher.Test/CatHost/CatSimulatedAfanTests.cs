@@ -143,7 +143,7 @@ public sealed class CatSimulatedAfanTests : IDisposable
         Assert.Equal(["a", "b", "d", "e"], first["items"]!.AsArray().Select(x => x!["itemId"]!.GetValue<string>()));
         Assert.Equal([18L, 35L, 0L], first["items"]!.AsArray().Take(3).Select(x => x!["current"]!.GetValue<long>()));
 
-        // 练级两项（含人做的骑士）共用一张, 金碟币与声誉共用一张; 勾选类、主线和 startShot 为 false 的不拍
+        // 练级两项（驯兽师与人做的骑士, 都是战斗职业）共用一张, 金碟币与声誉共用一张; 勾选类、主线和 startShot 为 false 的不拍
         var shots = first["shots"]!.AsArray();
         Assert.Equal(["a", "b", "c", "d"], shots.Select(x => x!["itemId"]!.GetValue<string>()));
         Assert.All(shots, x => Assert.Equal("start", x!["kind"]!.GetValue<string>()));
@@ -222,7 +222,7 @@ public sealed class CatSimulatedAfanTests : IDisposable
     [Fact]
     public void StartShots_NoAutoItems_GoInTheFirstIdleReport_ThenIdleHeartbeatsWithout()
     {
-        // 只有人做的项: 骑士、白魔法师为练级（共用一张）, 主线不知道开哪个界面（不拍）
+        // 只有人做的项: 骑士、白魔法师为战斗职业练级（共用一张）, 主线不知道开哪个界面（不拍）
         channel.SetJob(JobWithItems(["c", "f", "g"], x => x["startShot"] = true));
         var afan = NewAfan();
         var now  = Run(afan, DateTime.UtcNow, 3);
@@ -283,16 +283,55 @@ public sealed class CatSimulatedAfanTests : IDisposable
         Assert.Equal("start", shot["kind"]!.GetValue<string>());
     }
 
+    [Fact]
+    public void StartShots_CombatAndCraftLeveling_OnePictureEach_OnTheirOwnItems()
+    {
+        // 骑士（战斗）与刻木匠（生产采集, ClassJob 8）同一单: 战斗职业小页一张、制作&采集职业小页一张
+        channel.SetJob
+        (
+            JobWithItems
+            (
+                ["c", "g"],
+                x =>
+                {
+                    x["startShot"] = true;
+
+                    if (x["itemId"]!.GetValue<string>() != "g")
+                        return;
+
+                    x["title"]      = "刻木匠";
+                    x["classJobId"] = 8;
+                }
+            )
+        );
+        Run(NewAfan(), DateTime.UtcNow, 3);
+
+        Assert.Equal(["waiting", "idle"], States());
+
+        var shots = Reports()[1]["shots"]!.AsArray();
+        Assert.Equal(["c", "g"], shots.Select(x => x!["itemId"]!.GetValue<string>()));
+        Assert.All(shots, x => Assert.Equal("start", x!["kind"]!.GetValue<string>()));
+
+        var files = shots.Select(x => x!["file"]!.GetValue<string>()).ToArray();
+        Assert.NotEqual(files[0], files[1]);
+        Assert.All(files, x => Assert.True(new FileInfo(x).Length > 100));
+    }
+
     [Theory]
-    [InlineData("leveling", "bst-level", "jobs")]
-    [InlineData("leveling", null, "jobs")]
-    [InlineData("collect", "mgp", "currency")]
-    [InlineData("collect", "fallguys-rep", "currency")]
-    [InlineData("periodic", "allsaints-2026", null)]
-    [InlineData("msq", null, null)]
-    [InlineData("other", null, null)]
-    public void StartShotScreen_LevelingTogether_MgpAndFallGuysTogether_OthersNone(string kind, string? routine, string? screen) =>
-        Assert.Equal(screen, CatSimulatedAfan.StartShotScreen(kind, routine));
+    [InlineData("leveling", 43, "bst-level", "jobs-combat")]
+    [InlineData("leveling", 19, null, "jobs-combat")]
+    [InlineData("leveling", null, null, "jobs-combat")]
+    [InlineData("leveling", 7, null, "jobs-combat")]
+    [InlineData("leveling", 8, null, "jobs-craft")]
+    [InlineData("leveling", 15, null, "jobs-craft")]
+    [InlineData("leveling", 18, null, "jobs-craft")]
+    [InlineData("collect", null, "mgp", "currency")]
+    [InlineData("collect", null, "fallguys-rep", "currency")]
+    [InlineData("periodic", null, "allsaints-2026", null)]
+    [InlineData("msq", null, null, null)]
+    [InlineData("other", null, null, null)]
+    public void StartShotScreen_LevelingByCombatOrCraft_MgpAndFallGuysTogether_OthersNone(string kind, int? classJobId, string? routine, string? screen) =>
+        Assert.Equal(screen, CatSimulatedAfan.StartShotScreen(kind, classJobId, routine));
 
     [Fact]
     public void Heartbeat_ResendsTheSameStateAfterTheInterval()

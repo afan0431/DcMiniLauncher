@@ -345,7 +345,7 @@ internal sealed class CatSimulatedAfan
 
         foreach (var item in job.Items.Where(x => x.StartShot).OrderBy(x => x.Order))
         {
-            if (StartShotScreen(item.Kind, item.Routine) is { } screen)
+            if (StartShotScreen(item.Kind, item.ClassJobId, item.Routine) is { } screen)
                 shots.Add(new SimShot(item.ItemId, "start", $"start:{screen}"));
         }
 
@@ -353,11 +353,17 @@ internal sealed class CatSimulatedAfan
     }
 
     /// <summary>
-    ///     开工图打开哪组界面: 练级项（含 routine 为 null 的）= 职业页 <c>jobs</c>; 金碟币、糖豆人声誉 = 冒险者铭牌 + 货币一览 <c>currency</c>;
-    ///     其余（勾选类、不知道该开哪个界面的）不拍, 为 null
+    ///     开工图打开哪组界面: 练级项（含 routine 为 null 的）按职业分两组, 生产采集职业（ClassJob 行号 8–18, 刻木匠 … 捕鱼人）=
+    ///     职业页的"制作&amp;采集职业"小页 <c>jobs-craft</c>, 其余（含 classJobId 为 null 的）= "战斗职业&amp;特职"小页 <c>jobs-combat</c>;
+    ///     金碟币、糖豆人声誉 = 冒险者铭牌 + 货币一览 <c>currency</c>; 其余（勾选类、不知道该开哪个界面的）不拍, 为 null
     /// </summary>
-    internal static string? StartShotScreen(string? kind, string? routine) =>
-        kind == "leveling" ? "jobs" : routine is "mgp" or "fallguys-rep" ? "currency" : null;
+    internal static string? StartShotScreen(string? kind, int? classJobId, string? routine) =>
+        (kind, routine) switch
+        {
+            ("leveling", _)              => classJobId is >= 8 and <= 18 ? "jobs-craft" : "jobs-combat",
+            (_, "mgp" or "fallguys-rep") => "currency",
+            _                            => null
+        };
 
     /// <summary>按 order 第一个还没做完（也没被跳过）的可自动做的项</summary>
     private SimItem? FirstPending(SimJob job) =>
