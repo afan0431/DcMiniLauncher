@@ -2231,9 +2231,12 @@ namespace
 
     struct LevelsData
     {
-        int   status; // 1=正常 -1=异常 -2=PlayerState 读歪
-        int   loaded;
-        short levels[offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT];
+        int           status; // 1=正常 -1=异常 -2=PlayerState 读歪
+        int           loaded;
+        unsigned char classJob;
+        short         level;
+        int           synced;
+        short         levels[offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT];
     };
 
     void OpLevels(LevelsData* out)
@@ -2252,11 +2255,14 @@ namespace
                 return;
             }
 
-            if (loaded == 0)
+            // 与 WHOAMI 同一判据: 读盘中途 ContentId 还是 0 时当作还没载入
+            if (loaded == 0 || ReadAt<unsigned long long>(state, offsets::PLAYER_STATE_CONTENT_ID) == 0)
             {
                 out->status = 1;
                 return;
             }
+
+            bool any = false;
 
             for (int i = 0; i < offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT; i++)
             {
@@ -2269,9 +2275,15 @@ namespace
                 }
 
                 out->levels[i] = level;
+                any            = any || level != 0;
             }
 
-            out->loaded = 1;
+            out->classJob = ReadAt<unsigned char>(state, offsets::PLAYER_STATE_CURRENT_CLASS_JOB);
+            out->level    = ReadAt<short>(state, offsets::PLAYER_STATE_CURRENT_LEVEL);
+            out->synced   = ReadAt<unsigned char>(state, offsets::PLAYER_STATE_IS_LEVEL_SYNCED) != 0 ? 1 : 0;
+
+            // 全为 0 = 等级数据还没到（刚进世界的那一刻）, 按还没载入回
+            out->loaded = any ? 1 : 0;
             out->status = 1;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -2523,8 +2535,9 @@ std::string GameWhoAmI()
 }
 
 // 全部职业等级, 只读。响应只有一行:
-//   OK loaded=<0|1> n=<个数> levels=<逗号分隔的等级>
-// 下标为 ClassJob 表的 ExpArrayIndex, 未解锁为 0; loaded=0（不在世界里）时 n=0、levels 为空。
+//   OK loaded=<0|1> job=<当前 ClassJob> level=<当前等级> synced=<0|1 等级同步中> n=<个数> levels=<逗号分隔的等级>
+// job / level / synced 给启动器核对数组有没有读错位（levels[ExpArrayIndex(job)] 应等于 level, 同步中不比）。
+// 下标为 ClassJob 表的 ExpArrayIndex, 未解锁为 0; loaded=0（不在世界里、ContentId 还是 0、或等级全为 0）时 n=0、levels 为空。
 std::string GameLevels()
 {
     if (!GameResolve())
@@ -2548,7 +2561,9 @@ std::string GameLevels()
     if (data->loaded == 0)
         return "OK loaded=0 n=0 levels=";
 
-    std::string response = "OK loaded=1 n=" + std::to_string(offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT) + " levels=";
+    std::string response = "OK loaded=1 job=" + std::to_string(data->classJob) + " level=" + std::to_string(data->level) +
+                           " synced=" + std::to_string(data->synced) +
+                           " n=" + std::to_string(offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT) + " levels=";
 
     for (int i = 0; i < offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT; i++)
     {

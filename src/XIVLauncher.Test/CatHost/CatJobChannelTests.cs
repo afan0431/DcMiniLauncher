@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.IO;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using XIVLauncher.CatHost;
@@ -16,8 +17,18 @@ public sealed class CatJobChannelTests
     private readonly ConcurrentQueue<(string Method, string Json)> events = new();
     private string? operationId = OPERATION;
 
-    private CatJobChannel NewChannel() =>
-        new(() => operationId, (method, parameters) => events.Enqueue((method, JsonSerializer.Serialize(parameters, CatProtocol.JsonOptions))));
+    /// <summary>截图目录（只用来比对路径, 不用真的存在）</summary>
+    internal static readonly string ShotsDirectory = Path.Combine(Path.GetTempPath(), "dml-cat-shots-for-tests");
+
+    private CatJobChannel NewChannel(TimeSpan? minInterval = null) =>
+        new(() => operationId, (method, parameters) => events.Enqueue((method, JsonSerializer.Serialize(parameters, CatProtocol.JsonOptions))))
+        {
+            ShotsDirectory      = ShotsDirectory,
+            MinProgressInterval = minInterval ?? TimeSpan.Zero
+        };
+
+    internal static string ProgressWithShot(int pid, long seq, string file, string kind = "completion") =>
+        Progress(pid, seq).TrimEnd()[..^1] + $$""","shots":[{"itemId":"a","kind":"{{kind}}","file":{{JsonSerializer.Serialize(file)}},"at":"2026-10-16T14:02:11Z"}]}""";
 
     internal static JsonElement Job(long revision, string sessionId = OPERATION, string schema = CatJobChannel.JOB_SCHEMA, string desired = "run") =>
         JsonDocument.Parse
@@ -182,6 +193,203 @@ public sealed class CatJobChannelTests
         Assert.Equal(2, events.Count(x => x.Method == CatJobChannel.PROGRESS_EVENT));
     }
 
+    [Fact]
+    public void PostProgress_SeqNotAboveTheLargestSeen_IsNotPublishedAgain()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        // Afan 以加载时的毫秒时间为起点: 数很大, 只增不减
+        Assert.Equal(200, channel.PostProgress(Progress(1234, 1760600000000)).StatusCode);
+        Assert.Equal(200, channel.PostProgress(Progress(1234, 1760600000002)).StatusCode);
+        Assert.Equal(200, channel.PostProgress(Progress(1234, 1760600000001)).StatusCode);
+        Assert.Equal(200, channel.PostProgress(Progress(1234, 1760600000002)).StatusCode);
+        Assert.Equal(200, channel.PostProgress(Progress(1234, 1760600000003)).StatusCode);
+
+        Assert.Equal
+        (
+            [1760600000000L, 1760600000002L, 1760600000003L],
+            events.Where(x => x.Method == CatJobChannel.PROGRESS_EVENT).Select(x => JsonNode.Parse(x.Json)!["seq"]!.GetValue<long>())
+        );
+    }
+
+    [Fact]
+    public void PostProgress_AfterTheGameEnded_IsNotPublished()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+        channel.GameEnded(1234);
+
+        Assert.Equal(404, channel.PostProgress(Progress(1234, 1)).StatusCode);
+        Assert.Empty(events);
+    }
+
+    [Fact]
+    public void PostProgress_UnixMillisecondSeq_StaysLongAllTheWay()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        // Afan 的 seq 以加载时的 Unix 毫秒为起点: 13 位, 超出 int32; 截图文件名里的 seq 也是它
+        const long seq  = 1797000000000;
+        var        file = Path.Combine(ShotsDirectory, $"1234-{seq}.png");
+
+        Assert.Equal(200, channel.PostProgress(ProgressWithShot(1234, seq, file)).StatusCode);
+        Assert.Equal(200, channel.PostProgress(Progress(1234, seq + 1)).StatusCode);
+        Assert.Equal(200, channel.PostProgress(Progress(1234, seq)).StatusCode);
+
+        var published = events.Where(x => x.Method == CatJobChannel.PROGRESS_EVENT).Select(x => JsonNode.Parse(x.Json)!).ToArray();
+        Assert.Equal([seq, seq + 1], published.Select(x => x["seq"]!.GetValue<long>()));
+        Assert.Equal(file, published[0]["shots"]![0]!["file"]!.GetValue<string>());
+        Assert.Contains("\"seq\":1797000000000", events.First().Json);
+    }
+
+    [Theory]
+    [InlineData(true, "1234-1797000000000.png", "completion")]
+    [InlineData(true, "1234-17.PNG", "progress")]
+    [InlineData(false, "999-1797000000000.png", "completion")]
+    [InlineData(false, "1234-abc.png", "completion")]
+    [InlineData(false, "1234-17.jpg", "completion")]
+    [InlineData(false, "1234-.png", "completion")]
+    [InlineData(false, "sub\\1234-17.png", "completion")]
+    [InlineData(false, "..\\1234-17.png", "completion")]
+    [InlineData(false, "1234-17.png", "thumbnail")]
+    public void PostProgress_ShotFilesMustBeThisGamesPngsInTheShotsDirectory(bool accepted, string name, string kind)
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        var response = channel.PostProgress(ProgressWithShot(1234, 1, Path.Combine(ShotsDirectory, name), kind));
+
+        Assert.Equal(accepted ? 200 : 400, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("1234-17.png")]
+    [InlineData("C:\\Windows\\Temp\\1234-17.png")]
+    public void PostProgress_RelativeOrForeignShotPath_Is400(string file)
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        Assert.Equal(400, channel.PostProgress(ProgressWithShot(1234, 1, file)).StatusCode);
+        Assert.Empty(events);
+    }
+
+    [Fact]
+    public void PostProgress_TooFrequentFromTheLocalApi_Is429()
+    {
+        var channel = NewChannel(TimeSpan.FromSeconds(30));
+        channel.GameStarted(1234);
+
+        Assert.Equal(200, channel.PostProgress(Progress(1234, 1)).StatusCode);
+        Assert.Equal(429, channel.PostProgress(Progress(1234, 2)).StatusCode);
+
+        // 模拟模式自己产生的回报不限
+        Assert.Equal(200, channel.PostProgress(Progress(1234, 3), false).StatusCode);
+
+        Assert.Equal(2, events.Count(x => x.Method == CatJobChannel.PROGRESS_EVENT));
+    }
+
+    [Fact]
+    public void SetJob_WhenTheLocalApiIsUnavailable_IsUnsupported()
+    {
+        var channel = NewChannel();
+        channel.UnavailableReason = "本机接口端口没开成";
+
+        var result = channel.SetJob(Job(1));
+        Assert.Equal(CatCodes.UNSUPPORTED, result.Code);
+        Assert.Null(channel.JobJson);
+
+        channel.UnavailableReason = null;
+        Assert.True(channel.SetJob(Job(1)).Accepted);
+    }
+
+    [Fact]
+    public async Task SetJob_ConcurrentWithReads_NeverShowsAHalfJob_AndRevisionOnlyGrows()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        using var stop  = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var        seen = new ConcurrentBag<long>();
+
+        var writers = Enumerable.Range(0, 4).Select
+        (w => Task.Run
+            (() =>
+                {
+                    for (var revision = w + 1; revision <= 400; revision += 4)
+                        channel.SetJob(Job(revision));
+                }
+            )
+        );
+
+        var readers = Enumerable.Range(0, 4).Select
+        (r => Task.Run
+            (() =>
+                {
+                    long last = 0;
+                    long seq  = r * 1_000_000;
+
+                    while (!stop.IsCancellationRequested && last < 400)
+                    {
+                        var job = channel.GetJob(1234);
+
+                        if (job.StatusCode == 200)
+                        {
+                            var revision = JsonNode.Parse(job.Json!)!["revision"]!.GetValue<long>();
+                            Assert.True(revision >= last);
+                            last = revision;
+                            seen.Add(revision);
+                        }
+
+                        var posted = channel.PostProgress(Progress(1234, ++seq));
+                        Assert.Equal(200, posted.StatusCode);
+                        Assert.True(JsonNode.Parse(posted.Json!)!["revision"]!.GetValue<long>() >= 0);
+                    }
+                }
+            )
+        );
+
+        await Task.WhenAll(writers.Concat(readers));
+
+        Assert.Equal(400, channel.Revision);
+        Assert.NotEmpty(seen);
+    }
+
+    [Fact]
+    public async Task Host_AfterGameExited_NoMoreEventsForThatGame()
+    {
+        var runner    = new FakeGameRunner();
+        var published = new ConcurrentQueue<string>();
+        var host      = new CatLaunchHost(runner, (method, _) => { published.Enqueue(method); return Task.CompletedTask; }, new CatLogRedactor());
+
+        Assert.True(host.Launch(new CatLaunchParams(OPERATION, "acc", false, null)).Accepted);
+        await runner.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        host.Jobs.MinProgressInterval = TimeSpan.Zero;
+        host.Started(4321, DateTimeOffset.UtcNow);
+        Assert.Equal(200, host.Jobs.PostProgress(Progress(4321, 1)).StatusCode);
+        host.Levels(0, Seven, [90, 80]);
+
+        host.Exited(4321, 0);
+
+        Assert.Equal(404, host.Jobs.PostProgress(Progress(4321, 2)).StatusCode);
+        host.Levels(4321, Seven, [91, 80]);
+        host.Levels(0, Seven, [92, 80]);
+
+        Assert.True(await host.DrainEventsAsync(TimeSpan.FromSeconds(5)));
+        var order = published.ToArray();
+        var exitedAt = Array.IndexOf(order, "game.exited");
+
+        Assert.True(exitedAt >= 0);
+        Assert.DoesNotContain(order[(exitedAt + 1)..], x => x is CatJobChannel.PROGRESS_EVENT or CatJobChannel.LEVELS_EVENT);
+        Assert.Equal(1, order.Count(x => x == CatJobChannel.PROGRESS_EVENT));
+        Assert.Equal(1, order.Count(x => x == CatJobChannel.LEVELS_EVENT));
+
+        runner.Finish.TrySetResult(0);
+    }
+
     [Theory]
     [InlineData("")]
     [InlineData("not json")]
@@ -196,6 +404,8 @@ public sealed class CatJobChannelTests
     [InlineData("""{"schema":"cat-progress/1","pid":1234,"revision":1,"seq":1,"state":"mismatch","reason":{"text":"角色不符"}}""")]
     [InlineData("""{"schema":"cat-progress/1","pid":1234,"revision":1,"seq":1,"state":"running","items":{}}""")]
     [InlineData("""{"schema":"cat-progress/1","pid":1234,"revision":1,"seq":1,"state":"running","shots":"x"}""")]
+    [InlineData("""{"schema":"cat-progress/1","pid":1234,"pid":1234,"revision":1,"seq":1,"state":"running"}""")]
+    [InlineData("""{"schema":"cat-progress/1","pid":1234,"revision":1,"seq":1,"state":"running","items":[{"itemId":"a","itemId":"b"}]}""")]
     public void PostProgress_MalformedIs400(string body)
     {
         var channel = NewChannel();
@@ -208,31 +418,66 @@ public sealed class CatJobChannelTests
         Assert.Empty(events);
     }
 
+    private static readonly CatLevelsCharacter Seven = new("七色花", "40000000000000017", 1167);
+
+    private static readonly CatLevelsCharacter Other = new("别的角色", "40000000000000099", 1042);
+
     [Fact]
-    public void ReportLevels_OnlyWhenChanged_AndAgainForANewGame()
+    public void ReportLevels_OnlyWhenTheArrayOrTheCharacterChanges_AndAgainForANewGame()
     {
         var channel = NewChannel();
         channel.GameStarted(1234);
 
-        channel.ReportLevels(1234, [100, 80, 0]);
-        channel.ReportLevels(0, [100, 80, 0]);
-        channel.ReportLevels(1234, [100, 81, 0]);
+        channel.ReportLevels(1234, Seven, [100, 80, 0]);
+        channel.ReportLevels(0, Seven, [100, 80, 0]);
+        channel.ReportLevels(1234, Seven, [100, 81, 0]);
+
+        // 人换了个角色, 等级碰巧一样也要发
+        channel.ReportLevels(0, Other, [100, 81, 0]);
 
         channel.GameStarted(5678);
-        channel.ReportLevels(0, [100, 81, 0]);
+        channel.ReportLevels(0, Other, [100, 81, 0]);
 
         var published = events.Where(x => x.Method == CatJobChannel.LEVELS_EVENT).Select(x => JsonNode.Parse(x.Json)!).ToArray();
 
-        Assert.Equal(3, published.Length);
-        Assert.Equal([1234, 1234, 5678], published.Select(x => x["pid"]!.GetValue<int>()));
+        Assert.Equal(4, published.Length);
+        Assert.Equal([1234, 1234, 1234, 5678], published.Select(x => x["pid"]!.GetValue<int>()));
         Assert.Equal([100, 81, 0], published[1]["levels"]!.AsArray().Select(x => x!.GetValue<int>()));
         Assert.All(published, x => Assert.Equal(OPERATION, x["operationId"]!.GetValue<string>()));
+
+        var character = published[0]["character"]!;
+        Assert.Equal("七色花", character["name"]!.GetValue<string>());
+        Assert.Equal("40000000000000017", character["contentId"]!.GetValue<string>());
+        Assert.Equal(1167, character["homeWorldId"]!.GetValue<int>());
+        Assert.Equal("40000000000000099", published[2]["character"]!["contentId"]!.GetValue<string>());
     }
 
     [Fact]
-    public void ReportLevels_WithoutAGame_IsDropped()
+    public void ReportLevels_AllZeroOrNoCharacter_IsDropped()
     {
-        NewChannel().ReportLevels(0, [1, 2, 3]);
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        channel.ReportLevels(0, Seven, [0, 0, 0]);
+        channel.ReportLevels(0, Seven, []);
+        channel.ReportLevels(0, Seven with { ContentId = "" }, [100, 80, 0]);
+        channel.ReportLevels(0, Seven with { ContentId = "0" }, [100, 80, 0]);
+
+        Assert.Empty(events);
+    }
+
+    [Fact]
+    public void ReportLevels_ForAnotherPidOrWithoutAGame_IsDropped()
+    {
+        var channel = NewChannel();
+        channel.ReportLevels(0, Seven, [1, 2, 3]);
+
+        channel.GameStarted(1234);
+        channel.ReportLevels(999, Seven, [1, 2, 3]);
+
+        channel.GameEnded(1234);
+        channel.ReportLevels(1234, Seven, [1, 2, 3]);
+
         Assert.Empty(events);
     }
 
@@ -292,6 +537,51 @@ public sealed class CatJobChannelTests
 
         host.Exited(4321, 0);
         Assert.Equal(404, host.Jobs.GetJob(4321).StatusCode);
+
+        runner.Finish.TrySetResult(0);
+    }
+
+    [Theory]
+    [InlineData("international")]
+    [InlineData("authOnly")]
+    public async Task Host_SetJob_NobodyWillFetchIt_IsUnsupported(string kind)
+    {
+        var runner = new FakeGameRunner();
+        var host   = new CatLaunchHost(runner, (_, _) => Task.CompletedTask, new CatLogRedactor());
+
+        var launch = kind == "international"
+                         ? new CatLaunchParams(OPERATION, "acc", false, null, Platform: CatPlatforms.INTERNATIONAL, Password: "fake-password")
+                         : new CatLaunchParams(OPERATION, "acc", false, null, Platform: CatPlatforms.WE_GAME, AuthOnly: true);
+
+        Assert.True(host.Launch(launch).Accepted);
+        await runner.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var result = (CatSetJobResult)(await host.HandleAsync(CatJobChannel.METHOD, Params(Job(1)), CancellationToken.None))!;
+
+        Assert.False(result.Accepted);
+        Assert.Equal(CatCodes.UNSUPPORTED, result.Code);
+        Assert.Null(host.Jobs.JobJson);
+
+        runner.Finish.TrySetResult(0);
+    }
+
+    [Fact]
+    public async Task Host_SetJob_WhileClosing_IsBusy()
+    {
+        var runner = new FakeGameRunner();
+        var host   = new CatLaunchHost(runner, (_, _) => Task.CompletedTask, new CatLogRedactor());
+
+        Assert.True(host.Launch(new CatLaunchParams(OPERATION, "acc", false, null)).Accepted);
+        await runner.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        host.Started(4321, DateTimeOffset.UtcNow);
+        host.Stage(CatStages.RUNNING);
+
+        Assert.True(host.Close(new CatCloseParams(5)).Accepted);
+
+        var result = (CatSetJobResult)(await host.HandleAsync(CatJobChannel.METHOD, Params(Job(1)), CancellationToken.None))!;
+
+        Assert.False(result.Accepted);
+        Assert.Equal(CatCodes.BUSY, result.Code);
 
         runner.Finish.TrySetResult(0);
     }

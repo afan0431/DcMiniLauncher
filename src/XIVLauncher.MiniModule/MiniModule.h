@@ -13,6 +13,11 @@
 // 模块版本, 通过 pipe 的 VERSION 命令回给启动器, 便于确认注进去的是哪一版
 #define MINIMODULE_VERSION "0.8.0"
 
+// ---- 模式 (dllmain.cpp) -------------------------------------------------------
+// 只读模式: 启动器只为读角色和等级而注入时, 注入前写 <ProgramData>\DcMiniLauncher\module-<pid>.mode（readonly）,
+// 模块就不装标题守卫和选角右键菜单。VERSION 的回应里带 mode=readonly|full
+bool ModuleReadOnly();
+
 // ---- 日志 (log.cpp) ----------------------------------------------------------
 // 日志落在 %TEMP%\minilauncher-module-<pid>.log —— 游戏目录不保证可写, 且这里天然按 PID 分开
 void        LogInit();

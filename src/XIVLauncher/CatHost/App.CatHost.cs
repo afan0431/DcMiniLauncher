@@ -116,9 +116,6 @@ public partial class App
         else
             CatHostPresence.Hold();
 
-        // Cat 上号自动开工的截图目录: 建好、普通用户可读、删掉 3 天前的
-        CatShots.Prepare();
-
         var bootstrapLine = await ReadBootstrapLineAsync().ConfigureAwait(false);
 
         if (!CatHostRuntime.TryParseBootstrap(bootstrapLine, out var bootstrap, out var bootstrapError))
@@ -126,6 +123,9 @@ public partial class App
             Log.Error("[CatHost] {Error}", bootstrapError);
             return CatHostRuntime.EXIT_BOOTSTRAP_FAILED;
         }
+
+        // Cat 上号自动开工的截图目录: 建好、普通用户可读、删掉 3 天前的。后台做, 不挡启动（几个进程同时起时会碰同一个目录, 失败只记日志）
+        _ = Task.Run(() => CatShots.Prepare());
 
         var redactor = new CatLogRedactor();
         redactor.Register(bootstrap!.Token);

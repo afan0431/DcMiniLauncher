@@ -29,9 +29,10 @@ public interface ICatLocalEndpoints
 }
 
 /// <summary>
-///     <c>/cat</c> 下的两条路由。与 <c>/dctravel/ingame-travel</c> 同一信任级别: 只绑 127.0.0.1, 带 <c>Origin</c> 头的请求一律 403
+///     <c>/cat</c> 下的两条路由。与 <c>/dctravel/ingame-travel</c> 同一信任级别: 只绑 127.0.0.1, 带 <c>Origin</c> 头的请求一律 403;
+///     另外 <c>Host</c> 头只认 <c>127.0.0.1:&lt;端口&gt;</c>（挡住借 DNS 重绑定从网页打进来的请求）
 /// </summary>
-internal sealed class CatLocalController(Func<ICatLocalEndpoints?> endpoints) : WebApiController
+internal sealed class CatLocalController(Func<ICatLocalEndpoints?> endpoints, int port) : WebApiController
 {
     /// <summary>回报请求体上限</summary>
     public const int MAX_BODY_BYTES = 64 * 1024;
@@ -94,11 +95,13 @@ internal sealed class CatLocalController(Func<ICatLocalEndpoints?> endpoints) : 
 
     private async Task<bool> RejectCrossOriginAsync()
     {
-        if (string.IsNullOrEmpty(Request.Headers["Origin"]))
+        var host = Request.Headers["Host"];
+
+        if (string.IsNullOrEmpty(Request.Headers["Origin"]) && string.Equals(host, $"127.0.0.1:{port}", StringComparison.OrdinalIgnoreCase))
             return false;
 
         Response.StatusCode = 403;
-        await Response.OutputStream.WriteAsync("CORS Forbidden"u8.ToArray()).ConfigureAwait(false);
+        await Response.OutputStream.WriteAsync("Forbidden"u8.ToArray()).ConfigureAwait(false);
         return true;
     }
 
@@ -165,7 +168,7 @@ public sealed class CatLocalListener : IDisposable
         var urlPrefix = new UriBuilder(Uri.UriSchemeHttp, "127.0.0.1", port).Uri.ToString().TrimEnd('/');
 
         server = new WebServer(o => o.WithUrlPrefix(urlPrefix).WithMode(HttpListenerMode.EmbedIO))
-            .WithWebApi("/cat", m => m.WithController(() => new CatLocalController(() => endpoints)));
+            .WithWebApi("/cat", m => m.WithController(() => new CatLocalController(() => endpoints, port)));
 
         server.StateChanged += (_, e) =>
         {

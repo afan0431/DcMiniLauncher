@@ -118,6 +118,17 @@ public sealed class CatAutoEnterTimings
 
     /// <summary>和模块通话失败后等多久再看游戏进程还在不在（游戏崩溃时管道比进程先断）</summary>
     public TimeSpan ExitGrace { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    ///     看当前角色、读职业等级这类只读命令等回应的上限（模块在主线程上执行最多等 3 秒）; 超时跳过这一轮, 不一直占着模块闸
+    /// </summary>
+    public TimeSpan ReadTimeout { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>读职业等级要用的模块注入失败后, 隔多久再试</summary>
+    public TimeSpan AttachRetryInterval { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>读职业等级要用的模块最多注入几次（含第一次）</summary>
+    public int AttachAttempts { get; init; } = 4;
 }
 
 /// <summary>
@@ -264,15 +275,17 @@ public sealed class CatAutoEnter
 
             try
             {
-                var who = CatModuleReplies.ParseWhoAmI(await game.SendAsync("WHOAMI", cancellationToken).ConfigureAwait(false));
+                // 有上限: 模块卡住时跳过这一轮, 不一直占着模块闸
+                var response = await CatLevelReader.SendWithTimeoutAsync(game, "WHOAMI", timings.ReadTimeout, cancellationToken).ConfigureAwait(false);
+                var who      = response == null ? null : CatModuleReplies.ParseWhoAmI(response);
 
                 if (who is { Loaded: true })
                 {
                     if (who.ContentId != EnteredContentId)
                         ReportEntered(who);
 
-                    levelReader ??= new CatLevelReader(reporter, game.ProcessId);
-                    await levelReader.ReadAsync(game, cancellationToken).ConfigureAwait(false);
+                    levelReader ??= new CatLevelReader(reporter, game.ProcessId, timings.ReadTimeout);
+                    await levelReader.ReadAsync(game, who, cancellationToken).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException)

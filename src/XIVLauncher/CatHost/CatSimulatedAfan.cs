@@ -22,7 +22,13 @@ internal sealed class CatSimulatedAfan
         Blocked,
 
         /// <summary>不产生回报（由测试工具往 /cat/progress 发）, 只报等级</summary>
-        Manual
+        Manual,
+
+        /// <summary>核对角色不符: waiting 之后一直报 mismatch（reason.code=error, text 写进的是哪个角色）, 什么也不做</summary>
+        Mismatch,
+
+        /// <summary>第一项的例程认不出: 报一次 blocked（reason.code=unsupported）, 跳过它接着做后面的项</summary>
+        Unsupported
     }
 
     /// <summary>职业等级数组的长度（国服 PlayerState._classJobLevels）</summary>
@@ -31,35 +37,27 @@ internal sealed class CatSimulatedAfan
     /// <summary>回报里的 afan 版本号</summary>
     public const string VERSION = "sim";
 
-    /// <summary>
-    ///     ClassJob 表行号 → ExpArrayIndex（国服客户端 ClassJob 表, 2026-10-16 用 Dalamud 自带的 Lumina 从本机 sqpack 读出）
-    /// </summary>
-    public static readonly IReadOnlyDictionary<int, int> ExpArrayIndex = new Dictionary<int, int>
-    {
-        [1] = 1, [2] = 0, [3] = 2, [4] = 4, [5] = 3, [6] = 6, [7] = 5,
-        [8] = 7, [9] = 8, [10] = 9, [11] = 10, [12] = 11, [13] = 12, [14] = 13, [15] = 14,
-        [16] = 15, [17] = 16, [18] = 17,
-        [19] = 1, [20] = 0, [21] = 2, [22] = 4, [23] = 3, [24] = 6, [25] = 5,
-        [26] = 18, [27] = 18, [28] = 18, [29] = 19, [30] = 19, [31] = 20, [32] = 21, [33] = 22,
-        [34] = 23, [35] = 24, [36] = 25, [37] = 26, [38] = 27, [39] = 28, [40] = 29, [41] = 30, [42] = 31,
-        [43] = 32
-    };
+    /// <summary>ClassJob 表行号 → ExpArrayIndex（国服表, 见 <see cref="CatClassJobs.ExpArrayIndex" />）</summary>
+    public static IReadOnlyDictionary<int, int> ExpArrayIndex => CatClassJobs.ExpArrayIndex;
 
     /// <summary>没有任务单时报的等级: 下标 1（剑术师 / 骑士）100、6（幻术师 / 白魔法师）90, 其余 0</summary>
     public static readonly IReadOnlyList<int> SampleLevels = Enumerable.Range(0, LEVEL_COUNT).Select(i => i switch { 1 => 100, 6 => 90, _ => 0 }).ToArray();
 
-    private readonly CatJobChannel jobs;
-    private readonly int           pid;
-    private readonly Behavior      behavior;
+    private readonly CatJobChannel    jobs;
+    private readonly int              pid;
+    private readonly Behavior         behavior;
+    private readonly CatCharacterInfo character;
 
     private readonly Dictionary<string, ItemProgress> progress = new(StringComparer.Ordinal);
 
-    private long      seq;
+    /// <summary>上一条回报的 seq; 与真 Afan 一样以"加载"时的 Unix 毫秒为起点（13 位, 超出 int32）, 之后逐条加 1</summary>
+    private long      seq = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     private long?     lastRevision;
     private bool      characterChecked;
     private bool      progressShotTaken;
     private long?     blockedAtRevision;
     private bool      blockedOnce;
+    private bool      unsupportedReported;
     private string?   lastFingerprint;
     private DateTime  lastSentAt = DateTime.MinValue;
 
@@ -69,11 +67,13 @@ internal sealed class CatSimulatedAfan
     /// <param name="jobs">任务单通道</param>
     /// <param name="pid">（占位）游戏进程号</param>
     /// <param name="behavior">模拟的方式</param>
-    public CatSimulatedAfan(CatJobChannel jobs, int pid, Behavior behavior)
+    /// <param name="character">游戏里当前的（模拟）角色, 等级读数带上它</param>
+    public CatSimulatedAfan(CatJobChannel jobs, int pid, Behavior behavior, CatCharacterInfo character)
     {
-        this.jobs     = jobs;
-        this.pid      = pid;
-        this.behavior = behavior;
+        this.jobs      = jobs;
+        this.pid       = pid;
+        this.behavior  = behavior;
+        this.character = character;
     }
 
     /// <summary>每一步的间隔</summary>
@@ -82,8 +82,15 @@ internal sealed class CatSimulatedAfan
     /// <summary>没有变化时多久重发一次（心跳）</summary>
     public TimeSpan Heartbeat { get; init; } = TimeSpan.FromSeconds(60);
 
-    /// <summary>模拟截图写到哪里</summary>
+    /// <summary>模拟截图写到哪里（要与任务单通道的 <see cref="CatJobChannel.ShotsDirectory" /> 一致, 否则回报被拒）</summary>
     public string ShotsDirectory { get; init; } = CatShots.Directory;
+
+    /// <summary>第一条回报的 seq 减 1（测试用; 默认是创建时的 Unix 毫秒）</summary>
+    public long SeqStart
+    {
+        get => seq;
+        init => seq = value;
+    }
 
     /// <summary>
     ///     一直推进到取消（占位进程退出或收到 close）
@@ -124,7 +131,9 @@ internal sealed class CatSimulatedAfan
             Send(job, state, reason, active, shots, nowUtc);
         }
 
-        jobs.ReportLevels(pid, Levels(job));
+        // 模拟里没有服务器 Id: 原始服务器 Id 取任务单里的（没有为 0）
+        var homeWorldId = (job?.Character as JsonObject)?["homeWorldId"] is JsonValue id && id.TryGetValue(out int value) ? value : 0;
+        jobs.ReportLevels(pid, new CatLevelsCharacter(character.Name, character.ContentId, homeWorldId), Levels(job));
     }
 
     /// <summary>任务单里练级项的当前等级填进 35 项数组（按 ExpArrayIndex）, 其余为 0; 没有任务单时用 <see cref="SampleLevels" /></summary>
@@ -186,6 +195,10 @@ internal sealed class CatSimulatedAfan
             return ("waiting", null, null, shots);
         }
 
+        // 角色不符: 什么也不做, 一直报 mismatch（text 写进的是哪个角色）
+        if (behavior == Behavior.Mismatch)
+            return ("mismatch", Reason("error", Short($"进的是{character.Name}")), null, shots);
+
         if (blockedAtRevision is { } blockedRevision)
         {
             if (job.Revision <= blockedRevision)
@@ -209,6 +222,14 @@ internal sealed class CatSimulatedAfan
             return ("done", null, null, shots);
 
         var local = progress[active.ItemId];
+
+        // 第一项的例程"认不出": 报一次 blocked（unsupported）, 跳过它做下一项
+        if (behavior == Behavior.Unsupported && !unsupportedReported)
+        {
+            unsupportedReported = true;
+            local.Skipped       = true;
+            return ("blocked", Reason("unsupported", Short($"不认识例程 {active.Routine}")), active.ItemId, shots);
+        }
 
         if (behavior == Behavior.Blocked && !blockedOnce && local.Steps >= 2)
         {
@@ -241,11 +262,16 @@ internal sealed class CatSimulatedAfan
         return FirstPending(job) == null ? ("done", null, null, shots) : ("running", null, FirstPending(job)!.ItemId, shots);
     }
 
-    /// <summary>按 order 第一个还没做完的可自动做的项</summary>
+    /// <summary>按 order 第一个还没做完（也没被跳过）的可自动做的项</summary>
     private SimItem? FirstPending(SimJob job) =>
         job.Items.Where(x => x.Routine != null)
            .OrderBy(x => x.Order)
-           .FirstOrDefault(x => progress.TryGetValue(x.ItemId, out var local) && !local.Done && !(local.Current is { } c && x.Target is { } t && c >= t));
+           .FirstOrDefault
+           (x => progress.TryGetValue(x.ItemId, out var local) && !local.Done && !local.Skipped && !(local.Current is { } c && x.Target is { } t && c >= t));
+
+    /// <summary>reason.text 不超过 20 个字</summary>
+    private static string Short(string text) =>
+        text.Length <= 20 ? text : text[..20];
 
     private void Send(SimJob? job, string state, JsonObject? reason, string? active, List<(string ItemId, string Kind)> shots, DateTime nowUtc)
     {
@@ -295,13 +321,13 @@ internal sealed class CatSimulatedAfan
                 report["shots"] = list;
         }
 
-        report["character"] = job?.Character is JsonObject character
-                                  ? new JsonObject { ["name"] = character["name"]?.DeepClone(), ["homeWorldId"] = character["homeWorldId"]?.DeepClone() }
+        report["character"] = job?.Character is JsonObject jobCharacter
+                                  ? new JsonObject { ["name"] = jobCharacter["name"]?.DeepClone(), ["homeWorldId"] = jobCharacter["homeWorldId"]?.DeepClone() }
                                   : null;
         report["afan"]      = VERSION;
         report["at"]        = at;
 
-        var response = jobs.PostProgress(report.ToJsonString());
+        var response = jobs.PostProgress(report.ToJsonString(), false);
 
         if (response.StatusCode != 200)
             Log.Warning("[CatSimAfan] 模拟回报没有被接受: {Status} {Body}", response.StatusCode, response.Json);
@@ -340,6 +366,9 @@ internal sealed class CatSimulatedAfan
         public long? StartedFrom { get; set; }
 
         public int Steps { get; set; }
+
+        /// <summary>例程认不出, 跳过了（unsupported 模拟）</summary>
+        public bool Skipped { get; set; }
     }
 
     private sealed record SimItem(string ItemId, int Order, string? Kind, int? ClassJobId, long? Current, long? Target, bool Done, string? Routine)

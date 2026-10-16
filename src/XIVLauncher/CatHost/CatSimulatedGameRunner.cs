@@ -40,9 +40,13 @@ namespace XIVLauncher.CatHost;
 ///             再按 order 把 routine 不为 null 的项一项项做完（running, current 每步加 (target − 起点)/5, 勾选类三步完成）, 一项做完且 shots.completion
 ///             为 true 时在截图目录写 <c>&lt;pid&gt;-&lt;seq&gt;.png</c> 并带在回报的 shots 里（progressAt 不为空时开工后先带一张 progress 图）,
 ///             全部做完报 done; desired 为 pause / stop 报 paused / stopped; 没有可自动做的项报 idle; 没有变化时每 <see cref="AfanHeartbeat" /> 心跳一次。
-///             职业等级按任务单里练级项的当前值（ClassJob → ExpArrayIndex 用国服表）每步报一次, 有变化才发 game.levels。
+///             职业等级按任务单里练级项的当前值（ClassJob → ExpArrayIndex 用国服表）连同当前角色每步报一次, 有变化才发 game.levels;
+///             不自动进入角色时与真实启动一样, 进世界先报一次 game.character（模拟角色, 名字取 launch 的 character.name）。
 ///             账号名前缀 <c>blocked:</c> = 第一项走两步后报 blocked（noProgress）, 直到任务单 revision 变了才接着做;
-///             <c>manual:</c> = 不产生回报（由测试工具往 /cat/progress 发, pid 用占位进程号）, 只报等级
+///             <c>manual:</c> = 不产生回报（由测试工具往 /cat/progress 发, pid 用占位进程号）, 只报等级;
+///             <c>mismatch:</c> = waiting 之后一直报 mismatch（reason.code=error, text 写进的是哪个角色）;
+///             <c>unsupported:</c> = 第一项报一次 blocked（reason.code=unsupported, 例程认不出）, 跳过它接着做后面的项。
+///             seq 与真 Afan 一样以 Unix 毫秒为起点（13 位）
 ///         </item>
 ///     </list>
 /// </summary>
@@ -107,6 +111,12 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
     /// <summary>上号自动开工: 不产生模拟回报（由测试工具往 /cat/progress 发）的前缀</summary>
     public const string JOB_MANUAL_PREFIX = "manual:";
+
+    /// <summary>上号自动开工: 核对角色不符、一直报 mismatch 的前缀</summary>
+    public const string JOB_MISMATCH_PREFIX = "mismatch:";
+
+    /// <summary>上号自动开工: 第一项例程认不出（报一次 blocked + unsupported, 跳过它接着做）的前缀</summary>
+    public const string JOB_UNSUPPORTED_PREFIX = "unsupported:";
 
     private readonly CancellationTokenSource closeCts = new();
     private readonly object                  stateLock = new();
@@ -563,18 +573,32 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         Path.Combine(PortFileDirectory ?? Path.GetDirectoryName(InGame.RunningGameRegistry.PortFilePath(pid))!, $"dctravel-{pid}.port");
 
     /// <summary>
-    ///     上号自动开工: 进世界后开始模拟 Afan, 占位进程退出即停（外壳没有任务单通道时不做）
+    ///     上号自动开工: 进世界后开始模拟 Afan, 占位进程退出即停（外壳没有任务单通道时不做）。
+    ///     entered = 自动进入角色进的角色; 不自动进入角色时为 null, 这里按真实启动的做法（模块读到当前角色）先报一次 game.character
     /// </summary>
-    private void StartSimulatedAfan(CatLaunchRequest request, Process process, ICatLaunchReporter reporter)
+    private void StartSimulatedAfan(CatLaunchRequest request, Process process, ICatLaunchReporter reporter, CatCharacterInfo? entered = null)
     {
         if (reporter.Jobs is not { } jobs || process.HasExited)
             return;
 
-        var behavior = request.AccountName.StartsWith(JOB_BLOCKED_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Blocked
-                       : request.AccountName.StartsWith(JOB_MANUAL_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Manual
+        if (entered == null)
+        {
+            entered = SimulatedCharacter(1, request.CharacterName ?? SIMULATED_CHARACTER_NAME, request.CharacterHomeWorld ?? "LaNuoXiYa");
+            reporter.Character(entered);
+        }
+
+        var account = request.AccountName;
+        var behavior = account.StartsWith(JOB_BLOCKED_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Blocked
+                       : account.StartsWith(JOB_MANUAL_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Manual
+                       : account.StartsWith(JOB_MISMATCH_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Mismatch
+                       : account.StartsWith(JOB_UNSUPPORTED_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Unsupported
                        : CatSimulatedAfan.Behavior.Normal;
 
-        var afan = new CatSimulatedAfan(jobs, process.Id, behavior)
+        // 模拟截图写到别处（测试）时, 回报里的截图路径校验也认那个目录
+        if (ShotsDirectory != null)
+            jobs.ShotsDirectory = ShotsDirectory;
+
+        var afan = new CatSimulatedAfan(jobs, process.Id, behavior, entered)
         {
             Step           = AfanStep,
             Heartbeat      = AfanHeartbeat,
@@ -764,7 +788,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
                 reporter.Character(entered);
                 Stage(CatStages.IN_WORLD);
-                StartSimulatedAfan(request, process, reporter);
+                StartSimulatedAfan(request, process, reporter, entered);
             }
         }
         catch (OperationCanceledException)

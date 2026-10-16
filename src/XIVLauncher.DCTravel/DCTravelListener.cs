@@ -105,7 +105,7 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
                   .WithMode(HttpListenerMode.EmbedIO)
             )
             .WithWebApi("/dctravel", m => m.WithController(() => new RpcController(this)))
-            .WithWebApi("/cat", m => m.WithController(() => new CatLocalController(() => CatEndpoints)));
+            .WithWebApi("/cat", m => m.WithController(() => new CatLocalController(() => CatEndpoints, port)));
 
         webServer.StateChanged += (_, e) =>
         {

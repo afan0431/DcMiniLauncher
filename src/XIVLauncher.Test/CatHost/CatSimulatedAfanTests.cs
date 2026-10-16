@@ -24,7 +24,10 @@ public sealed class CatSimulatedAfanTests : IDisposable
 
     public CatSimulatedAfanTests()
     {
-        channel = new CatJobChannel(() => "op-1", (method, parameters) => events.Enqueue((method, JsonNode.Parse(JsonSerializer.Serialize(parameters, CatProtocol.JsonOptions))!)));
+        channel = new CatJobChannel(() => "op-1", (method, parameters) => events.Enqueue((method, JsonNode.Parse(JsonSerializer.Serialize(parameters, CatProtocol.JsonOptions))!)))
+        {
+            ShotsDirectory = shots
+        };
         channel.GameStarted(PID);
     }
 
@@ -34,8 +37,10 @@ public sealed class CatSimulatedAfanTests : IDisposable
             Directory.Delete(shots, true);
     }
 
+    private static readonly CatCharacterInfo Entered = new("4000000000000001", "七色花", "MengYaChi", "MengYaChi", "萌芽池", "萌芽池", false, true);
+
     private CatSimulatedAfan NewAfan(CatSimulatedAfan.Behavior behavior = CatSimulatedAfan.Behavior.Normal) =>
-        new(channel, PID, behavior) { ShotsDirectory = shots, Heartbeat = TimeSpan.FromSeconds(60) };
+        new(channel, PID, behavior, Entered) { ShotsDirectory = shots, Heartbeat = TimeSpan.FromSeconds(60), SeqStart = 0 };
 
     private JsonObject[] Reports() =>
         events.Where(x => x.Method == CatJobChannel.PROGRESS_EVENT).Select(x => x.Params.AsObject()).ToArray();
@@ -96,6 +101,12 @@ public sealed class CatSimulatedAfanTests : IDisposable
         Assert.Equal(30, levels[^1][32]);
         Assert.All(levels, x => Assert.Equal(94, x[1]));
         Assert.All(levels, x => Assert.Equal(CatSimulatedAfan.LEVEL_COUNT, x.Length));
+
+        // 等级读数带当前角色: 名字与 contentId 是游戏里的, 原始服务器 Id 取任务单里的
+        var character = events.First(x => x.Method == CatJobChannel.LEVELS_EVENT).Params["character"]!;
+        Assert.Equal("七色花", character["name"]!.GetValue<string>());
+        Assert.Equal("4000000000000001", character["contentId"]!.GetValue<string>());
+        Assert.Equal(1167, character["homeWorldId"]!.GetValue<int>());
 
         // 做完之后没有变化就不再发（心跳间隔没到）
         var count = Reports().Length;
@@ -203,6 +214,60 @@ public sealed class CatSimulatedAfanTests : IDisposable
 
         Assert.Empty(Reports());
         Assert.Single(Levels());
+    }
+
+    [Fact]
+    public void Mismatch_ReportsTheEnteredCharacter_AndDoesNothing()
+    {
+        channel.SetJob(CatJobChannelTests.Job(3));
+        Run(NewAfan(CatSimulatedAfan.Behavior.Mismatch), DateTime.UtcNow, 6);
+
+        var reports = Reports();
+        Assert.Equal(["waiting", "mismatch"], reports.Select(x => x["state"]!.GetValue<string>()));
+        Assert.Equal("error", reports[1]["reason"]!["code"]!.GetValue<string>());
+        Assert.Contains("七色花", reports[1]["reason"]!["text"]!.GetValue<string>());
+        Assert.Equal([18L, 35L], reports[1]["items"]!.AsArray().Select(x => x!["current"]!.GetValue<long>()));
+    }
+
+    [Fact]
+    public void Unsupported_BlocksOnceForTheFirstItem_ThenDoesTheRest()
+    {
+        channel.SetJob(CatJobChannelTests.Job(3));
+        Run(NewAfan(CatSimulatedAfan.Behavior.Unsupported), DateTime.UtcNow, 20);
+
+        var reports = Reports();
+        var states  = reports.Select(x => x["state"]!.GetValue<string>()).ToArray();
+
+        Assert.Equal(["waiting", "blocked"], states[..2]);
+        Assert.Equal("unsupported", reports[1]["reason"]!["code"]!.GetValue<string>());
+        Assert.Contains("bst-level", reports[1]["reason"]!["text"]!.GetValue<string>());
+        Assert.Equal("a", reports[1]["activeItemId"]!.GetValue<string>());
+
+        // 跳过驯兽师, 只做金碟币
+        Assert.Equal("done", states[^1]);
+        Assert.Equal(1, states.Count(x => x == "blocked"));
+        var last = reports[^1]["items"]!.AsArray();
+        Assert.Equal([18L, 120L], last.Select(x => x!["current"]!.GetValue<long>()));
+        Assert.Equal([false, true], last.Select(x => x!["done"]!.GetValue<bool>()));
+    }
+
+    [Fact]
+    public void Seq_StartsFromUnixMilliseconds_LikeTheRealAfan()
+    {
+        channel.SetJob(CatJobChannelTests.Job(3));
+        var before = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        var afan = new CatSimulatedAfan(channel, PID, CatSimulatedAfan.Behavior.Normal, Entered) { ShotsDirectory = shots };
+        Run(afan, DateTime.UtcNow, 30);
+
+        var seqs = Reports().Select(x => x["seq"]!.GetValue<long>()).ToArray();
+        Assert.True(seqs[0] > before && seqs[0] > int.MaxValue);
+        Assert.Equal(Enumerable.Range(0, seqs.Length).Select(i => seqs[0] + i), seqs);
+
+        // 截图文件名里的 seq 也是这个大数
+        var file = Reports().Where(x => x["shots"] != null).SelectMany(x => x["shots"]!.AsArray()).First()!["file"]!.GetValue<string>();
+        Assert.Matches(@"\\4242-\d{13}\.png$", file);
+        Assert.True(File.Exists(file));
     }
 
     [Fact]

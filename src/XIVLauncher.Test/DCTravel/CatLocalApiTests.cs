@@ -104,6 +104,55 @@ public sealed class CatLocalApiTests
             Assert.Empty(published);
     }
 
+    [Theory]
+    [InlineData("localhost")]
+    [InlineData("rebind.example.invalid")]
+    public async Task StandaloneListener_RejectsOtherHostHeaders(string host)
+    {
+        var published = new List<string>();
+        var channel   = NewChannel(published);
+        channel.GameStarted(1234);
+        channel.SetJob(CatJobChannelTests.Job(2));
+
+        var port = FreePort();
+
+        using var listener = new CatLocalListener(port, channel);
+        Assert.True(await listener.StartAsync(Timeout));
+
+        using var get = new HttpRequestMessage(HttpMethod.Get, $"http://127.0.0.1:{port}/cat/job?pid=1234");
+        get.Headers.Host = $"{host}:{port}";
+
+        // EmbedIO 按监听前缀已经会直接断开 Host 对不上的连接; 万一放进来了, 控制器回 403。两种都不能拿到任务单
+        try
+        {
+            var response = await Http.SendAsync(get);
+
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.DoesNotContain("七色花", await response.Content.ReadAsStringAsync());
+        }
+        catch (HttpRequestException)
+        {
+            // 连接被断开: 没有拿到任务单
+        }
+    }
+
+    [Fact]
+    public async Task StandaloneListener_TooFrequentReportsAre429()
+    {
+        var channel = NewChannel([]);
+        channel.MinProgressInterval = TimeSpan.FromSeconds(30);
+        channel.GameStarted(1234);
+
+        var port = FreePort();
+
+        using var listener = new CatLocalListener(port, channel);
+        Assert.True(await listener.StartAsync(Timeout));
+
+        var url = $"http://127.0.0.1:{port}/cat/progress";
+        Assert.Equal(HttpStatusCode.OK, (await Http.PostAsync(url, new StringContent(CatJobChannelTests.Progress(1234, 1), Encoding.UTF8, "application/json"))).StatusCode);
+        Assert.Equal((HttpStatusCode)429, (await Http.PostAsync(url, new StringContent(CatJobChannelTests.Progress(1234, 2), Encoding.UTF8, "application/json"))).StatusCode);
+    }
+
     [Fact]
     public async Task StandaloneListener_OversizedBodyIs400()
     {

@@ -110,8 +110,11 @@ public interface ICatLaunchReporter
     /// <summary>本进程的任务单通道（Cat 上号自动开工）; 不支持时为 null</summary>
     CatJobChannel? Jobs => null;
 
-    /// <summary>游戏内模块读到的全部职业等级（下标为 ExpArrayIndex）; pid ≤ 0 表示当前守护的游戏。有变化才发 game.levels</summary>
-    void Levels(int pid, IReadOnlyList<int> levels)
+    /// <summary>
+    ///     游戏内模块读到的全部职业等级（下标为 ExpArrayIndex）与同一轮读到的当前角色; pid ≤ 0 表示当前守护的游戏。
+    ///     角色或数组有变化才发 game.levels
+    /// </summary>
+    void Levels(int pid, CatLevelsCharacter character, IReadOnlyList<int> levels)
     {
     }
 
@@ -352,7 +355,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             CatHandOff.METHOD => HandOffBoxedAsync(cancellationToken),
             "weGame.confirmSms" => Task.FromResult<object?>(ConfirmWeGameSms(Deserialize<CatWeGameConfirmSmsParams>(parameters))),
             "selectCharacter" => Task.FromResult<object?>(SelectCharacter(Deserialize<CatSelectCharacterParams>(parameters))),
-            CatJobChannel.METHOD => Task.FromResult<object?>(jobs.SetJob(Deserialize<CatSetJobParams>(parameters)?.Job)),
+            CatJobChannel.METHOD => Task.FromResult<object?>(SetJob(Deserialize<CatSetJobParams>(parameters))),
             _        => throw new CatRpcException(CatRpcException.METHOD_NOT_FOUND, $"未知方法: {method}")
         };
 
@@ -862,6 +865,30 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     }
 
     /// <summary>
+    ///     setJob: 国际服和只登录的上号没有人来取任务单（没有本机接口、不起游戏）, 回 unsupported;
+    ///     正在交接停止或已收到 close 回 busy（工作台在 game.adopted 之后对接管的进程重发）; 其余交给 <see cref="CatJobChannel.SetJob" />
+    /// </summary>
+    public CatSetJobResult SetJob(CatSetJobParams? parameters)
+    {
+        lock (stateLock)
+        {
+            if (request is { IsInternational: true })
+                return CatSetJobResult.Rejected(CatCodes.UNSUPPORTED, "国际服没有本机接口, 游戏内取不到任务单");
+
+            if (request is { AuthOnly: true })
+                return CatSetJobResult.Rejected(CatCodes.UNSUPPORTED, "这次只登录、不起游戏, 没有游戏来取任务单");
+
+            if (handOffRequested)
+                return CatSetJobResult.Rejected(CatCodes.BUSY, "正在交接停止, 请在 game.adopted 之后对接管的进程重发");
+
+            if (closeRequested)
+                return CatSetJobResult.Rejected(CatCodes.BUSY, "已收到 close, 本进程即将退出");
+        }
+
+        return jobs.SetJob(parameters?.Job);
+    }
+
+    /// <summary>
     ///     员工在工作台选了要登录的角色: 只在等人选角色（awaitingCharacterChoice）时交给启动器, 立即回是否接受
     /// </summary>
     public CatAcceptResult SelectCharacter(CatSelectCharacterParams? parameters)
@@ -1031,8 +1058,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     }
 
     /// <inheritdoc />
-    public void Levels(int levelsPid, IReadOnlyList<int> levels) =>
-        jobs.ReportLevels(levelsPid, levels);
+    public void Levels(int levelsPid, CatLevelsCharacter character, IReadOnlyList<int> levels) =>
+        jobs.ReportLevels(levelsPid, character, levels);
 
     /// <inheritdoc />
     public void Failed(string code, string message)
@@ -1212,6 +1239,9 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         return EXIT_GUARD_ERROR;
     }
 
+    /// <summary>
+    ///     发事件: 只放进无界的队列（TryWrite）, 从不阻塞、不等管道。<see cref="CatJobChannel" /> 在它自己的锁里调用这里, 改成会阻塞的写法会卡住本机接口
+    /// </summary>
     private void Publish(string method, object parameters)
     {
         if (handOffCommitted)

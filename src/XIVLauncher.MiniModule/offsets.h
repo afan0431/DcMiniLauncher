@@ -186,6 +186,12 @@ namespace offsets
     inline constexpr int       PLAYER_STATE_CLASS_JOB_LEVEL_COUNT = 35;
     inline constexpr short     PLAYER_STATE_CLASS_JOB_LEVEL_MAX   = 200;   // 读出超过它（或为负）就当读歪了
 
+    // 当前职业与等级, 给启动器核对等级数组有没有读错位: levels[ExpArrayIndex(当前职业)] 应等于当前等级（等级同步中不比）。
+    // 出处同上（Hooks\26-10-14-01 元数据）; 实机: CurrentClassJobId / CurrentLevel 是（2026-10-16 同一次采样: 31 机工士 / 100）, IsLevelSynced 否
+    inline constexpr uintptr_t PLAYER_STATE_CURRENT_CLASS_JOB = 0x7E;   // byte
+    inline constexpr uintptr_t PLAYER_STATE_CURRENT_LEVEL     = 0x88;   // short
+    inline constexpr uintptr_t PLAYER_STATE_IS_LEVEL_SYNCED   = 0x15E;  // bool
+
     // ---- AtkUnitBase / 对话框（Component/GUI/AtkUnitBase.cs）----------------
     // 以下各项静态: 否  实机: 否（0x1E4 紧挨着右键菜单已在用的 BlockedParentId 0x1EA, 仅此旁证）
     inline constexpr uintptr_t ATK_UNIT_BASE_ATK_VALUES       = 0x178;  // :30 AtkValue*

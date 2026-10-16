@@ -1,3 +1,4 @@
+using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -5,6 +6,12 @@ using Serilog;
 using XIVLauncher.DCTravel;
 
 namespace XIVLauncher.CatHost;
+
+/// <summary>
+///     game.levels 里的当前角色（同一轮 WHOAMI 读到的）: name = 角色名; contentId = ContentId（字符串, 17 位超出 Lua double 精度）;
+///     homeWorldId = 原始服务器的 World 表行号, 读不到为 0
+/// </summary>
+public sealed record CatLevelsCharacter(string Name, string ContentId, int HomeWorldId);
 
 /// <summary>
 ///     Cat 上号自动开工的任务单通道（约定 cat-job/1）: 工作台经管道方法 setJob 交来任务单, 游戏内 Afan 经本机接口
@@ -32,9 +39,6 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     /// <summary>任务单原文上限</summary>
     public const int MAX_JOB_BYTES = 256 * 1024;
 
-    /// <summary>每个游戏进程记住的已收 seq 个数上限, 超了丢掉较小的一半</summary>
-    private const int MAX_SEEN_SEQS = 4096;
-
     /// <summary>回报 state 的取值</summary>
     public static readonly IReadOnlySet<string> States = new HashSet<string>(StringComparer.Ordinal)
     {
@@ -48,18 +52,56 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     private readonly Action<string, object> publish;
     private readonly object                 stateLock = new();
 
-    private readonly Dictionary<int, SortedSet<long>> seenSeqs   = [];
-    private readonly Dictionary<int, int[]>           lastLevels = [];
+    /// <summary>每个游戏进程收到过的最大 seq（约定: 同一进程内严格递增, Afan 重载也不回退）</summary>
+    private readonly Dictionary<int, long> lastSeqs = [];
+
+    /// <summary>每个游戏进程上次发的等级读数（角色 + 数组）</summary>
+    private readonly Dictionary<int, (string ContentId, int[] Levels)> lastLevels = [];
+
+    /// <summary>每个游戏进程上一次经本机接口收下回报的时刻（Environment.TickCount64）</summary>
+    private readonly Dictionary<int, long> lastPostedAt = [];
 
     private string? jobJson;
     private long    revision;
     private int?    gamePid;
+    private string? unavailableReason;
+    private string? shotsDirectory;
+
+    /// <summary>经本机接口来的同一游戏的两条回报至少隔多久, 更密的回 429</summary>
+    public TimeSpan MinProgressInterval { get; set; } = TimeSpan.FromMilliseconds(200);
+
+    /// <summary>回报 shots 里的图只能在这个目录下; 不设用 <see cref="CatShots.Directory" /></summary>
+    public string ShotsDirectory
+    {
+        get => shotsDirectory ?? CatShots.Directory;
+        set => shotsDirectory = value;
+    }
+
+    /// <summary>
+    ///     游戏内取不到任务单（本机接口端口没开成、接管时绑不回）的原因; 不为 null 时 setJob 回 unsupported。为 null = 可用
+    /// </summary>
+    public string? UnavailableReason
+    {
+        get
+        {
+            lock (stateLock)
+                return unavailableReason;
+        }
+        set
+        {
+            lock (stateLock)
+                unavailableReason = value;
+        }
+    }
 
     /// <summary>
     ///     创建
     /// </summary>
     /// <param name="operationId">本实例的 operationId（还没 launch / adopt 时为 null）</param>
-    /// <param name="publish">发事件（方法名, 参数）</param>
+    /// <param name="publish">
+    ///     发事件（方法名, 参数）。<b>必须非阻塞</b>（只入队）: 回报与等级在本类的锁里发, 这样 <see cref="GameEnded" /> 之后（game.exited 之前）
+    ///     不会再有这个游戏的事件插进来
+    /// </param>
     public CatJobChannel(Func<string?> operationId, Action<string, object> publish)
     {
         this.operationId = operationId;
@@ -133,6 +175,9 @@ public sealed class CatJobChannel : ICatLocalEndpoints
 
         lock (stateLock)
         {
+            if (unavailableReason != null)
+                return CatSetJobResult.Rejected(CatCodes.UNSUPPORTED, unavailableReason);
+
             if (jobJson != null && newRevision <= revision)
                 return CatSetJobResult.StaleOk();
 
@@ -186,11 +231,14 @@ public sealed class CatJobChannel : ICatLocalEndpoints
         {
             gamePid = pid;
 
-            foreach (var other in seenSeqs.Keys.Where(x => x != pid).ToArray())
-                seenSeqs.Remove(other);
+            foreach (var other in lastSeqs.Keys.Where(x => x != pid).ToArray())
+                lastSeqs.Remove(other);
 
             foreach (var other in lastLevels.Keys.Where(x => x != pid).ToArray())
                 lastLevels.Remove(other);
+
+            foreach (var other in lastPostedAt.Keys.Where(x => x != pid).ToArray())
+                lastPostedAt.Remove(other);
         }
     }
 
@@ -220,69 +268,80 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     }
 
     /// <inheritdoc />
-    public CatLocalResponse PostProgress(string body)
+    public CatLocalResponse PostProgress(string body) =>
+        PostProgress(body, true);
+
+    /// <summary>
+    ///     收一条回报。rateLimited = 经本机接口来的（同一游戏两条之间不到 <see cref="MinProgressInterval" /> 回 429）; 模拟模式自己产生的回报不限
+    /// </summary>
+    internal CatLocalResponse PostProgress(string body, bool rateLimited)
     {
-        if (ParseProgress(body, out var progress, out var pid, out var seq) is { } error)
+        if (ParseProgress(body, ShotsDirectory, out var progress, out var pid, out var seq) is { } error)
             return new CatLocalResponse(400, CatLocalJson.Error(error));
 
+        // 先取 operationId 再进锁: 取它要拿外壳的锁, 两把锁不嵌套
+        var  operation = operationId();
+        var  now       = Environment.TickCount64;
         long currentRevision;
-        bool duplicate;
 
         lock (stateLock)
         {
             if (gamePid != pid)
                 return new CatLocalResponse(404, CatLocalJson.Error($"pid {pid} 不是本启动器守护的游戏"));
 
-            currentRevision = jobJson == null ? 0 : revision;
+            if (rateLimited && lastPostedAt.TryGetValue(pid, out var lastAt) && now - lastAt < (long)MinProgressInterval.TotalMilliseconds)
+                return new CatLocalResponse(429, CatLocalJson.Error($"回报太密, 两条之间至少隔 {MinProgressInterval.TotalMilliseconds:F0} 毫秒"));
 
-            if (!seenSeqs.TryGetValue(pid, out var seen))
-                seenSeqs[pid] = seen = [];
+            lastPostedAt[pid] = now;
+            currentRevision   = jobJson == null ? 0 : revision;
 
-            duplicate = !seen.Add(seq);
-
-            if (seen.Count > MAX_SEEN_SEQS)
+            // seq 在同一游戏进程内严格递增: 不大于已收最大值的就是重发或乱序, 不再发
+            if (!lastSeqs.TryGetValue(pid, out var last) || seq > last)
             {
-                foreach (var old in seen.Take(MAX_SEEN_SEQS / 2).ToArray())
-                    seen.Remove(old);
+                lastSeqs[pid]            = seq;
+                progress!["operationId"] = operation;
+                publish(PROGRESS_EVENT, progress);
             }
-        }
-
-        if (!duplicate)
-        {
-            progress!["operationId"] = operationId();
-            publish(PROGRESS_EVENT, progress);
         }
 
         return new CatLocalResponse(200, JsonSerializer.Serialize(new Dictionary<string, long> { ["revision"] = currentRevision }));
     }
 
     /// <summary>
-    ///     小模块读到的全部职业等级（下标为 ExpArrayIndex）: 与这个游戏上次发的不同才发 game.levels。pid ≤ 0 = 当前守护的游戏
+    ///     小模块读到的全部职业等级（下标为 ExpArrayIndex）与同一轮读到的当前角色: 角色或数组与这个游戏上次发的不同才发 game.levels。
+    ///     数组全为 0、角色没有 ContentId 时不发; pid ≤ 0 = 当前守护的游戏, 给了 pid 但不是当前守护的游戏时丢掉
     /// </summary>
-    public void ReportLevels(int pid, IReadOnlyList<int> levels)
+    public void ReportLevels(int pid, CatLevelsCharacter character, IReadOnlyList<int> levels)
     {
-        int target;
+        if (levels.Count == 0 || levels.All(x => x == 0) || string.IsNullOrEmpty(character.ContentId) || character.ContentId == "0")
+            return;
+
+        var operation = operationId();
+        var copy      = levels.ToArray();
 
         lock (stateLock)
         {
-            if (pid <= 0)
-            {
-                if (gamePid is not { } current)
-                    return;
-
-                pid = current;
-            }
-
-            target = pid;
-
-            if (lastLevels.TryGetValue(target, out var last) && last.SequenceEqual(levels))
+            if (gamePid is not { } current || (pid > 0 && pid != current))
                 return;
 
-            lastLevels[target] = levels.ToArray();
-        }
+            if (lastLevels.TryGetValue(current, out var last) && last.ContentId == character.ContentId && last.Levels.SequenceEqual(copy))
+                return;
 
-        Log.Information("[CatHost] 职业等级 pid={Pid}: {Levels}", target, string.Join(',', levels));
-        publish(LEVELS_EVENT, new { operationId = operationId(), pid = target, levels = levels.ToArray() });
+            lastLevels[current] = (character.ContentId, copy);
+            Log.Information("[CatHost] 职业等级 pid={Pid}: {Levels}", current, string.Join(',', copy));
+
+            publish
+            (
+                LEVELS_EVENT,
+                new
+                {
+                    operationId = operation,
+                    pid         = current,
+                    character   = new { name = character.Name, contentId = character.ContentId, homeWorldId = character.HomeWorldId },
+                    levels      = copy
+                }
+            );
+        }
     }
 
     /// <summary>
@@ -323,9 +382,10 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     }
 
     /// <summary>
-    ///     解析并校验一条回报; 通过返回 null, 否则返回 400 的原因
+    ///     解析并校验一条回报; 通过返回 null, 否则返回 400 的原因。seq 是 Unix 毫秒起算的大数（13 位）, 全程按 long 处理;
+    ///     shots 里的图只能是 <paramref name="shotsDirectory" /> 下、文件名为 <c>&lt;本条回报的 pid&gt;-&lt;seq&gt;.png</c> 的文件
     /// </summary>
-    internal static string? ParseProgress(string body, out JsonObject? progress, out int pid, out long seq)
+    internal static string? ParseProgress(string body, string shotsDirectory, out JsonObject? progress, out int pid, out long seq)
     {
         progress = null;
         pid      = 0;
@@ -339,10 +399,17 @@ public sealed class CatJobChannel : ICatLocalEndpoints
         try
         {
             node = JsonNode.Parse(body);
+
+            // 每一层的对象都展开一遍: 有重复的键在这里就报（不展开要到发事件序列化时才抛, 事件就丢了）
+            Materialize(node);
         }
         catch (JsonException ex)
         {
             return $"不是有效的 JSON: {ex.Message}";
+        }
+        catch (ArgumentException)
+        {
+            return "JSON 对象里有重复的键";
         }
 
         if (node is not JsonObject value)
@@ -374,9 +441,74 @@ public sealed class CatJobChannel : ICatLocalEndpoints
                 return $"{name} 必须是数组";
         }
 
+        if (value["shots"] is JsonArray shots)
+        {
+            foreach (var shot in shots)
+            {
+                if (shot is not JsonObject entry || StringOf(entry, "itemId") is not { Length: > 0 })
+                    return "shots 里每一项都要有 itemId";
+
+                if (StringOf(entry, "kind") is not ("completion" or "progress"))
+                    return "shots 的 kind 只能是 completion / progress";
+
+                if (!IsShotFile(StringOf(entry, "file"), (int)pidValue, shotsDirectory))
+                    return $"shots 的 file 只能是 {shotsDirectory} 下的 {pidValue}-<seq>.png";
+            }
+        }
+
         progress = value;
         pid      = (int)pidValue;
         return null;
+    }
+
+    /// <summary>
+    ///     截图文件是否在截图目录下（只这一层）、文件名是不是 <c>&lt;pid&gt;-&lt;数字&gt;.png</c> 且 pid 与回报一致
+    /// </summary>
+    internal static bool IsShotFile(string? file, int pid, string shotsDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(file) || !Path.IsPathFullyQualified(file))
+            return false;
+
+        string full;
+        string directory;
+
+        try
+        {
+            full      = Path.GetFullPath(file);
+            directory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(shotsDirectory));
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+
+        if (!string.Equals(Path.GetDirectoryName(full), directory, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var name   = Path.GetFileName(full);
+        var prefix = $"{pid}-";
+
+        if (!name.StartsWith(prefix, StringComparison.Ordinal) || !name.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var number = name[prefix.Length..^4];
+        return number.Length is > 0 and <= 19 && number.All(char.IsAsciiDigit);
+    }
+
+    private static void Materialize(JsonNode? node)
+    {
+        switch (node)
+        {
+            case JsonObject value:
+                foreach (var property in value)
+                    Materialize(property.Value);
+                break;
+
+            case JsonArray list:
+                foreach (var item in list)
+                    Materialize(item);
+                break;
+        }
     }
 
     private static string? StringOf(JsonObject value, string name) =>
