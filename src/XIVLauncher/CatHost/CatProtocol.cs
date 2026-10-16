@@ -239,6 +239,9 @@ public static class CatCodes
 
     /// <summary>这个启动器不支持该操作（如国际服、模拟启动器的 adopt）</summary>
     public const string UNSUPPORTED = "unsupported";
+
+    /// <summary>setJob: 任务单不是给本实例的（schema 不认识、sessionId 与 operationId 不一致, 或还没有 launch / adopt）</summary>
+    public const string JOB_MISMATCH = "jobMismatch";
 }
 
 /// <summary>game.exited 的 reason（不带 reason = 游戏自己退出或被外部结束）</summary>
@@ -501,6 +504,22 @@ public static class CatHandOff
 
     /// <summary>交接成功后发的事件, 载荷 { operationId, pid, processStartedAt }; 之后进程以 <see cref="CatHostRuntime.EXIT_HANDED_OFF" /> 退出</summary>
     public const string EVENT = "game.handedOff";
+}
+
+/// <summary>setJob 参数: job = 服务器生成的 cat-job/1 任务单, 原样转交 Afan</summary>
+public sealed record CatSetJobParams(JsonElement? Job);
+
+/// <summary>setJob 返回; stale = revision 不比已有的新, 没有替换</summary>
+public sealed record CatSetJobResult(bool Accepted, bool? Stale = null, string? Code = null, string? Message = null)
+{
+    /// <summary>已接受并替换</summary>
+    public static CatSetJobResult Ok() => new(true);
+
+    /// <summary>已接受但没替换（revision 不比已有的新）</summary>
+    public static CatSetJobResult StaleOk() => new(true, true);
+
+    /// <summary>未接受</summary>
+    public static CatSetJobResult Rejected(string code, string message) => new(false, null, code, message);
 }
 
 /// <summary>inject 参数; force = 已挂着也重新挂 Minion</summary>

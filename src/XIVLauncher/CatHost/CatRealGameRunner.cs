@@ -100,6 +100,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     /// <summary>本进程守着的游戏的守护记录与守护锁</summary>
     private readonly GameRecordWriter records = new();
 
+    /// <summary>任务单通道（Cat 上号自动开工）: 挂到本机监听上给 Afan 用, 任务单写进守护记录; 外壳不支持时为 null</summary>
+    private CatJobChannel? jobs;
+
     /// <summary>
     ///     正在交接停止或已交接: 进程退出前不再碰游戏、记录、端口文件, 也不再重开（游戏留给下一个守护进程）。
     ///     没交接成时撤回, 之前被它挡下的收尾由 <see cref="HandOffDecidedAsync" /> 的等待方补做
@@ -122,6 +125,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     public async Task<int> RunAsync(CatLaunchRequest launchRequest, ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
         request = launchRequest;
+        AttachJobs(reporter);
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, closeCts.Token);
 
@@ -194,6 +198,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             record.CharacterName,
             record.CharacterHomeWorld
         );
+
+        AttachJobs(reporter);
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, closeCts.Token);
 
@@ -319,7 +325,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         context = new GameLaunchContext(new LoginResult { State = LoginState.Ok, OAuthLogin = oauth }, area, areas, request.Platform);
 
-        dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel);
+        dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel) { CatEndpoints = jobs };
+
+        // 记录里的任务单（工作台在 game.adopted 之后还会再发一次, 这里只是兜底）
+        jobs?.Restore(record.CatJob);
 
         if (!string.IsNullOrEmpty(tgt) && !string.IsNullOrEmpty(guid))
             new LoginChannelContext(device).BindLoginSessionRefresh(dcTravel, tgt, guid);
@@ -364,6 +373,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                     GuardPid = Environment.ProcessId,
                     GuardStartedAt = GameRecordWriter.SelfStartedAt,
                     DcTravelSession = null,
+                    CatJob = jobs?.JobElement ?? record.CatJob,
                     UpdatedAt = DateTimeOffset.UtcNow
                 }
             )
@@ -408,11 +418,68 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             return launched;
         }
 
-        // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色（编排早就做完了, 不再重做）
-        if (record.AutoEnter && !process.HasExited)
-            StartObserve(launched, reporter, cancellationToken);
+        // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色并读职业等级（编排早就做完了, 不再重做）; 其它游戏只读职业等级
+        if (!process.HasExited)
+        {
+            if (record.AutoEnter)
+                StartObserve(launched, reporter, cancellationToken);
+            else
+                StartLevelWatch(launched, reporter, cancellationToken);
+        }
 
         return launched;
+    }
+
+    /// <summary>
+    ///     接上外壳给的任务单通道: 任务单变了就改写当前游戏的守护记录
+    /// </summary>
+    private void AttachJobs(ICatLaunchReporter reporter)
+    {
+        jobs = reporter.Jobs;
+
+        if (jobs != null)
+            jobs.Changed += () => _ = RewriteGameRecordJobAsync();
+    }
+
+    /// <summary>
+    ///     不自动进入角色的游戏: 后台注入游戏内模块, 之后每隔一段时间读一次全部职业等级（不挡崩溃守护, 游戏进程收尾时取消）
+    /// </summary>
+    private void StartLevelWatch(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken token)
+    {
+        var process      = launched.UnderlyingProcess;
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var game         = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea);
+        var watch        = new CatLevelWatch(game, reporter);
+        var watchToken   = cancellation.Token;
+
+        lock (cleanupLock)
+        {
+            autoEnterCancellations[launched.ProcessID] = cancellation;
+            autoEnterTasks.Add
+            (
+                Task.Run
+                (async () =>
+                    {
+                        try
+                        {
+                            await watch.RunAsync(watchToken).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // 游戏退出或收到关闭请求
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, "[CatHost] 读职业等级的后台任务出错（游戏不受影响）");
+                        }
+                        finally
+                        {
+                            game.Dispose();
+                        }
+                    }
+                )
+            );
+        }
     }
 
     /// <summary>
@@ -536,6 +603,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                                   Tgt = await EncryptOrNullAsync(oauth?.TGT).ConfigureAwait(false) ?? record.Tgt,
                                   Guid = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false) ?? record.Guid,
                                   DcTravelSession = await EncryptOrNullAsync(session).ConfigureAwait(false),
+                                  CatJob = jobs?.JobElement ?? record.CatJob,
                                   UpdatedAt = DateTimeOffset.UtcNow
                               };
                           }
@@ -738,7 +806,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             accountManager.Save(account);
         }
 
-        dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel);
+        // 本机监听同时提供 /cat/job、/cat/progress（Cat 上号自动开工）
+        dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel) { CatEndpoints = jobs };
 
         var loginResult = await LoginWithSavedCredentialAsync(reporter, cancellationToken).ConfigureAwait(false);
 
@@ -1496,8 +1565,11 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             reporter.Stage(CatStages.RUNNING);
 
+            // 盛趣、WeGame 的游戏一律注入游戏内模块: 自动进入角色的由编排注入, 进世界后在看当前角色时顺带读职业等级; 其它的只读职业等级
             if (request.AutoEnter)
                 StartAutoEnter(launched, reporter, startToken);
+            else
+                StartLevelWatch(launched, reporter, startToken);
         }
 
         return (launched, dalamudOk, companionAppManager);
@@ -1768,6 +1840,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 CharacterName             = request.CharacterName,
                 CharacterHomeWorld        = request.CharacterHomeWorld,
                 CrashDialogTimeoutSeconds = request.CrashDialogTimeoutSeconds,
+                CatJob                    = jobs?.JobElement,
                 GuardPid                  = Environment.ProcessId,
                 GuardStartedAt            = GameRecordWriter.SelfStartedAt,
                 UpdatedAt                 = DateTimeOffset.UtcNow
@@ -1798,6 +1871,26 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                     Guid = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false),
                     UpdatedAt = DateTimeOffset.UtcNow
                 };
+            }
+        );
+
+    /// <summary>
+    ///     setJob 换了任务单后改写当前游戏守护记录里的任务单（接管的进程凭它继续给 Afan）; 记录还没写的不用改（写时会带上）,
+    ///     交接停止中或已交接的不改（记录已归接管方）
+    /// </summary>
+    private Task RewriteGameRecordJobAsync() =>
+        records.WriteAsync
+        (() =>
+            {
+                if (handingOff || currentProcess is not { } process || !records.TryGetRecorded(process.ProcessID, out var startedAt))
+                    return Task.FromResult<GameRecord?>(null);
+
+                return Task.FromResult
+                (
+                    GameRecords.ReadMatching(process.ProcessID, startedAt) is { } record
+                        ? record with { CatJob = jobs?.JobElement, UpdatedAt = DateTimeOffset.UtcNow }
+                        : null
+                );
             }
         );
 

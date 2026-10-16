@@ -83,6 +83,11 @@ public sealed record GameRecord
 
     public int CrashDialogTimeoutSeconds { get; init; }
 
+    /// <summary>
+    ///     Cat 下发的任务单（cat-job/1, 原样）; 接管后新守护进程凭它继续给游戏内 Afan 提供 <c>/cat/job</c>。没有为 null
+    /// </summary>
+    public JsonElement? CatJob { get; init; }
+
     /// <summary>当前守护者进程; 接管时据此判断原守护者是否还活着</summary>
     public required int GuardPid { get; init; }
 

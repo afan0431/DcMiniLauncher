@@ -9,6 +9,7 @@ namespace XIVLauncher.CatHost;
 /// <summary>
 ///     自动进入角色的真实游戏一侧: 注入并连上游戏内模块, 换大厅复用 <see cref="InGameTravelService" /> 的那套步骤。
 ///     管道和换服的闸（按进程号）只在发命令时占着, <see cref="Release" /> 后别的操作（游戏内跨区、读选角列表）才用得了模块。
+///     不自动进入角色的游戏读职业等级（<see cref="CatLevelWatch" />）也用它注入和通话。
 /// </summary>
 internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
 {
@@ -46,6 +47,9 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
 
     /// <inheritdoc />
     public string CurrentAreaName { get; private set; }
+
+    /// <inheritdoc />
+    public int ProcessId => process.Id;
 
     /// <inheritdoc />
     public IReadOnlyList<string> AreaNames => areas.Select(x => x.AreaName).ToArray();

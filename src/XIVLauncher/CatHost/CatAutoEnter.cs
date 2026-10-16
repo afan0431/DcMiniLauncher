@@ -44,6 +44,9 @@ public interface ICatAutoEnterGame : IMiniModuleChannel
     /// <summary>游戏进程是否已退出</summary>
     bool HasExited { get; }
 
+    /// <summary>游戏进程号（报职业等级用）; 不知道时为 0, 按当前守护的游戏算</summary>
+    int ProcessId => 0;
+
     /// <summary>游戏现在连着的大区名</summary>
     string CurrentAreaName { get; }
 
@@ -149,6 +152,7 @@ public sealed class CatAutoEnter
     private int?                          reportedQueue;
     private string?                       enteredContentId;
     private TimeSpan?                     lobbyUnreadableSince;
+    private CatLevelReader?               levelReader;
 
     /// <summary>
     ///     创建一次编排
@@ -242,7 +246,8 @@ public sealed class CatAutoEnter
     }
 
     /// <summary>
-    ///     编排结束或停手之后: 隔一段时间看一次游戏里当前是谁, 角色变了（人手动进了游戏、换了角色）就再报一次。
+    ///     编排结束或停手之后: 隔一段时间看一次游戏里当前是谁, 角色变了（人手动进了游戏、换了角色）就再报一次;
+    ///     角色在世界里时顺带读一次全部职业等级（有变化才发 game.levels, 模块太旧就不读）。
     ///     管道被别的操作占着时跳过这一次; 游戏退出或取消即结束。
     /// </summary>
     public async Task ObserveAsync(CancellationToken cancellationToken)
@@ -261,8 +266,14 @@ public sealed class CatAutoEnter
             {
                 var who = CatModuleReplies.ParseWhoAmI(await game.SendAsync("WHOAMI", cancellationToken).ConfigureAwait(false));
 
-                if (who is { Loaded: true } && who.ContentId != EnteredContentId)
-                    ReportEntered(who);
+                if (who is { Loaded: true })
+                {
+                    if (who.ContentId != EnteredContentId)
+                        ReportEntered(who);
+
+                    levelReader ??= new CatLevelReader(reporter, game.ProcessId);
+                    await levelReader.ReadAsync(game, cancellationToken).ConfigureAwait(false);
+                }
             }
             catch (OperationCanceledException)
             {

@@ -759,6 +759,32 @@ public sealed class CatAutoEnterTests
     }
 
     [Fact]
+    public async Task Observe_ReadsLevelsWhileInWorld_AndStopsAskingAnOldModule()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null));
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+
+        // 编排本身不读等级: 等级只在之后每 15 秒的检查里顺带读
+        Assert.DoesNotContain("LEVELS", game.Commands);
+
+        var ticks = 0;
+        game.Intercept = command => command == "LEVELS" ? (ticks < 3 ? $"OK loaded=1 n=3 levels=90,{80 + ticks},0" : "FAIL unknown-command") : null;
+        game.OnDelay = g =>
+        {
+            if (++ticks == 6)
+                g.HasExited = true;
+        };
+
+        await flow.ObserveAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal([[90, 81, 0], [90, 82, 0]], reporter.LevelReports.Select(x => x.Levels));
+        // 第 3 次回 unknown-command 之后不再问
+        Assert.Equal(3, game.Commands.Count(x => x == "LEVELS"));
+    }
+
+    [Fact]
     public async Task Observe_AfterAStop_ReportsTheCharacterOnceSomeoneEntersByHand()
     {
         var (game, reporter) = Setup(Chara("11", "小白"));

@@ -60,6 +60,12 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
     /// </summary>
     public Func<string?, object>? InGameTravelSettingsHandler { get; set; }
 
+    /// <summary>
+    ///     <c>GET /cat/job?pid=</c>、<c>POST /cat/progress</c> 的处理方（Cat 上号自动开工）: 游戏内 Afan 按 pid 读端口文件找到这里,
+    ///     取任务单、报进度。没装时这两条路由回 404
+    /// </summary>
+    public ICatLocalEndpoints? CatEndpoints { get; set; }
+
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -98,7 +104,8 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
                   .WithUrlPrefix(urlPrefix)
                   .WithMode(HttpListenerMode.EmbedIO)
             )
-            .WithWebApi("/dctravel", m => m.WithController(() => new RpcController(this)));
+            .WithWebApi("/dctravel", m => m.WithController(() => new RpcController(this)))
+            .WithWebApi("/cat", m => m.WithController(() => new CatLocalController(() => CatEndpoints)));
 
         webServer.StateChanged += (_, e) =>
         {

@@ -107,6 +107,14 @@ public interface ICatLaunchReporter
     {
     }
 
+    /// <summary>本进程的任务单通道（Cat 上号自动开工）; 不支持时为 null</summary>
+    CatJobChannel? Jobs => null;
+
+    /// <summary>游戏内模块读到的全部职业等级（下标为 ExpArrayIndex）; pid ≤ 0 表示当前守护的游戏。有变化才发 game.levels</summary>
+    void Levels(int pid, IReadOnlyList<int> levels)
+    {
+    }
+
     /// <summary>游戏进程已创建</summary>
     void Started(int pid, DateTimeOffset processStartedAt);
 
@@ -240,6 +248,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     private readonly Channel<(string Method, object Parameters)> events =
         Channel.CreateUnbounded<(string Method, object Parameters)>(new UnboundedChannelOptions { SingleReader = true });
 
+    private readonly CatJobChannel jobs;
+
     private ICatGameRunner?   runner;
     private CatLaunchRequest? request;
     private string            stage = CatStages.IDLE;
@@ -276,9 +286,13 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         this.runnerFactory = runnerFactory;
         this.publish       = publish;
         this.redactor      = redactor;
+        jobs               = new CatJobChannel(() => OperationId, Publish);
 
         _ = Task.Run(PumpEventsAsync);
     }
+
+    /// <inheritdoc />
+    public CatJobChannel Jobs => jobs;
 
     /// <summary>生命周期结束时完成, 值为进程退出码</summary>
     public Task<int> Completion => completion.Task;
@@ -338,6 +352,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             CatHandOff.METHOD => HandOffBoxedAsync(cancellationToken),
             "weGame.confirmSms" => Task.FromResult<object?>(ConfirmWeGameSms(Deserialize<CatWeGameConfirmSmsParams>(parameters))),
             "selectCharacter" => Task.FromResult<object?>(SelectCharacter(Deserialize<CatSelectCharacterParams>(parameters))),
+            CatJobChannel.METHOD => Task.FromResult<object?>(jobs.SetJob(Deserialize<CatSetJobParams>(parameters)?.Job)),
             _        => throw new CatRpcException(CatRpcException.METHOD_NOT_FOUND, $"未知方法: {method}")
         };
 
@@ -955,6 +970,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             processStartedAt = startedAt;
         }
 
+        jobs.GameStarted(newPid);
         Publish("game.adopted", new { operationId = OperationId, pid = newPid, processStartedAt = CatProtocol.FormatTimestamp(startedAt) });
     }
 
@@ -967,6 +983,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             processStartedAt = startedAt;
         }
 
+        jobs.GameStarted(newPid);
         Publish("game.started", new { operationId = OperationId, pid = newPid, processStartedAt = CatProtocol.FormatTimestamp(startedAt) });
     }
 
@@ -981,6 +998,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             minionOk         = null;
         }
 
+        jobs.GameStarted(newPid);
         Publish("game.restarted", new { operationId = OperationId, oldPid, pid = newPid, processStartedAt = CatProtocol.FormatTimestamp(startedAt) });
     }
 
@@ -1008,8 +1026,13 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         lock (stateLock)
             stage = CatStages.EXITED;
 
+        jobs.GameEnded(exitedPid);
         Publish("game.exited", new { operationId = OperationId, pid = exitedPid, exitCode, reason, code, message = Redact(message) });
     }
+
+    /// <inheritdoc />
+    public void Levels(int levelsPid, IReadOnlyList<int> levels) =>
+        jobs.ReportLevels(levelsPid, levels);
 
     /// <inheritdoc />
     public void Failed(string code, string message)

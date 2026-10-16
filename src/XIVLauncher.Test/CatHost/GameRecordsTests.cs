@@ -74,6 +74,35 @@ public sealed class GameRecordsTests : IDisposable
     }
 
     [Fact]
+    public void CatJob_RoundTripsAsJson_AndIsLeftOutWhenNull()
+    {
+        using var game = StartSleeper();
+
+        try
+        {
+            var job = CatJobChannelTests.Job(9);
+
+            Assert.True(GameRecords.Write(NewRecord(game) with { CatJob = job }));
+
+            var read = GameRecords.Read(game.Id);
+            Assert.NotNull(read?.CatJob);
+            Assert.Equal(9, read.CatJob.Value.GetProperty("revision").GetInt64());
+            Assert.Equal("七色花", read.CatJob.Value.GetProperty("character").GetProperty("name").GetString());
+
+            // 文件里是嵌套的 JSON 对象, 不是转义的字符串
+            Assert.Contains("\"catJob\": {", File.ReadAllText(GameRecords.FilePath(game.Id)));
+
+            Assert.True(GameRecords.Write(NewRecord(game)));
+            Assert.Null(GameRecords.Read(game.Id)!.CatJob);
+            Assert.DoesNotContain("catJob", File.ReadAllText(GameRecords.FilePath(game.Id)));
+        }
+        finally
+        {
+            game.Kill();
+        }
+    }
+
+    [Fact]
     public void ReadMatching_RejectsReusedPid()
     {
         using var game = StartSleeper();

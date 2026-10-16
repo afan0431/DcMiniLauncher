@@ -116,6 +116,9 @@ public partial class App
         else
             CatHostPresence.Hold();
 
+        // Cat 上号自动开工的截图目录: 建好、普通用户可读、删掉 3 天前的
+        CatShots.Prepare();
+
         var bootstrapLine = await ReadBootstrapLineAsync().ConfigureAwait(false);
 
         if (!CatHostRuntime.TryParseBootstrap(bootstrapLine, out var bootstrap, out var bootstrapError))
