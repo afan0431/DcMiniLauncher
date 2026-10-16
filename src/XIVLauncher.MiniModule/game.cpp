@@ -2227,6 +2227,60 @@ namespace
         }
     }
 
+    // ---- LEVELS --------------------------------------------------------------
+
+    struct LevelsData
+    {
+        int   status; // 1=正常 -1=异常 -2=PlayerState 读歪
+        int   loaded;
+        short levels[offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT];
+    };
+
+    void OpLevels(LevelsData* out)
+    {
+        memset(out, 0, sizeof(LevelsData));
+        out->status = -1;
+
+        __try
+        {
+            const auto state  = reinterpret_cast<uint8_t*>(g_playerState);
+            const auto loaded = ReadAt<unsigned char>(state, offsets::PLAYER_STATE_IS_LOADED);
+
+            if (loaded > 1)
+            {
+                out->status = -2;
+                return;
+            }
+
+            if (loaded == 0)
+            {
+                out->status = 1;
+                return;
+            }
+
+            for (int i = 0; i < offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT; i++)
+            {
+                const auto level = ReadAt<short>(state, offsets::PLAYER_STATE_CLASS_JOB_LEVELS + static_cast<uintptr_t>(i) * sizeof(short));
+
+                if (level < 0 || level > offsets::PLAYER_STATE_CLASS_JOB_LEVEL_MAX)
+                {
+                    out->status = -2;
+                    return;
+                }
+
+                out->levels[i] = level;
+            }
+
+            out->loaded = 1;
+            out->status = 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] LEVELS 异常 code=0x%08X", GetExceptionCode());
+            out->status = -1;
+        }
+    }
+
     // 操作命令共用的前置; 失败时 failure 是要回给启动器的那一行
     bool PrepareAction(CallStatePtr& state, std::string& failure)
     {
@@ -2465,6 +2519,45 @@ std::string GameWhoAmI()
                 "OK loaded=%d cid=%llu world=%u home=%u worldName=%s homeName=%s loggedIn=%d inZone=%d lobbyCid=%llu name=%s",
                 data->loaded, data->contentId, data->currentWorldId, data->homeWorldId, data->currentWorldName,
                 data->homeWorldName, data->loggedIn, data->inZone, data->lobbyContentId, data->name);
+    return response;
+}
+
+// 全部职业等级, 只读。响应只有一行:
+//   OK loaded=<0|1> n=<个数> levels=<逗号分隔的等级>
+// 下标为 ClassJob 表的 ExpArrayIndex, 未解锁为 0; loaded=0（不在世界里）时 n=0、levels 为空。
+std::string GameLevels()
+{
+    if (!GameResolve())
+        return "FAIL sigscan-failed";
+
+    if (!ResolvePlayerState())
+        return "FAIL sigscan-failed:PlayerState";
+
+    auto data = std::make_shared<LevelsData>();
+
+    if (!MainThreadRun([data] { OpLevels(data.get()); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    switch (data->status)
+    {
+        case 1:  break;
+        case -2: return "FAIL bad-state";
+        default: return "FAIL exception";
+    }
+
+    if (data->loaded == 0)
+        return "OK loaded=0 n=0 levels=";
+
+    std::string response = "OK loaded=1 n=" + std::to_string(offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT) + " levels=";
+
+    for (int i = 0; i < offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT; i++)
+    {
+        if (i > 0)
+            response += ',';
+
+        response += std::to_string(data->levels[i]);
+    }
+
     return response;
 }
 

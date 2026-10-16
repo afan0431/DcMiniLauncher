@@ -126,6 +126,9 @@ namespace
         if (command == "WHOAMI")
             return GameWhoAmI();
 
+        if (command == "LEVELS")
+            return GameLevels();
+
         if (command.rfind("DIALOG ", 0) == 0)
             return GameDialog(command.substr(7));
 

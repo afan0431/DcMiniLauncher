@@ -177,6 +177,15 @@ namespace offsets
     inline constexpr size_t    PLAYER_STATE_NAME_LEN   = 64;
     inline constexpr uintptr_t PLAYER_STATE_CONTENT_ID = 0x68;  // :19 ulong。静态: 否  实机: 否
 
+    // 各职业等级, 下标为 ClassJob 表的 ExpArrayIndex, 未解锁为 0。
+    // 出处: 国服 Dalamud（Soil）Hooks\26-10-14-01\FFXIVClientStructs.dll 元数据, PlayerState._classJobLevels = FixedSizeArray35<short> @0x8A
+    //   （同处 CurrentClassJobId @0x7E byte、CurrentLevel @0x88 short、_classJobExperience @0xD0 FixedSizeArray35<int>）。
+    // 实机: 是（2026-10-16 开发机, 从外部 ReadProcessMemory 只读采样: 青魔 25 = 80、当前职业机工士 → 下标 20 = CurrentLevel 100、
+    //   唯一未满级的下标 32（驯兽师, 国服 ClassJob 43）同时有经验值, 三项自洽）。下标 33、34 没有对应职业。
+    inline constexpr uintptr_t PLAYER_STATE_CLASS_JOB_LEVELS      = 0x8A;  // short[35]
+    inline constexpr int       PLAYER_STATE_CLASS_JOB_LEVEL_COUNT = 35;
+    inline constexpr short     PLAYER_STATE_CLASS_JOB_LEVEL_MAX   = 200;   // 读出超过它（或为负）就当读歪了
+
     // ---- AtkUnitBase / 对话框（Component/GUI/AtkUnitBase.cs）----------------
     // 以下各项静态: 否  实机: 否（0x1E4 紧挨着右键菜单已在用的 BlockedParentId 0x1EA, 仅此旁证）
     inline constexpr uintptr_t ATK_UNIT_BASE_ATK_VALUES       = 0x178;  // :30 AtkValue*
