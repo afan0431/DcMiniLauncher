@@ -801,6 +801,73 @@ public sealed class CatWeGameLoginCaptureTests
 
     #endregion
 
+    #region 硬件自动登录接入 afterLaunch
+
+    [Fact]
+    public async Task HwLogin_QqPassword_WithChip_RunsFlow_AndFallsBackWhenNoChip()
+    {
+        // 接了硬件键鼠, 但探测不到芯片（OpenResult=false）: 走硬件登录分支, 退回员工手动并报原因
+        var keyboard = new StubHidKeyboard { OpenResult = false };
+        environment.Result = new WeGameCaptureResult(USER_ID, TOKEN);
+
+        var capture = new CatWeGameLoginCapture(environment, store, redactor)
+        {
+            Screen     = new StubWeGameScreen(),
+            Keyboard   = keyboard,
+            Foreground = new StubWeGameForeground()
+        };
+
+        await capture.FindRowAsync(HwRequest(null), reporter, CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.True(keyboard.TryOpenCount >= 1);
+        Assert.Contains(reporter.HwFallbacks, r => r.Contains("未接硬件键鼠"));
+    }
+
+    [Fact]
+    public async Task HwLogin_NotTriggered_ForScanLogin()
+    {
+        // QQ 扫码（带 weGameScan）: 不走硬件登录, 照旧用观察器, 不碰硬件、不报退回手动
+        var keyboard = new StubHidKeyboard();
+        environment.Result = new WeGameCaptureResult(USER_ID, TOKEN);
+
+        var capture = new CatWeGameLoginCapture(environment, store, redactor)
+        {
+            Screen     = new StubWeGameScreen(),
+            Keyboard   = keyboard,
+            Foreground = new StubWeGameForeground()
+        };
+
+        await capture.FindRowAsync(HwRequest(CatWeGameScan.Qq), reporter, CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(0, keyboard.TryOpenCount);
+        Assert.Empty(reporter.HwFallbacks);
+    }
+
+    [Fact]
+    public async Task HwLogin_NotTriggered_WithoutPassword()
+    {
+        // 没下发密码: 不走硬件登录（与加这个功能之前一样）
+        var keyboard = new StubHidKeyboard();
+        environment.Result = new WeGameCaptureResult(USER_ID, TOKEN);
+
+        var capture = new CatWeGameLoginCapture(environment, store, redactor)
+        {
+            Screen     = new StubWeGameScreen(),
+            Keyboard   = keyboard,
+            Foreground = new StubWeGameForeground()
+        };
+
+        await capture.FindRowAsync(Request(true), reporter, CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(0, keyboard.TryOpenCount);
+        Assert.Empty(reporter.HwFallbacks);
+    }
+
+    private static CatLaunchRequest HwRequest(CatWeGameScan? scan) =>
+        Request(true) with { Password = new CatSecret("pw1234Ab"), WeGameScan = scan };
+
+    #endregion
+
     private CatWeGameLoginCapture Create() =>
         new(environment, store, redactor);
 

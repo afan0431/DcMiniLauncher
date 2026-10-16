@@ -288,6 +288,16 @@ internal sealed class RecordingReporter : ICatLaunchReporter
     public void WeGameSmsResult(string challengeId, bool passed) =>
         Entries.Enqueue($"smsResult:{challengeId}:{(passed ? "passed" : "notPassed")}");
 
+    /// <summary>硬件自动登录退回手动的原因, 按顺序</summary>
+    public ConcurrentQueue<string> HwFallbacks { get; } = new();
+
+    public void WeGameHwLoginFallback(string reason)
+    {
+        HwFallbacks.Enqueue(reason);
+        Entries.Enqueue($"hwFallback:{reason}");
+        Messages.Enqueue(reason);
+    }
+
     /// <summary>报出来的角色列表, 按顺序</summary>
     public ConcurrentQueue<(bool NeedsChoice, IReadOnlyList<CatCharacterInfo> Characters)> CharacterLists { get; } = new();
 
@@ -314,6 +324,128 @@ internal sealed class RecordingReporter : ICatLaunchReporter
         Entries.Enqueue($"stopped:{code}");
         Messages.Enqueue(message);
     }
+}
+
+/// <summary>
+///     记录调用、不接硬件的假硬件键鼠。遇硬件键盘打不出的字符（非 US-ASCII 可打印）照真实实现返回 false
+/// </summary>
+internal sealed class StubHidKeyboard : ICatHidKeyboard
+{
+    public bool OpenResult { get; set; } = true;
+
+    public int TryOpenCount { get; private set; }
+
+    public StringBuilder Typed { get; } = new();
+
+    public List<(HidModifiers Modifiers, HidKey Key)> Presses { get; } = [];
+
+    public List<(int X, int Y)> Clicks { get; } = [];
+
+    /// <summary>每次点击后回调（测试用它在某个坐标被点时翻转登录状态）</summary>
+    public Action<int, int>? OnClick { get; set; }
+
+    public string? PortName => OpenResult ? "COM-TEST" : null;
+
+    public bool TryOpen()
+    {
+        TryOpenCount++;
+        return OpenResult;
+    }
+
+    public Task<bool> TypeTextAsync(string text, CancellationToken ct)
+    {
+        if (!CatHid9329Protocol.CanType(text))
+            return Task.FromResult(false);
+
+        Typed.Append(text);
+        return Task.FromResult(true);
+    }
+
+    public Task PressAsync(HidModifiers modifiers, HidKey key, CancellationToken ct)
+    {
+        Presses.Add((modifiers, key));
+        return Task.CompletedTask;
+    }
+
+    public Task ClickAsync(int screenX, int screenY, int screenWidth, int screenHeight, CancellationToken ct)
+    {
+        Clicks.Add((screenX, screenY));
+        OnClick?.Invoke(screenX, screenY);
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
+///     假的前台窗口操作。SignedIn 翻 true 后登录窗消失、主窗口出现; InterruptUntilCheck 控制前几次核对前台返回 false（模拟前台被抢走）
+/// </summary>
+internal sealed class StubWeGameForeground : ICatWeGameForeground
+{
+    private int checks;
+
+    public CatWeGameWindowRect? Login { get; set; } = new(0, 0, 1210, 680);
+
+    public CatWeGameWindowRect? Main { get; set; } = new(0, 0, 1600, 900);
+
+    public CatScreenSize Screen { get; set; } = new(1920, 1080);
+
+    public bool SignedIn { get; set; }
+
+    /// <summary>前几次 <see cref="LoginWindowIsForeground" /> 返回 false, 之后一直 true</summary>
+    public int InterruptUntilCheck { get; set; }
+
+    public int FocusCount { get; private set; }
+
+    public CatWeGameWindowRect? LoginWindow() => SignedIn ? null : Login;
+
+    public CatWeGameWindowRect? MainWindow() => SignedIn ? Main : null;
+
+    public bool FocusLoginWindow()
+    {
+        FocusCount++;
+        return Login != null;
+    }
+
+    public bool LoginWindowIsForeground() => ++checks > InterruptUntilCheck;
+
+    public CatScreenSize PrimaryScreen() => Screen;
+}
+
+/// <summary>
+///     假的 WeGame 屏幕操作。页面判断 / 密码错 / 等手机确认用可设的值或探针（测试驱动状态变化）
+/// </summary>
+internal sealed class StubWeGameScreen : ICatWeGameScreen
+{
+    public CatWeGameLoginWindow? Window { get; set; } = new(1210, 680);
+
+    public bool? QqPasswordPage { get; set; } = true;
+
+    public bool AccountIsMatch { get; set; }
+
+    public Func<bool> PasswordRejectedProbe { get; set; } = () => false;
+
+    public Func<bool> PhoneConfirmProbe { get; set; } = () => false;
+
+    public List<(int X, int Y)> Clicks { get; } = [];
+
+    public CatWeGameLoginWindow? CaptureLoginWindow() => Window;
+
+    public bool ClickLoginWindow(int x, int y)
+    {
+        Clicks.Add((x, y));
+        return Window != null;
+    }
+
+    public CatWeGameSmsPrompt? FindSmsPrompt() => null;
+
+    public bool ConfirmSmsPrompt() => false;
+
+    public bool? OnQqPasswordPage() => QqPasswordPage;
+
+    public bool AccountMatches(string account) => AccountIsMatch;
+
+    public bool PasswordRejected() => PasswordRejectedProbe();
+
+    public bool AwaitingPhoneConfirm() => PhoneConfirmProbe();
 }
 
 internal static class CatTestNames

@@ -262,6 +262,48 @@ public sealed class CatRpcServerTests : IDisposable
         Assert.Equal(new CatLaunchRequest("op1", "123456", false, null, Platform: XIVAccountType.WeGame), runner.Request);
     }
 
+    [Fact]
+    public async Task Launch_WeGame_WithPassword_KeepsIt_AndNeverPrintsIt()
+    {
+        const string PW = "wegame-qq-pw-9f3a";
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin = true, password = PW }
+        );
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        var request = runner.Request!;
+        Assert.Equal(PW, request.Password!.Reveal());
+        Assert.True(request.WeGameLogin);
+        Assert.DoesNotContain(PW, request.ToString());
+        Assert.DoesNotContain(PW, $"{request}");
+
+        // 已登记脱敏: 不小心写进发给外壳的文字都会被遮住
+        runner.Reporter!.Log("error", $"登录失败 {PW}");
+        runner.Reporter.WeGameHwLoginFallback($"密码 {PW} 被拒");
+
+        var seen = new List<(string Method, JsonNode? Params)>();
+        client.WaitForEvent("weGame.hwLoginFallback", Timeout, seen);
+        Assert.All(seen, x => Assert.DoesNotContain(PW, x.Params?.ToJsonString(CatProtocol.JsonOptions) ?? string.Empty));
+    }
+
+    [Fact]
+    public async Task Launch_Shengqu_WithPassword_DropsIt()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "shengqu", password = "pw-should-drop" });
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.Null(runner.Request!.Password);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("shengqu")]
@@ -856,9 +898,9 @@ public sealed class CatRpcServerTests : IDisposable
     [Theory]
     [InlineData(null)]
     [InlineData("shengqu")]
-    [InlineData("weGame")]
     public async Task Launch_DomesticPlatform_IgnoresPassword(string? platform)
     {
+        // 盛趣号带来的密码一律丢掉（WeGame 现在会留着给硬件自动输入, 另有专门的 Launch_WeGame_WithPassword_KeepsIt 覆盖）
         const string PASSWORD = "should-not-be-kept";
         await using var client = await ConnectAndHelloAsync();
 
@@ -872,8 +914,7 @@ public sealed class CatRpcServerTests : IDisposable
         Assert.Null(runner.Request.Password);
 
         // 与不带 password 时得到的请求完全相同
-        var expectedType = platform == "weGame" ? XIVAccountType.WeGame : XIVAccountType.Sdo;
-        Assert.Equal(new CatLaunchRequest("op1", "acc", false, null, Platform: expectedType), runner.Request);
+        Assert.Equal(new CatLaunchRequest("op1", "acc", false, null, Platform: XIVAccountType.Sdo), runner.Request);
     }
 
     [Theory]
