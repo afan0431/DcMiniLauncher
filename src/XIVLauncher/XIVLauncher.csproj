@@ -92,6 +92,7 @@
         <PackageReference Include="Serilog.Sinks.Debug"/>
         <PackageReference Include="Serilog.Sinks.File"/>
         <PackageReference Include="SharedMemory"/>
+        <PackageReference Include="System.IO.Ports"/>
         <PackageReference Include="CommunityToolkit.Mvvm"/>
         <PackageReference Include="Velopack"/>
         <PackageReference Include="ZXing.Net"/>
