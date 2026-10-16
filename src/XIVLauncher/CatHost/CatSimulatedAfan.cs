@@ -8,8 +8,9 @@ namespace XIVLauncher.CatHost;
 /// <summary>
 ///     模拟模式里的游戏内 Afan（供 Cat 不开游戏联调上号自动开工）: 每一步按当前任务单推进一次, 回报经
 ///     <see cref="CatJobChannel.PostProgress" />（与真 Afan 的 <c>POST /cat/progress</c> 同一条路, 一样校验、去重、发 game.jobProgress）,
-///     职业等级经 <see cref="CatJobChannel.ReportLevels" />（有变化才发 game.levels）, 是否在副本中经 <see cref="CatJobChannel.ReportDuty" />
-///     （有变化才发 game.duty; 真实启动时这两样由小模块读, 模拟里一起在这里产生）。规则见 <see cref="CatSimulatedGameRunner" />。
+///     职业等级经 <see cref="CatJobChannel.ReportLevels" />（有变化才发 game.levels）, 是否在副本中经 <see cref="CatDutyTracker" /> 与
+///     <see cref="CatJobChannel.ReportDuty" />（有变化才发 game.duty, 读到过值之后接连两步读不到发"未知"; 真实启动时这两样由小模块读, 模拟里一起在这里产生）。
+///     规则见 <see cref="CatSimulatedGameRunner" />。
 /// </summary>
 internal sealed class CatSimulatedAfan
 {
@@ -41,6 +42,12 @@ internal sealed class CatSimulatedAfan
     /// <summary>模拟的"一把"（在副本中）有几步; 两把之间隔一步不在副本中</summary>
     public const int DUTY_ROUND_STEPS = 2;
 
+    /// <summary>模拟掉线回标题（<see cref="DutyLost" />）: 进世界后第几步之后掉线</summary>
+    public const int DUTY_LOST_AFTER_STEPS = 3;
+
+    /// <summary>模拟掉线回标题（<see cref="DutyLost" />）: 在标题界面待几步再回到世界</summary>
+    public const int DUTY_LOST_STEPS = 4;
+
     /// <summary>ClassJob 表行号 → ExpArrayIndex（国服表, 见 <see cref="CatClassJobs.ExpArrayIndex" />）</summary>
     public static IReadOnlyDictionary<int, int> ExpArrayIndex => CatClassJobs.ExpArrayIndex;
 
@@ -66,6 +73,10 @@ internal sealed class CatSimulatedAfan
     private DateTime  lastSentAt = DateTime.MinValue;
     private bool      inRound;
     private int       roundSteps;
+    private int       steps;
+
+    /// <summary>是否在副本中的读数怎样变成 game.duty（与真实启动同一套: 读到过值之后接连两步读不到报"未知"）</summary>
+    private readonly CatDutyTracker duty;
 
     /// <summary>
     ///     创建
@@ -80,6 +91,7 @@ internal sealed class CatSimulatedAfan
         this.pid       = pid;
         this.behavior  = behavior;
         this.character = character;
+        duty           = new CatDutyTracker((inDuty, at) => jobs.ReportDuty(pid, inDuty, at));
     }
 
     /// <summary>每一步的间隔</summary>
@@ -93,6 +105,12 @@ internal sealed class CatSimulatedAfan
 
     /// <summary>副本状态一直报"在副本中"（账号名前缀 <c>induty:</c>）; 任务单的推进照常</summary>
     public bool AlwaysInDuty { get; init; }
+
+    /// <summary>
+    ///     模拟掉线回标题（账号名前缀 <c>dutylost:</c>）: 进世界后第 <see cref="DUTY_LOST_AFTER_STEPS" /> 步之后在标题界面待
+    ///     <see cref="DUTY_LOST_STEPS" /> 步, 这几步读不到等级与副本状态（接连两步读不到报一次"未知"）, 之后回到世界照常读; 任务单的推进照常
+    /// </summary>
+    public bool DutyLost { get; init; }
 
     /// <summary>第一条回报的 seq 减 1（测试用; 默认是创建时的 Unix 毫秒）</summary>
     public long SeqStart
@@ -141,10 +159,19 @@ internal sealed class CatSimulatedAfan
             Send(job, state, reason, active, shots, nowUtc);
         }
 
+        steps++;
+
+        // 掉线回标题的这几步: 没有载入角色, 等级与副本状态都读不到
+        if (DutyLost && steps > DUTY_LOST_AFTER_STEPS && steps <= DUTY_LOST_AFTER_STEPS + DUTY_LOST_STEPS)
+        {
+            duty.Missed(nowUtc);
+            return;
+        }
+
         // 模拟里没有服务器 Id: 原始服务器 Id 取任务单里的（没有为 0）
         var homeWorldId = (job?.Character as JsonObject)?["homeWorldId"] is JsonValue id && id.TryGetValue(out int value) ? value : 0;
         jobs.ReportLevels(pid, new CatLevelsCharacter(character.Name, character.ContentId, homeWorldId), Levels(job));
-        jobs.ReportDuty(pid, AlwaysInDuty || inRound, nowUtc);
+        duty.Read(AlwaysInDuty || inRound, nowUtc);
     }
 
     /// <summary>

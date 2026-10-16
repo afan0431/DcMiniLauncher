@@ -119,9 +119,9 @@ public interface ICatLaunchReporter
     }
 
     /// <summary>
-    ///     游戏内模块读到的角色是否在副本中（at = 读到的时刻）; pid ≤ 0 表示当前守护的游戏。有变化才发 game.duty
+    ///     游戏内模块读到的角色是否在副本中（at = 读到的时刻; null = 读到过值之后接连读不到, 不知道了）; pid ≤ 0 表示当前守护的游戏。有变化才发 game.duty
     /// </summary>
-    void Duty(int pid, bool inDuty, DateTimeOffset at)
+    void Duty(int pid, bool? inDuty, DateTimeOffset at)
     {
     }
 
@@ -1069,7 +1069,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         jobs.ReportLevels(levelsPid, character, levels);
 
     /// <inheritdoc />
-    public void Duty(int dutyPid, bool inDuty, DateTimeOffset at) =>
+    public void Duty(int dutyPid, bool? inDuty, DateTimeOffset at) =>
         jobs.ReportDuty(dutyPid, inDuty, at);
 
     /// <inheritdoc />

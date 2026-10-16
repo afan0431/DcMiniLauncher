@@ -5,6 +5,23 @@ using XIVLauncher.InGame;
 namespace XIVLauncher.CatHost;
 
 /// <summary>
+///     向游戏内模块读一次的结果
+/// </summary>
+internal enum CatModuleRead
+{
+    /// <summary>模块回应了（读到值、没读成、读数不合理都算）; 这一轮可以接着发别的命令</summary>
+    Answered,
+
+    /// <summary>模块是旧版, 不认识这条命令; 之后不再读</summary>
+    Unsupported,
+
+    /// <summary>
+    ///     超时没有回应: 发命令的一方超时即断开管道（下一条命令重新连）, 模块多半卡着, 这一轮不要再发别的命令
+    /// </summary>
+    TimedOut
+}
+
+/// <summary>
 ///     向游戏内模块读一次全部职业等级（<c>LEVELS</c>）并连同同一轮 WHOAMI 读到的当前角色报告; 报不报 game.levels 由 <see cref="CatJobChannel" />
 ///     按角色或数组有没有变化决定。游戏里注着的是不认识这条命令的旧模块（0.8.0 之前）时记一次日志, 之后不再读。
 ///     每次读都有上限（<see cref="CatAutoEnterTimings.ReadTimeout" />）, 超时跳过这一轮, 不一直占着模块闸
@@ -15,30 +32,30 @@ internal sealed class CatLevelReader(ICatLaunchReporter reporter, int processId,
     public const string COMMAND = "LEVELS";
 
     private bool unsupported;
+    private bool warnedInconsistent;
 
     /// <summary>模块不认识 <c>LEVELS</c>, 不再读</summary>
     public bool Unsupported => unsupported;
 
     /// <summary>
-    ///     读一次。who = 同一轮读到的当前角色（必须已载入）。返回 false = 这一次超时（管道里可能还留着半条回应）, 这一轮不要再发别的命令;
-    ///     其余（读到、没读成、模块不支持）返回 true。通话失败照常抛异常, 由调用方决定跳过这一次。调用方事后要放开管道
+    ///     读一次。who = 同一轮读到的当前角色（必须已载入）。通话失败照常抛异常, 由调用方决定跳过这一次; 调用方事后要放开管道
     /// </summary>
-    public async Task<bool> ReadAsync(IMiniModuleChannel module, CatModuleReplies.WhoAmI who, CancellationToken cancellationToken)
+    public async Task<CatModuleRead> ReadAsync(IMiniModuleChannel module, CatModuleReplies.WhoAmI who, CancellationToken cancellationToken)
     {
         if (unsupported)
-            return true;
+            return CatModuleRead.Unsupported;
 
         if (await SendWithTimeoutAsync(module, COMMAND, timeout, cancellationToken).ConfigureAwait(false) is not { } response)
         {
             Log.Debug("[CatHost] 读职业等级 {Seconds} 秒没有回应, 跳过这一次", timeout.TotalSeconds);
-            return false;
+            return CatModuleRead.TimedOut;
         }
 
         if (response.Contains("unknown-command", StringComparison.Ordinal))
         {
             unsupported = true;
             Log.Information("[CatHost] 游戏 {Pid} 里的游戏内模块是旧版, 读不了职业等级（下次启动游戏才会换上新模块）", processId);
-            return true;
+            return CatModuleRead.Unsupported;
         }
 
         if (CatModuleReplies.ParseLevels(response) is not { } reading)
@@ -46,7 +63,7 @@ internal sealed class CatLevelReader(ICatLaunchReporter reporter, int processId,
             if (!CatModuleReplies.IsOk(response))
                 Log.Debug("[CatHost] 这一次没读成职业等级: {Response}", CatModuleReplies.FirstLine(response));
 
-            return true;
+            return CatModuleRead.Answered;
         }
 
         // 当前职业的那一格应等于当前等级（等级同步中不比）: 对不上多半是游戏更新后偏移漂移, 读出的是形似等级的错位数据, 不发
@@ -64,14 +81,12 @@ internal sealed class CatLevelReader(ICatLaunchReporter reporter, int processId,
                 );
             }
 
-            return true;
+            return CatModuleRead.Answered;
         }
 
         reporter.Levels(processId, new CatLevelsCharacter(who.Name, who.ContentId, who.HomeWorldId), reading.Levels);
-        return true;
+        return CatModuleRead.Answered;
     }
-
-    private bool warnedInconsistent;
 
     /// <summary>
     ///     发一条只读命令, 最多等 <paramref name="timeout" />; 超时返回 null, 外部取消照常抛 <see cref="OperationCanceledException" />
@@ -93,51 +108,164 @@ internal sealed class CatLevelReader(ICatLaunchReporter reporter, int processId,
 }
 
 /// <summary>
-///     向游戏内模块读一次角色是否在副本中（<c>DUTY</c>, Conditions 的 BoundByDuty 类标志）并报告; 报不报 game.duty 由 <see cref="CatJobChannel" />
-///     按有没有变化决定。读不到（没载入角色、读歪、超时）不报。游戏里注着的是不认识这条命令的旧模块（0.9.0 之前）时记一次日志, 之后不再读。
-///     每次读都有上限（<see cref="CatAutoEnterTimings.ReadTimeout" />）
+///     一个游戏的"是否在副本中"读数怎样变成报告: 每读到一次值就报（发不发 game.duty 由 <see cref="CatJobChannel" /> 按有没有变化决定）;
+///     读到过值之后连续 <see cref="MISSES_BEFORE_UNKNOWN" /> 轮读不到, 报一次 null（未知）, 之后再读到值照常报; 从未读到过值时读不到不报。
+///     真实启动由 <see cref="CatDutyReader" /> 用, 模拟模式由 <see cref="CatSimulatedAfan" /> 用
 /// </summary>
-internal sealed class CatDutyReader(ICatLaunchReporter reporter, int processId, TimeSpan timeout)
+internal sealed class CatDutyTracker(Action<bool?, DateTimeOffset> report)
+{
+    /// <summary>读到过值之后连续这么多轮读不到, 报一次"未知"</summary>
+    public const int MISSES_BEFORE_UNKNOWN = 2;
+
+    private bool hasValue;
+    private int  misses;
+
+    /// <summary>这一轮读到了值</summary>
+    public void Read(bool inDuty, DateTimeOffset at)
+    {
+        hasValue = true;
+        misses   = 0;
+        report(inDuty, at);
+    }
+
+    /// <summary>这一轮没读到值（没载入角色、读失败、超时、模块旧、读数不合理）</summary>
+    public void Missed(DateTimeOffset at)
+    {
+        if (!hasValue)
+            return;
+
+        if (++misses == MISSES_BEFORE_UNKNOWN)
+            report(null, at);
+    }
+}
+
+/// <summary>
+///     向游戏内模块读角色是否在副本中（<c>DUTY</c>, Conditions 的 BoundByDuty 类标志）并报告, 规则见 <see cref="CatDutyTracker" />:
+///     读到过值之后连续两轮读不到（没载入角色、FAIL、超时、旧模块、读数不合理）报一次"未知"。
+///     载入了角色却 112 个标志全为 0（正常时下标 1 NormalConditions 应置位）当作读不到, 连续 <see cref="ALL_CLEAR_ROUNDS_BEFORE_WARNING" /> 轮记一次警告;
+///     模块回 sigscan-failed、bad-state 第一次出现时记警告, 之后不刷屏。游戏里注着的是不认识这条命令的旧模块（0.9.0 之前）时记一次日志, 之后不再读。
+///     每次读都有上限（<see cref="CatAutoEnterTimings.ReadTimeout" />）。每一轮观察结束都要调 <see cref="EndRound" />（不论这一轮读没读 DUTY）
+/// </summary>
+internal sealed class CatDutyReader
 {
     /// <summary>模块命令</summary>
     public const string COMMAND = "DUTY";
 
+    /// <summary>载入了角色却全部标志为 0 连续这么多轮, 记一次警告</summary>
+    public const int ALL_CLEAR_ROUNDS_BEFORE_WARNING = 3;
+
+    private readonly int            processId;
+    private readonly TimeSpan       timeout;
+    private readonly CatDutyTracker tracker;
+
     private bool unsupported;
+    private bool readThisRound;
+    private int  allClearRounds;
+    private bool warnedAllClear;
+    private bool warnedSigscan;
+    private bool warnedBadState;
+
+    /// <summary>
+    ///     创建
+    /// </summary>
+    public CatDutyReader(ICatLaunchReporter reporter, int processId, TimeSpan timeout)
+    {
+        this.processId = processId;
+        this.timeout   = timeout;
+        tracker        = new CatDutyTracker((inDuty, at) => reporter.Duty(processId, inDuty, at));
+    }
 
     /// <summary>模块不认识 <c>DUTY</c>, 不再读</summary>
     public bool Unsupported => unsupported;
 
+    /// <summary>已记的警告条数（找不到游戏数据、读数不合理、标志全为 0 各最多一条）</summary>
+    public int Warnings { get; private set; }
+
     /// <summary>
-    ///     读一次。返回值与 <see cref="CatLevelReader.ReadAsync" /> 相同: false = 这一次超时, 这一轮不要再发别的命令; 通话失败照常抛异常
+    ///     读一次; 读到值就报。通话失败照常抛异常（这一轮算读不到）, 调用方事后要放开管道
     /// </summary>
-    public async Task<bool> ReadAsync(IMiniModuleChannel module, CancellationToken cancellationToken)
+    public async Task<CatModuleRead> ReadAsync(IMiniModuleChannel module, CancellationToken cancellationToken)
     {
         if (unsupported)
-            return true;
+            return CatModuleRead.Unsupported;
 
         if (await CatLevelReader.SendWithTimeoutAsync(module, COMMAND, timeout, cancellationToken).ConfigureAwait(false) is not { } response)
         {
             Log.Debug("[CatHost] 读副本状态 {Seconds} 秒没有回应, 跳过这一次", timeout.TotalSeconds);
-            return false;
+            return CatModuleRead.TimedOut;
         }
 
         if (response.Contains("unknown-command", StringComparison.Ordinal))
         {
             unsupported = true;
             Log.Information("[CatHost] 游戏 {Pid} 里的游戏内模块是旧版, 读不了是否在副本中（下次启动游戏才会换上新模块）", processId);
-            return true;
+            return CatModuleRead.Unsupported;
         }
 
-        if (CatModuleReplies.ParseDuty(response) is not { } inDuty)
+        if (CatModuleReplies.ParseDuty(response) is not { } reading)
         {
-            if (!CatModuleReplies.IsOk(response))
-                Log.Debug("[CatHost] 这一次没读成副本状态: {Response}", CatModuleReplies.FirstLine(response));
-
-            return true;
+            allClearRounds = 0;
+            LogFailure(response);
+            return CatModuleRead.Answered;
         }
 
-        reporter.Duty(processId, inDuty, DateTimeOffset.UtcNow);
-        return true;
+        if (reading.AllClear)
+        {
+            if (++allClearRounds >= ALL_CLEAR_ROUNDS_BEFORE_WARNING && !warnedAllClear)
+            {
+                warnedAllClear = true;
+                Warnings++;
+                Log.Warning
+                (
+                    "[CatHost] 游戏 {Pid} 载入了角色, 副本状态的标志却连续 {Rounds} 次全为 0, 不发; 若一直如此要按新版客户端核对 Conditions 地址",
+                    processId,
+                    allClearRounds
+                );
+            }
+
+            return CatModuleRead.Answered;
+        }
+
+        allClearRounds = 0;
+        readThisRound  = true;
+        tracker.Read(reading.InDuty, DateTimeOffset.UtcNow);
+        return CatModuleRead.Answered;
+    }
+
+    /// <summary>
+    ///     一轮观察结束（不论这一轮读没读 DUTY、为什么没读）: 这一轮没读到值就记一次读不到。取消时不调
+    /// </summary>
+    public void EndRound()
+    {
+        if (!readThisRound)
+            tracker.Missed(DateTimeOffset.UtcNow);
+
+        readThisRound = false;
+    }
+
+    /// <summary>没读成: 找不到游戏数据（sigscan-failed）与读数不合理（bad-state）第一次出现时记警告, 其余只记调试日志</summary>
+    private void LogFailure(string response)
+    {
+        var line = CatModuleReplies.FirstLine(response);
+
+        if (line.StartsWith("FAIL sigscan-failed", StringComparison.Ordinal) && !warnedSigscan)
+        {
+            warnedSigscan = true;
+            Warnings++;
+            Log.Warning("[CatHost] 游戏 {Pid} 的游戏内模块找不到读副本状态要用的游戏数据（{Response}）, 读不了是否在副本中; 若一直如此要按新版客户端核对特征码", processId, line);
+            return;
+        }
+
+        if (line.StartsWith("FAIL bad-state", StringComparison.Ordinal) && !warnedBadState)
+        {
+            warnedBadState = true;
+            Warnings++;
+            Log.Warning("[CatHost] 游戏 {Pid} 的副本状态读数不合理（{Response}）, 不发; 若一直如此要按新版客户端核对 Conditions 地址", processId, line);
+            return;
+        }
+
+        if (!CatModuleReplies.IsOk(response))
+            Log.Debug("[CatHost] 这一次没读成副本状态: {Response}", line);
     }
 }
 
@@ -220,7 +348,7 @@ internal sealed class CatLevelWatch(ICatAutoEnterGame game, ICatLaunchReporter r
                     ReportCharacter(who);
 
                 // 读等级超时了, 这一轮就不再读副本状态
-                if (await reader.ReadAsync(game, who, cancellationToken).ConfigureAwait(false))
+                if (await reader.ReadAsync(game, who, cancellationToken).ConfigureAwait(false) != CatModuleRead.TimedOut)
                     await dutyReader.ReadAsync(game, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -234,6 +362,10 @@ internal sealed class CatLevelWatch(ICatAutoEnterGame game, ICatLaunchReporter r
             finally
             {
                 game.Release();
+
+                // 这一轮没读到副本状态（没载入角色、读失败、超时）记一次, 读到过值之后接连两轮读不到就报"未知"
+                if (!cancellationToken.IsCancellationRequested)
+                    dutyReader.EndRound();
             }
         }
     }
@@ -371,10 +503,15 @@ internal static partial class CatModuleReplies
     }
 
     /// <summary>
-    ///     DUTY 的回应（<c>OK loaded=1 inDuty=1 flags=34,56</c>）: 在世界里时返回是否在副本中;
-    ///     没有载入角色（loaded=0）、回应不是 OK、或没带 inDuty（0 / 1 以外）返回 null = 不知道
+    ///     DUTY 读到的内容: InDuty = 是否在副本中; AllClear = 全部 112 个标志都为 0（载入了角色时不该如此, 多半读歪了）
     /// </summary>
-    public static bool? ParseDuty(string response)
+    public sealed record DutyReading(bool InDuty, bool AllClear);
+
+    /// <summary>
+    ///     DUTY 的回应（<c>OK loaded=1 inDuty=1 set=5 flags=34,56</c>, set = 112 个标志里置位的个数）: 在世界里时返回读到的内容;
+    ///     没有载入角色（loaded=0）、回应不是 OK、或没带 inDuty（0 / 1 以外）返回 null = 不知道。没带 set 时不当作全为 0
+    /// </summary>
+    public static DutyReading? ParseDuty(string response)
     {
         if (!IsOk(response))
             return null;
@@ -384,12 +521,14 @@ internal static partial class CatModuleReplies
         if (!Flag(fields, "loaded") || !fields.TryGetValue("inDuty", out var value))
             return null;
 
-        return value switch
+        bool? inDuty = value switch
         {
             "1" => true,
             "0" => false,
             _   => null
         };
+
+        return inDuty is { } result ? new DutyReading(result, OptionalInt(fields, "set") == 0) : null;
     }
 
     private static int? OptionalInt(Dictionary<string, string> fields, string key) =>

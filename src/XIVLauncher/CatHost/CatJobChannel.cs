@@ -2,6 +2,7 @@ using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using Serilog;
 using XIVLauncher.DCTravel;
 
@@ -12,6 +13,21 @@ namespace XIVLauncher.CatHost;
 ///     homeWorldId = 原始服务器的 World 表行号, 读不到为 0
 /// </summary>
 public sealed record CatLevelsCharacter(string Name, string ContentId, int HomeWorldId);
+
+/// <summary>
+///     game.duty 的参数。inDuty 为 null（未知）时也照样写出 <c>"inDuty": null</c>, 不随序列化选项省掉
+/// </summary>
+/// <param name="OperationId">当前操作</param>
+/// <param name="Pid">游戏进程号</param>
+/// <param name="InDuty">是否在副本中; null = 读到过值之后接连读不到</param>
+/// <param name="At">读到的时刻, ISO 时间字符串（与 processStartedAt 同格式）</param>
+public sealed record CatDutyEvent
+(
+    string?                                                       OperationId,
+    int                                                           Pid,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] bool? InDuty,
+    string                                                        At
+);
 
 /// <summary>
 ///     Cat 上号自动开工的任务单通道（约定 cat-job/1）: 工作台经管道方法 setJob 交来任务单, 游戏内 Afan 经本机接口
@@ -62,8 +78,8 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     /// <summary>每个游戏进程上次发的等级读数（角色 + 数组）</summary>
     private readonly Dictionary<int, (string ContentId, int[] Levels)> lastLevels = [];
 
-    /// <summary>每个游戏进程上次发的"是否在副本中"</summary>
-    private readonly Dictionary<int, bool> lastDuty = [];
+    /// <summary>每个游戏进程上次发的"是否在副本中"（null = 发过"未知"）</summary>
+    private readonly Dictionary<int, bool?> lastDuty = [];
 
     /// <summary>每个游戏进程上一次经本机接口收下回报的时刻（Environment.TickCount64）</summary>
     private readonly Dictionary<int, long> lastPostedAt = [];
@@ -356,9 +372,10 @@ public sealed class CatJobChannel : ICatLocalEndpoints
 
     /// <summary>
     ///     小模块读到的"是否在副本中"（Conditions 的 BoundByDuty 类标志）: 与这个游戏上次发的不同才发 game.duty（第一次读到也发）。
+    ///     inDuty = null 表示读到过值之后接连读不到（未知）, 去重时与 true / false 一样当作一个值; 这个游戏还没发过值时的 null 不发。
     ///     at = 读到的时刻; pid ≤ 0 = 当前守护的游戏, 给了 pid 但不是当前守护的游戏（含游戏已退出）时丢掉
     /// </summary>
-    public void ReportDuty(int pid, bool inDuty, DateTimeOffset at)
+    public void ReportDuty(int pid, bool? inDuty, DateTimeOffset at)
     {
         var operation = operationId();
 
@@ -367,23 +384,13 @@ public sealed class CatJobChannel : ICatLocalEndpoints
             if (gamePid is not { } current || (pid > 0 && pid != current))
                 return;
 
-            if (lastDuty.TryGetValue(current, out var last) && last == inDuty)
+            if (lastDuty.TryGetValue(current, out var last) ? last == inDuty : inDuty == null)
                 return;
 
             lastDuty[current] = inDuty;
-            Log.Information("[CatHost] 副本状态 pid={Pid}: {InDuty}", current, inDuty ? "在副本中" : "不在副本中");
+            Log.Information("[CatHost] 副本状态 pid={Pid}: {InDuty}", current, inDuty switch { true => "在副本中", false => "不在副本中", null => "未知" });
 
-            publish
-            (
-                DUTY_EVENT,
-                new
-                {
-                    operationId = operation,
-                    pid         = current,
-                    inDuty,
-                    at          = CatProtocol.FormatTimestamp(at)
-                }
-            );
+            publish(DUTY_EVENT, new CatDutyEvent(operation, current, inDuty, CatProtocol.FormatTimestamp(at)));
         }
     }
 

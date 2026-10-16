@@ -49,7 +49,10 @@ namespace XIVLauncher.CatHost;
 ///             <c>manual:</c> = 不产生回报（由测试工具往 /cat/progress 发, pid 用占位进程号）, 只报等级;
 ///             <c>mismatch:</c> = waiting 之后一直报 mismatch（reason.code=error, text 写进的是哪个角色）;
 ///             <c>unsupported:</c> = 第一项报一次 blocked（reason.code=unsupported, 例程认不出）, 跳过它接着做后面的项;
-///             <c>induty:</c> = 是否在副本中一直报 true（任务单照常推进）, 可放在上面四个前缀前面连用（如 <c>induty:blocked:</c>）。
+///             <c>induty:</c> = 是否在副本中一直报 true（任务单照常推进）;
+///             <c>dutylost:</c> = 进世界后第 <see cref="CatSimulatedAfan.DUTY_LOST_AFTER_STEPS" /> 步之后模拟掉线回标题
+///             <see cref="CatSimulatedAfan.DUTY_LOST_STEPS" /> 步: 这几步读不到等级与副本状态, 接连两步读不到发一次 <c>game.duty { inDuty: null }</c>,
+///             之后回到世界照常发（任务单照常推进）。这两个可放在上面四个前缀前面连用, 顺序不限（如 <c>induty:blocked:</c>、<c>dutylost:induty:</c>）。
 ///             seq 与真 Afan 一样以 Unix 毫秒为起点（13 位）
 ///         </item>
 ///     </list>
@@ -124,6 +127,9 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
     /// <summary>是否在副本中一直报 true 的前缀（可放在上面几个上号自动开工的前缀前面连用）</summary>
     public const string IN_DUTY_PREFIX = "induty:";
+
+    /// <summary>模拟掉线回标题、副本状态变成未知再恢复的前缀（可放在上面几个上号自动开工的前缀前面连用）</summary>
+    public const string DUTY_LOST_PREFIX = "dutylost:";
 
     private readonly CancellationTokenSource closeCts = new();
     private readonly object                  stateLock = new();
@@ -595,10 +601,27 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         }
 
         var account      = request.AccountName;
-        var alwaysInDuty = account.StartsWith(IN_DUTY_PREFIX, StringComparison.Ordinal);
+        var alwaysInDuty = false;
+        var dutyLost     = false;
 
-        if (alwaysInDuty)
-            account = account[IN_DUTY_PREFIX.Length..];
+        // 副本状态的两个前缀顺序不限, 都在上号自动开工的前缀前面
+        while (true)
+        {
+            if (!alwaysInDuty && account.StartsWith(IN_DUTY_PREFIX, StringComparison.Ordinal))
+            {
+                alwaysInDuty = true;
+                account      = account[IN_DUTY_PREFIX.Length..];
+            }
+            else if (!dutyLost && account.StartsWith(DUTY_LOST_PREFIX, StringComparison.Ordinal))
+            {
+                dutyLost = true;
+                account  = account[DUTY_LOST_PREFIX.Length..];
+            }
+            else
+            {
+                break;
+            }
+        }
 
         var behavior = account.StartsWith(JOB_BLOCKED_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Blocked
                        : account.StartsWith(JOB_MANUAL_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Manual
@@ -615,7 +638,8 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
             Step           = AfanStep,
             Heartbeat      = AfanHeartbeat,
             ShotsDirectory = ShotsDirectory ?? CatShots.Directory,
-            AlwaysInDuty   = alwaysInDuty
+            AlwaysInDuty   = alwaysInDuty,
+            DutyLost       = dutyLost
         };
 
         var task = Task.Run

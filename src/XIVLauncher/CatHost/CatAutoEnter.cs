@@ -264,6 +264,9 @@ public sealed class CatAutoEnter
     /// </summary>
     public async Task ObserveAsync(CancellationToken cancellationToken)
     {
+        levelReader ??= new CatLevelReader(reporter, game.ProcessId, timings.ReadTimeout);
+        dutyReader  ??= new CatDutyReader(reporter, game.ProcessId, timings.ReadTimeout);
+
         while (!cancellationToken.IsCancellationRequested && !game.HasExited)
         {
             await game.DelayAsync(timings.ObserveInterval, cancellationToken).ConfigureAwait(false);
@@ -285,11 +288,8 @@ public sealed class CatAutoEnter
                     if (who.ContentId != EnteredContentId)
                         ReportEntered(who);
 
-                    levelReader ??= new CatLevelReader(reporter, game.ProcessId, timings.ReadTimeout);
-                    dutyReader  ??= new CatDutyReader(reporter, game.ProcessId, timings.ReadTimeout);
-
                     // 读等级超时了, 这一轮就不再读副本状态
-                    if (await levelReader.ReadAsync(game, who, cancellationToken).ConfigureAwait(false))
+                    if (await levelReader.ReadAsync(game, who, cancellationToken).ConfigureAwait(false) != CatModuleRead.TimedOut)
                         await dutyReader.ReadAsync(game, cancellationToken).ConfigureAwait(false);
                 }
             }
@@ -304,6 +304,10 @@ public sealed class CatAutoEnter
             finally
             {
                 game.Release();
+
+                // 这一轮没读到副本状态（没载入角色、读失败、超时）记一次, 读到过值之后接连两轮读不到就报"未知"
+                if (!cancellationToken.IsCancellationRequested)
+                    dutyReader.EndRound();
             }
         }
     }

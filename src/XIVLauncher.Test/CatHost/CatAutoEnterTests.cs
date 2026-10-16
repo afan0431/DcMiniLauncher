@@ -785,7 +785,7 @@ public sealed class CatAutoEnterTests
     }
 
     [Fact]
-    public async Task Observe_ReadsDutyAfterLevels_AndStopsAskingAModuleWithoutIt()
+    public async Task Observe_ReadsDutyAfterLevels_StopsAskingAModuleWithoutIt_AndReportsUnknown()
     {
         var (game, reporter) = Setup(Chara("11", "小白"));
 
@@ -808,7 +808,8 @@ public sealed class CatAutoEnterTests
 
         await flow.ObserveAsync(CancellationToken.None).WaitAsync(Timeout);
 
-        Assert.Equal([false, true, false], reporter.DutyReports.Select(x => x.InDuty));
+        // 第 4、5 轮读不到（回 unknown-command 之后不再问）: 读到过值之后接连两轮读不到, 报一次未知
+        Assert.Equal([false, true, false, null], reporter.DutyReports.Select(x => x.InDuty));
         // 第 4 次回 unknown-command 之后不再问; 每次都排在 LEVELS 之后
         Assert.Equal(4, game.Commands.Count(x => x == "DUTY"));
         Assert.All(game.Commands.Select((x, i) => (x, i)).Where(x => x.x == "DUTY"), x => Assert.Equal("LEVELS", game.Commands[x.i - 1]));

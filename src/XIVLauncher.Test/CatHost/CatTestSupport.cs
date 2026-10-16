@@ -331,10 +331,10 @@ internal sealed class RecordingReporter : ICatLaunchReporter
     public void Levels(int pid, CatLevelsCharacter character, IReadOnlyList<int> levels) =>
         LevelReports.Enqueue((pid, character, levels.ToArray()));
 
-    /// <summary>报出来的副本状态（pid, 是否在副本中）, 按顺序; 不进 <see cref="Entries" /></summary>
-    public ConcurrentQueue<(int Pid, bool InDuty)> DutyReports { get; } = new();
+    /// <summary>报出来的副本状态（pid, 是否在副本中, null = 未知）, 按顺序; 不进 <see cref="Entries" /></summary>
+    public ConcurrentQueue<(int Pid, bool? InDuty)> DutyReports { get; } = new();
 
-    public void Duty(int pid, bool inDuty, DateTimeOffset at) =>
+    public void Duty(int pid, bool? inDuty, DateTimeOffset at) =>
         DutyReports.Enqueue((pid, inDuty));
 }
 

@@ -513,6 +513,33 @@ public sealed class CatJobChannelTests
     }
 
     [Fact]
+    public void ReportDuty_Unknown_IsDedupedLikeAValue_AndWrittenAsNull()
+    {
+        var channel = NewChannel();
+        var at      = new DateTimeOffset(2026, 10, 16, 22, 2, 11, 345, TimeSpan.FromHours(8));
+        channel.GameStarted(1234);
+
+        // 还没发过值: 未知不发
+        channel.ReportDuty(0, null, at);
+        channel.ReportDuty(0, true, at);
+        channel.ReportDuty(0, null, at);
+        channel.ReportDuty(0, null, at);
+        channel.ReportDuty(0, true, at);
+        channel.ReportDuty(0, false, at);
+
+        // 新的游戏: 还没发过值, 未知照样不发
+        channel.GameStarted(5678);
+        channel.ReportDuty(0, null, at);
+
+        var published = events.Where(x => x.Method == CatJobChannel.DUTY_EVENT).Select(x => JsonNode.Parse(x.Json)!.AsObject()).ToArray();
+
+        Assert.Equal<bool?>([true, null, true, false], published.Select(x => x["inDuty"]?.GetValue<bool>()));
+        Assert.All(published, x => Assert.Equal(["operationId", "pid", "inDuty", "at"], x.Select(p => p.Key)));
+        Assert.Contains("\"inDuty\":null", events.Where(x => x.Method == CatJobChannel.DUTY_EVENT).ElementAt(1).Json, StringComparison.Ordinal);
+        Assert.All(published, x => Assert.Equal("2026-10-16T14:02:11.345Z", x["at"]!.GetValue<string>()));
+    }
+
+    [Fact]
     public void ReportDuty_ForAnotherPidOrWithoutAGame_IsDropped()
     {
         var channel = NewChannel();
