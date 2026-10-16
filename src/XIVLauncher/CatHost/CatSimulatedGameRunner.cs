@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using XIVLauncher.DCTravel;
 using XIVLauncher.Minion;
 
 namespace XIVLauncher.CatHost;
@@ -32,6 +33,17 @@ namespace XIVLauncher.CatHost;
 ///             <c>stop:&lt;停手码&gt;</c> = 停手（enteringLobby → game.autoEnterStopped → running; 不写停手码按 moduleUnavailable）
 ///         </item>
 ///         <item>占位进程被结束时发 game.exited; close 时结束占位进程并发 game.exited{reason:"closed"}; 随后本进程退出</item>
+///         <item>
+///             上号自动开工（外壳经 setJob 交任务单）: 占位进程起来后开一个本机监听（随机端口, 提供 <c>GET /cat/job?pid=</c>、<c>POST /cat/progress</c>）,
+///             写 <c>dctravel-&lt;占位进程号&gt;.port</c>, 并发一条 launcher.log 写明地址。进世界（带 autoEnter 为 inWorld, 否则 running）后
+///             由 <see cref="CatSimulatedAfan" /> 每 <see cref="AfanStep" /> 推进一步: 没有任务单报 waiting; 有任务单先报一次 waiting（核对角色）,
+///             再按 order 把 routine 不为 null 的项一项项做完（running, current 每步加 (target − 起点)/5, 勾选类三步完成）, 一项做完且 shots.completion
+///             为 true 时在截图目录写 <c>&lt;pid&gt;-&lt;seq&gt;.png</c> 并带在回报的 shots 里（progressAt 不为空时开工后先带一张 progress 图）,
+///             全部做完报 done; desired 为 pause / stop 报 paused / stopped; 没有可自动做的项报 idle; 没有变化时每 <see cref="AfanHeartbeat" /> 心跳一次。
+///             职业等级按任务单里练级项的当前值（ClassJob → ExpArrayIndex 用国服表）每步报一次, 有变化才发 game.levels。
+///             账号名前缀 <c>blocked:</c> = 第一项走两步后报 blocked（noProgress）, 直到任务单 revision 变了才接着做;
+///             <c>manual:</c> = 不产生回报（由测试工具往 /cat/progress 发, pid 用占位进程号）, 只报等级
+///         </item>
 ///     </list>
 /// </summary>
 public sealed class CatSimulatedGameRunner : ICatGameRunner
@@ -90,8 +102,17 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     /// <summary>只登录时 launch 没带 weGameAccountId 用的 WeGame 用户号</summary>
     public const string SIMULATED_WE_GAME_ACCOUNT_ID = "10000000000000000";
 
+    /// <summary>上号自动开工: 模拟回报中途停下（blocked）的前缀</summary>
+    public const string JOB_BLOCKED_PREFIX = "blocked:";
+
+    /// <summary>上号自动开工: 不产生模拟回报（由测试工具往 /cat/progress 发）的前缀</summary>
+    public const string JOB_MANUAL_PREFIX = "manual:";
+
     private readonly CancellationTokenSource closeCts = new();
     private readonly object                  stateLock = new();
+    private readonly List<Task>              afanTasks = [];
+
+    private CatLocalListener? localListener;
 
     private Process? placeholder;
     private bool     closeRequested;
@@ -118,6 +139,18 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     /// <summary>占位进程的创建方式, 默认 <c>ping -t 127.0.0.1</c></summary>
     public Func<Process> PlaceholderFactory { get; init; } = StartDefaultPlaceholder;
 
+    /// <summary>上号自动开工: 模拟 Afan 每一步的间隔</summary>
+    public TimeSpan AfanStep { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>上号自动开工: 模拟 Afan 没有变化时的心跳间隔</summary>
+    public TimeSpan AfanHeartbeat { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>模拟截图写到哪里; 不给用 <see cref="CatShots.Directory" /></summary>
+    public string? ShotsDirectory { get; init; }
+
+    /// <summary>端口文件写到哪里; 不给用真实位置（<c>%ProgramData%\DcMiniLauncher</c>）</summary>
+    public string? PortFileDirectory { get; init; }
+
     /// <inheritdoc />
     public async Task<int> RunAsync(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
@@ -132,6 +165,10 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         {
             reporter.Failed(CatCodes.CANCELLED, "启动途中收到关闭请求, 没有起游戏（模拟）");
             return CatLaunchHost.EXIT_LAUNCH_FAILED;
+        }
+        finally
+        {
+            localListener?.Dispose();
         }
     }
 
@@ -264,10 +301,11 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
             var crashedPid = process.Id;
             TryKill(process);
             await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+            await autoEnterTask.ConfigureAwait(false);
+            await ReleaseGameAsync(crashedPid).ConfigureAwait(false);
 
             if (crashMode == CRASH_DIALOG)
             {
-                await autoEnterTask.ConfigureAwait(false);
                 reporter.Crashed(crashedPid);
 
                 var timeout = CrashDialogTimeout ?? request.CrashDialogTimeout;
@@ -303,6 +341,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
         await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
         await autoEnterTask.ConfigureAwait(false);
+        await ReleaseGameAsync(process.Id).ConfigureAwait(false);
 
         int? exitCode;
 
@@ -440,6 +479,9 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         else
             reporter.Started(process.Id, startedAt);
 
+        if (reporter.Jobs is { } jobs)
+            await OpenLocalApiAsync(jobs, process, reporter).ConfigureAwait(false);
+
         if (closeNow)
         {
             TryKill(process);
@@ -469,10 +511,134 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
         reporter.Stage(CatStages.RUNNING);
 
+        // 不自动进入角色时没有进世界的信号, running 就当进了世界
         if (request.AutoEnter)
             autoEnterTask = RunAutoEnterAsync(request, process, reporter, token);
+        else
+            StartSimulatedAfan(request, process, reporter);
 
         return process;
+    }
+
+    /// <summary>
+    ///     上号自动开工: 开本机监听（一个进程一个, 崩溃重开后沿用）并写这个占位进程的端口文件, 地址经 launcher.log 告诉外壳
+    /// </summary>
+    private async Task OpenLocalApiAsync(CatJobChannel jobs, Process process, ICatLaunchReporter reporter)
+    {
+        if (localListener == null)
+        {
+            for (var attempt = 1; attempt <= 3 && localListener == null; attempt++)
+            {
+                var listener = new CatLocalListener(Common.Util.APIHelper.GetAvailablePort(), jobs);
+
+                if (await listener.StartAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false))
+                    localListener = listener;
+                else
+                    listener.Dispose();
+            }
+
+            if (localListener == null)
+            {
+                reporter.Log("warning", "模拟模式: 本机接口没能打开, /cat/job 不可用");
+                return;
+            }
+        }
+
+        var path = PortFilePath(process.Id);
+
+        try
+        {
+            System.IO.Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllTextAsync(path, localListener.Port.ToString(System.Globalization.CultureInfo.InvariantCulture)).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Serilog.Log.Warning(ex, "[CatHost] 模拟模式写端口文件失败");
+        }
+
+        reporter.Log("information", $"模拟模式: 本机接口 http://127.0.0.1:{localListener.Port}/cat/job?pid={process.Id}（回报 POST /cat/progress）, 端口文件 {path}");
+    }
+
+    private string PortFilePath(int pid) =>
+        Path.Combine(PortFileDirectory ?? Path.GetDirectoryName(InGame.RunningGameRegistry.PortFilePath(pid))!, $"dctravel-{pid}.port");
+
+    /// <summary>
+    ///     上号自动开工: 进世界后开始模拟 Afan, 占位进程退出即停（外壳没有任务单通道时不做）
+    /// </summary>
+    private void StartSimulatedAfan(CatLaunchRequest request, Process process, ICatLaunchReporter reporter)
+    {
+        if (reporter.Jobs is not { } jobs || process.HasExited)
+            return;
+
+        var behavior = request.AccountName.StartsWith(JOB_BLOCKED_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Blocked
+                       : request.AccountName.StartsWith(JOB_MANUAL_PREFIX, StringComparison.Ordinal) ? CatSimulatedAfan.Behavior.Manual
+                       : CatSimulatedAfan.Behavior.Normal;
+
+        var afan = new CatSimulatedAfan(jobs, process.Id, behavior)
+        {
+            Step           = AfanStep,
+            Heartbeat      = AfanHeartbeat,
+            ShotsDirectory = ShotsDirectory ?? CatShots.Directory
+        };
+
+        var task = Task.Run
+        (async () =>
+            {
+                using var stop = new CancellationTokenSource();
+                var run = afan.RunAsync(stop.Token);
+
+                try
+                {
+                    await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    // 占位进程已不可用
+                }
+
+                await stop.CancelAsync().ConfigureAwait(false);
+
+                try
+                {
+                    await run.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // 停下
+                }
+            }
+        );
+
+        lock (stateLock)
+            afanTasks.Add(task);
+    }
+
+    /// <summary>
+    ///     占位进程退出后: 等模拟 Afan 停下（它的回报都排在 game.exited 之前）, 删掉端口文件
+    /// </summary>
+    private async Task ReleaseGameAsync(int pid)
+    {
+        Task[] tasks;
+
+        lock (stateLock)
+        {
+            tasks = afanTasks.ToArray();
+            afanTasks.Clear();
+        }
+
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+
+        if (localListener == null)
+            return;
+
+        try
+        {
+            File.Delete(PortFilePath(pid));
+        }
+        catch (Exception ex)
+        {
+            Serilog.Log.Debug(ex, "[CatHost] 模拟模式删端口文件失败");
+        }
     }
 
     private async Task AttachMinionAsync(string? failAgent, ICatLaunchReporter reporter, CancellationToken token)
@@ -598,6 +764,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
                 reporter.Character(entered);
                 Stage(CatStages.IN_WORLD);
+                StartSimulatedAfan(request, process, reporter);
             }
         }
         catch (OperationCanceledException)
