@@ -206,6 +206,83 @@ public sealed class CatSimulatedAfanTests : IDisposable
         Assert.True(Reports()[1]["items"]![0]!["current"]!.GetValue<long>() > 18);
     }
 
+    /// <summary><see cref="CatJobChannelTests.JobWithStartShots" /> 只留给定的项, 每项再经 change 改字段</summary>
+    private static JsonElement JobWithItems(string[] keep, Action<JsonObject>? change = null)
+    {
+        var job   = JsonNode.Parse(CatJobChannelTests.JobWithStartShots(3).GetRawText())!.AsObject();
+        var items = new JsonArray(job["items"]!.AsArray().Where(x => keep.Contains(x!["itemId"]!.GetValue<string>())).Select(x => x!.DeepClone()).ToArray());
+
+        foreach (var item in items)
+            change?.Invoke(item!.AsObject());
+
+        job["items"] = items;
+        return JsonDocument.Parse(job.ToJsonString()).RootElement.Clone();
+    }
+
+    [Fact]
+    public void StartShots_NoAutoItems_GoInTheFirstIdleReport_ThenIdleHeartbeatsWithout()
+    {
+        // 只有人做的项: 骑士、白魔法师为练级（共用一张）, 主线不知道开哪个界面（不拍）
+        channel.SetJob(JobWithItems(["c", "f", "g"], x => x["startShot"] = true));
+        var afan = NewAfan();
+        var now  = Run(afan, DateTime.UtcNow, 3);
+
+        Assert.Equal(["waiting", "idle"], States());
+
+        var shots = Reports()[1]["shots"]!.AsArray();
+        Assert.Equal(["c", "g"], shots.Select(x => x!["itemId"]!.GetValue<string>()));
+        Assert.All(shots, x => Assert.Equal("start", x!["kind"]!.GetValue<string>()));
+        Assert.Equal(shots[0]!["file"]!.GetValue<string>(), shots[1]!["file"]!.GetValue<string>());
+        Assert.True(new FileInfo(shots[0]!["file"]!.GetValue<string>()).Length > 100);
+
+        // 之后照常心跳, 不再带图
+        afan.Tick(now.AddSeconds(61));
+        Assert.Equal(["waiting", "idle", "idle"], States());
+        Assert.Null(Reports()[2]["shots"]);
+    }
+
+    [Theory]
+    [InlineData(false, "idle")]
+    [InlineData(true, "running")]
+    public void StartShots_OnlyCheckboxOrUnknownScreens_TakeNone(bool autoCheckbox, string state)
+    {
+        // 守护天节（勾选类, 自动做或人做）与主线（人做, 不知道开哪个界面）
+        channel.SetJob(autoCheckbox ? JobWithItems(["e"]) : JobWithItems(["e", "f"], x => x["routine"] = null));
+        Run(NewAfan(), DateTime.UtcNow, 5);
+
+        Assert.Equal(["waiting", state], States()[..2]);
+        Assert.Empty(StartShots());
+        Assert.Null(Reports()[1]["shots"]);
+    }
+
+    [Fact]
+    public void StartShots_AutoItemsAlreadyDone_GoInTheDoneReport()
+    {
+        // 金碟币已经到目标（服务器不再要它的开工图）, 人做的骑士还要
+        channel.SetJob
+        (
+            JobWithItems
+            (
+                ["b", "c"],
+                x =>
+                {
+                    if (x["itemId"]!.GetValue<string>() != "b")
+                        return;
+
+                    x["current"]   = 120;
+                    x["startShot"] = false;
+                }
+            )
+        );
+        Run(NewAfan(), DateTime.UtcNow, 3);
+
+        Assert.Equal(["waiting", "done"], States());
+
+        var shot = Assert.Single(Reports()[1]["shots"]!.AsArray());
+        Assert.Equal("c", shot!["itemId"]!.GetValue<string>());
+        Assert.Equal("start", shot["kind"]!.GetValue<string>());
+    }
+
     [Theory]
     [InlineData("leveling", "bst-level", "jobs")]
     [InlineData("leveling", null, "jobs")]

@@ -37,7 +37,8 @@ namespace XIVLauncher.CatHost;
 ///             上号自动开工（外壳经 setJob 交任务单）: 占位进程起来后开一个本机监听（随机端口, 提供 <c>GET /cat/job?pid=</c>、<c>POST /cat/progress</c>）,
 ///             写 <c>dctravel-&lt;占位进程号&gt;.port</c>, 并发一条 launcher.log 写明地址。进世界（带 autoEnter 为 inWorld, 否则 running）后
 ///             由 <see cref="CatSimulatedAfan" /> 每 <see cref="AfanStep" /> 推进一步: 没有任务单报 waiting; 有任务单先报一次 waiting（核对角色）,
-///             desired 为 run 时先报一条只带开工图的 running（有 startShot 为 true 且要拍的项时; 不推进, 每个占位进程只拍这一次）:
+///             desired 为 run 时, 有 startShot 为 true 且要拍的项就在之后的第一条回报里带开工图（每个占位进程只拍这一次）:
+///             要开工时这条是只带开工图、不推进的 running, 没有可自动做的项时是 idle, 都做完了时是 done;
 ///             练级项（含 routine 为 null 的）共用一张, 金碟币（mgp）与糖豆人声誉（fallguys-rep）共用一张, 勾选类等不拍, 每项各带一条 kind=start、file 相同;
 ///             再按 order 把 routine 不为 null 的项一项项做完（running, current 每步加 (target − 起点)/5, 勾选类三步完成）, 一项做完且 shots.completion
 ///             为 true 时在截图目录写 <c>&lt;pid&gt;-&lt;seq&gt;.png</c> 并带在回报的 shots 里（progressAt 不为空时开工后先带一张 progress 图）,

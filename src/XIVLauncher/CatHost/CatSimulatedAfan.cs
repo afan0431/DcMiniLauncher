@@ -270,27 +270,30 @@ internal sealed class CatSimulatedAfan
         if (job.Desired == "stop")
             return ("stopped", null, null, shots, false);
 
+        // 角色核对通过、desired 为 run: 先拍开工图（换职业、开例程之前）, 这个游戏进程里只拍这一次。
+        // 没有可自动做的项（idle）或都做完了（done）时带在这条回报里; 要开工时这一步只带开工图、不推进
+        var start = new List<SimShot>();
+
+        if (!startShotsTaken && job.Desired == "run")
+        {
+            startShotsTaken = true;
+            start           = StartShots(job);
+        }
+
         if (!job.Items.Any(x => x.Routine != null))
-            return ("idle", null, null, shots, false);
+            return ("idle", null, null, start, false);
 
         var active = FirstPending(job);
 
         if (active == null)
-            return ("done", null, null, shots, false);
+            return ("done", null, null, start, false);
+
+        if (start.Count > 0)
+            return ("running", null, active.ItemId, start, false);
 
         // 做完这一把就停: 正在一把里时接着走完这一把, 不在一把里（或这一把走完了）就停下
         if (job.Desired == "finish" && !inRound)
             return ("stopped", null, null, shots, false);
-
-        // 开工前先拍开工图（换职业、开例程之前）, 这个游戏进程里只拍这一次: 这一步只带开工图、不推进
-        if (!startShotsTaken && job.Desired == "run")
-        {
-            startShotsTaken = true;
-            var start = StartShots(job);
-
-            if (start.Count > 0)
-                return ("running", null, active.ItemId, start, false);
-        }
 
         var local = progress[active.ItemId];
 
