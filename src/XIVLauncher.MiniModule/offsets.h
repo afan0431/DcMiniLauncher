@@ -177,6 +177,37 @@ namespace offsets
     inline constexpr size_t    PLAYER_STATE_NAME_LEN   = 64;
     inline constexpr uintptr_t PLAYER_STATE_CONTENT_ID = 0x68;  // :19 ulong。静态: 否  实机: 否
 
+    // 各职业等级, 下标为 ClassJob 表的 ExpArrayIndex, 未解锁为 0。
+    // 出处: 国服 Dalamud（Soil）Hooks\26-10-14-01\FFXIVClientStructs.dll 元数据, PlayerState._classJobLevels = FixedSizeArray35<short> @0x8A
+    //   （同处 CurrentClassJobId @0x7E byte、CurrentLevel @0x88 short、_classJobExperience @0xD0 FixedSizeArray35<int>）。
+    // 实机: 是（2026-10-16 开发机, 从外部 ReadProcessMemory 只读采样: 青魔 25 = 80、当前职业机工士 → 下标 20 = CurrentLevel 100、
+    //   唯一未满级的下标 32（驯兽师, 国服 ClassJob 43）同时有经验值, 三项自洽）。下标 33、34 没有对应职业。
+    inline constexpr uintptr_t PLAYER_STATE_CLASS_JOB_LEVELS      = 0x8A;  // short[35]
+    inline constexpr int       PLAYER_STATE_CLASS_JOB_LEVEL_COUNT = 35;
+    inline constexpr short     PLAYER_STATE_CLASS_JOB_LEVEL_MAX   = 200;   // 读出超过它（或为负）就当读歪了
+
+    // 当前职业与等级, 给启动器核对等级数组有没有读错位: levels[ExpArrayIndex(当前职业)] 应等于当前等级（等级同步中不比）。
+    // 出处同上（Hooks\26-10-14-01 元数据）; 实机: CurrentClassJobId / CurrentLevel 是（2026-10-16 同一次采样: 31 机工士 / 100）, IsLevelSynced 否
+    inline constexpr uintptr_t PLAYER_STATE_CURRENT_CLASS_JOB = 0x7E;   // byte
+    inline constexpr uintptr_t PLAYER_STATE_CURRENT_LEVEL     = 0x88;   // short
+    inline constexpr uintptr_t PLAYER_STATE_IS_LEVEL_SYNCED   = 0x15E;  // bool
+
+    // ---- Conditions（Client/Game/Conditions.cs）-----------------------------
+    // 出处: 国服 Dalamud（Soil）Hooks\26-10-14-01\FFXIVClientStructs.dll 元数据:
+    //   Conditions.Instance() [StaticAddress("48 8D 0D ?? ?? ?? ?? 66 2B D8", 3)] 直接是结构体地址（不是指针）, Size 0x74,
+    //   _flags = FixedSizeArray112<bool> @0, 每个标志一个字节, 下标即 Dalamud 的 ConditionFlag。
+    // 静态: 本机 E:\最终幻想XIV\game\ffxiv_dx11.exe（2026-10-16）唯一命中, 指令 RVA 0x87591A → 结构体 RVA 0x2AED050。
+    // 不在必中集合里: 命中不了只让 DUTY 返回 FAIL sigscan-failed:Conditions。要求唯一命中（扫完整个 .text 节）, 多于一处同样当作没命中。
+    inline constexpr const char* CONDITIONS_SIG        = "48 8D 0D ?? ?? ?? ?? 66 2B D8";
+    inline constexpr int         CONDITIONS_SIG_OFFSET = 3;
+    inline constexpr int         CONDITION_COUNT       = 112;
+
+    // 「正在副本中」= 下面三个任一为真（Dalamud 插件判断在不在副本的通用写法）。出处同上:
+    //   BoundByDuty @0x22、BoundByDuty56 @0x38、BoundByDuty95 @0x5F
+    inline constexpr int CONDITION_BOUND_BY_DUTY    = 34;
+    inline constexpr int CONDITION_BOUND_BY_DUTY_56 = 56;
+    inline constexpr int CONDITION_BOUND_BY_DUTY_95 = 95;
+
     // ---- AtkUnitBase / 对话框（Component/GUI/AtkUnitBase.cs）----------------
     // 以下各项静态: 否  实机: 否（0x1E4 紧挨着右键菜单已在用的 BlockedParentId 0x1EA, 仅此旁证）
     inline constexpr uintptr_t ATK_UNIT_BASE_ATK_VALUES       = 0x178;  // :30 AtkValue*

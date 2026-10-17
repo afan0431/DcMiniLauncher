@@ -19,7 +19,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$commands = @('VERSION', 'WHERE', 'LOBBYSTATE', 'CHARAS', 'WHOLIST', 'WHOAMI')
+$commands = @('VERSION', 'WHERE', 'LOBBYSTATE', 'CHARAS', 'WHOLIST', 'WHOAMI', 'LEVELS', 'DUTY')
 $pipeName = "minilauncher-$ProcessId"
 $utf8     = New-Object System.Text.UTF8Encoding($false)
 

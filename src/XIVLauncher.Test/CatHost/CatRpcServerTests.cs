@@ -1260,6 +1260,57 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Fact]
+    public async Task BufferOverflow_DropsProgressWithoutShotsBeforeLifecycleEvents_AndKeepsOnlyTheLatestLevels()
+    {
+        await server.NotifyAsync("game.started", new { pid = 1 });
+        await server.NotifyAsync(CatJobChannel.PROGRESS_EVENT, new { pid = 1, seq = 1797000000000L, state = "running", shots = new[] { new { itemId = "a", kind = "completion" } } });
+
+        for (var i = 0; i < CatRpcServer.MAX_BUFFERED_EVENTS; i++)
+        {
+            await server.NotifyAsync(CatJobChannel.PROGRESS_EVENT, new { pid = 1, seq = 1797000000001L + i, state = "running" });
+            await server.NotifyAsync(CatJobChannel.LEVELS_EVENT, new { pid = 1, levels = new[] { i } });
+        }
+
+        await server.NotifyAsync("game.exited", new { pid = 1 });
+
+        Assert.Equal(CatRpcServer.MAX_BUFFERED_EVENTS, server.BufferedEventCount);
+
+        await using var client = await ConnectAndHelloAsync();
+        var seen = new List<(string Method, JsonNode? Params)>();
+        client.WaitForEvent("game.exited", Timeout, seen);
+
+        Assert.Equal("game.started", seen[0].Method);
+
+        // 带截图的那条留着（丢了截图就传不上去）, 等级只剩最后一条
+        Assert.Contains(seen, x => x.Method == CatJobChannel.PROGRESS_EVENT && x.Params!["shots"] != null);
+        var levels = Assert.Single(seen, x => x.Method == CatJobChannel.LEVELS_EVENT);
+        Assert.Equal(CatRpcServer.MAX_BUFFERED_EVENTS - 1, levels.Params!["levels"]![0]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task Buffer_KeepsOnlyTheLatestDuty_AlongsideTheLatestLevels()
+    {
+        await server.NotifyAsync("game.started", new { pid = 1 });
+        await server.NotifyAsync(CatJobChannel.DUTY_EVENT, new { pid = 1, inDuty = false, at = "2026-10-16T14:00:00.000Z" });
+        await server.NotifyAsync(CatJobChannel.LEVELS_EVENT, new { pid = 1, levels = new[] { 1 } });
+        await server.NotifyAsync(CatJobChannel.DUTY_EVENT, new { pid = 1, inDuty = true, at = "2026-10-16T14:00:15.000Z" });
+        await server.NotifyAsync(CatJobChannel.LEVELS_EVENT, new { pid = 1, levels = new[] { 2 } });
+        await server.NotifyAsync(CatJobChannel.DUTY_EVENT, new { pid = 1, inDuty = false, at = "2026-10-16T14:00:30.000Z" });
+        await server.NotifyAsync("game.exited", new { pid = 1 });
+
+        Assert.Equal(4, server.BufferedEventCount);
+
+        await using var client = await ConnectAndHelloAsync();
+        var seen = new List<(string Method, JsonNode? Params)>();
+        client.WaitForEvent("game.exited", Timeout, seen);
+
+        Assert.Equal(["game.started", CatJobChannel.LEVELS_EVENT, CatJobChannel.DUTY_EVENT, "game.exited"], seen.Select(x => x.Method));
+        Assert.Equal(2, seen[1].Params!["levels"]![0]!.GetValue<int>());
+        Assert.False(seen[2].Params!["inDuty"]!.GetValue<bool>());
+        Assert.Equal("2026-10-16T14:00:30.000Z", seen[2].Params!["at"]!.GetValue<string>());
+    }
+
+    [Fact]
     public async Task Host_DoesNotBlockReporter_WhenPublishingHangs()
     {
         var never = new TaskCompletionSource();

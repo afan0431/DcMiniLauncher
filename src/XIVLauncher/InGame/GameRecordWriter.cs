@@ -68,13 +68,27 @@ public sealed class GameRecordWriter
     /// <summary>
     ///     在记录锁下生成并写一份记录（生成返回 null 则不写）。失败只记日志, 返回 false
     /// </summary>
-    public async Task<bool> WriteAsync(Func<Task<GameRecord?>> build)
+    public Task<bool> WriteAsync(Func<Task<GameRecord?>> build) =>
+        WriteLockedAsync(build, null);
+
+    /// <summary>
+    ///     写一个刚开始守护的游戏的记录, 写成了就记下它（之后的改写、删除都认这份）。记下与写在同一把锁里:
+    ///     紧跟着的改写（如任务单变了）拿到锁时一定看得到这份记录
+    /// </summary>
+    public Task<bool> WriteNewAsync(int processId, DateTimeOffset processStartedAt, Func<Task<GameRecord?>> build) =>
+        WriteLockedAsync(build, () => MarkRecorded(processId, processStartedAt));
+
+    private async Task<bool> WriteLockedAsync(Func<Task<GameRecord?>> build, Action? written)
     {
         await recordLock.WaitAsync().ConfigureAwait(false);
 
         try
         {
-            return await build().ConfigureAwait(false) is { } record && GameRecords.Write(record);
+            if (await build().ConfigureAwait(false) is not { } record || !GameRecords.Write(record))
+                return false;
+
+            written?.Invoke();
+            return true;
         }
         catch (Exception ex)
         {
@@ -85,19 +99,6 @@ public sealed class GameRecordWriter
         {
             recordLock.Release();
         }
-    }
-
-    /// <summary>
-    ///     写一个刚开始守护的游戏的记录, 写成了就记下它（之后的改写、删除都认这份）
-    /// </summary>
-    public async Task<bool> WriteNewAsync(int processId, DateTimeOffset processStartedAt, Func<Task<GameRecord?>> build)
-    {
-        var written = await WriteAsync(build).ConfigureAwait(false);
-
-        if (written)
-            MarkRecorded(processId, processStartedAt);
-
-        return written;
     }
 
     /// <summary>

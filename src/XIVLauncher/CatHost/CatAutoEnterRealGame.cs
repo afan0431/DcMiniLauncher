@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Serilog;
+using XIVLauncher.Common.Util;
 using XIVLauncher.DCTravel;
 using XIVLauncher.InGame;
 using XIVLauncher.Login.Models;
@@ -9,6 +10,7 @@ namespace XIVLauncher.CatHost;
 /// <summary>
 ///     自动进入角色的真实游戏一侧: 注入并连上游戏内模块, 换大厅复用 <see cref="InGameTravelService" /> 的那套步骤。
 ///     管道和换服的闸（按进程号）只在发命令时占着, <see cref="Release" /> 后别的操作（游戏内跨区、读选角列表）才用得了模块。
+///     不自动进入角色的游戏读职业等级（<see cref="CatLevelWatch" />）也用它注入和通话。
 /// </summary>
 internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
 {
@@ -46,6 +48,21 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
 
     /// <inheritdoc />
     public string CurrentAreaName { get; private set; }
+
+    /// <inheritdoc />
+    public int ProcessId => process.Id;
+
+    /// <summary>
+    ///     接管来的游戏（原守护进程起的）: 里面没有模块时, 补注入受环境变量 <see cref="CatModuleInjection.ADOPT_INJECT_VARIABLE" /> 控制,
+    ///     并且多个游戏同时被接管（更新启动器后）时经跨进程锁一个一个注、注完隔一会儿再放下一个
+    /// </summary>
+    public bool AdoptedGame { get; init; }
+
+    /// <summary>
+    ///     只为读当前角色和职业等级而注入（不自动进入角色的游戏）: 模块按只读模式装, 不装标题守卫和选角右键菜单, 游戏的行为与没注入时一样。
+    ///     模块已经在了（带 Minion 的上号已按完整模式注过）就照旧
+    /// </summary>
+    public bool ReadOnlyModule { get; init; }
 
     /// <inheritdoc />
     public IReadOnlyList<string> AreaNames => areas.Select(x => x.AreaName).ToArray();
@@ -94,7 +111,21 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
             await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken).ConfigureAwait(false);
         }
 
-        return await Task.Run(() => MiniModuleInjector.Inject(process), cancellationToken).ConfigureAwait(false);
+        if (!AdoptedGame || MiniModuleInjector.IsInjected(process))
+            return await Task.Run(() => MiniModuleInjector.Inject(process, ReadOnlyModule), cancellationToken).ConfigureAwait(false);
+
+        if (!CatModuleInjection.InjectOnAdopt)
+            return $"接管来的游戏里没有游戏内模块, 按环境变量 {CatModuleInjection.ADOPT_INJECT_VARIABLE} 的设置不补注入";
+
+        // 拿不到锁（超时、打不开）时不加锁照常注
+        using var injectGate = await CrossProcessMutex.TryAcquireAsync(CatModuleInjection.ADOPT_INJECT_MUTEX, CatModuleInjection.AdoptInjectWait).ConfigureAwait(false);
+
+        var error = await Task.Run(() => MiniModuleInjector.Inject(process, ReadOnlyModule), cancellationToken).ConfigureAwait(false);
+
+        if (injectGate != null)
+            await Task.Delay(CatModuleInjection.AdoptInjectSpacing, cancellationToken).ConfigureAwait(false);
+
+        return error;
     }
 
     /// <inheritdoc />

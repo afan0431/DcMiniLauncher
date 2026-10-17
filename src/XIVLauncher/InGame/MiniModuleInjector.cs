@@ -48,9 +48,18 @@ public static class MiniModuleInjector
     }
 
     /// <summary>
-    ///     注入。返回 null 表示成功, 否则是失败原因（调用方只提示、不影响已经在跑的游戏）。
+    ///     模式文件 <c>%ProgramData%\DcMiniLauncher\module-&lt;pid&gt;.mode</c>: 注入前写, 模块启动时读。内容 <c>readonly</c> = 只读模式
+    ///     （不装标题守卫和选角右键菜单）; 没有这个文件 = 完整模式。游戏退出时随端口文件一起删
     /// </summary>
-    public static string? Inject(Process gameProcess)
+    public static string ModeFilePath(int processId) =>
+        Path.Combine(Path.GetDirectoryName(RunningGameRegistry.PortFilePath(processId))!, $"module-{processId}.mode");
+
+    /// <summary>
+    ///     注入。返回 null 表示成功, 否则是失败原因（调用方只提示、不影响已经在跑的游戏）。
+    ///     readOnly = 只为读当前角色和职业等级而注入: 模块不装标题守卫和选角右键菜单, 游戏的行为与没注入时一样。
+    ///     模块已经在了就不再注入, 它的模式也不变
+    /// </summary>
+    public static string? Inject(Process gameProcess, bool readOnly = false)
     {
         var modulePath = ModulePath;
 
@@ -65,6 +74,10 @@ public static class MiniModuleInjector
             Log.Information("[MiniModule] 目标进程 (PID={Pid}) 里模块已经在了, 跳过注入", gameProcess.Id);
             return null;
         }
+
+        // 每次注入前都按这次要的模式重写（进程号会复用: 不能让上一个游戏留下的文件决定这一次）; 只读模式写不成就不注, 免得装成完整模式
+        if (WriteModeFile(gameProcess.Id, readOnly) is { } modeError)
+            return modeError;
 
         var access = ProcessAccess.CREATE_THREAD | ProcessAccess.QUERY_INFORMATION | ProcessAccess.VM_OPERATION |
                      ProcessAccess.VM_WRITE     | ProcessAccess.VM_READ;
@@ -130,6 +143,46 @@ public static class MiniModuleInjector
 
         Log.Information("[MiniModule] 已注入 {Module} → PID={Pid}", MODULE_FILE_NAME, gameProcess.Id);
         return null;
+    }
+
+    /// <summary>写（只读）或删（完整）模式文件; 失败返回原因</summary>
+    private static string? WriteModeFile(int processId, bool readOnly)
+    {
+        var path = ModeFilePath(processId);
+
+        try
+        {
+            if (readOnly)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllText(path, "readonly");
+            }
+            else if (File.Exists(path))
+                File.Delete(path);
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[MiniModule] 写模式文件失败 {Path}", path);
+            return readOnly ? $"写只读模式文件失败, 没有注入: {ex.Message}" : $"删旧的模式文件失败, 没有注入: {ex.Message}";
+        }
+    }
+
+    /// <summary>游戏退出后删掉它的模式文件</summary>
+    public static void DeleteModeFile(int processId)
+    {
+        try
+        {
+            var path = ModeFilePath(processId);
+
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[MiniModule] 删模式文件失败 PID={Pid}", processId);
+        }
     }
 
     [Flags]

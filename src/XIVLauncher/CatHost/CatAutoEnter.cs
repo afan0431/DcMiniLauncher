@@ -44,6 +44,9 @@ public interface ICatAutoEnterGame : IMiniModuleChannel
     /// <summary>游戏进程是否已退出</summary>
     bool HasExited { get; }
 
+    /// <summary>游戏进程号（报职业等级用）; 不知道时为 0, 按当前守护的游戏算</summary>
+    int ProcessId => 0;
+
     /// <summary>游戏现在连着的大区名</summary>
     string CurrentAreaName { get; }
 
@@ -115,6 +118,17 @@ public sealed class CatAutoEnterTimings
 
     /// <summary>和模块通话失败后等多久再看游戏进程还在不在（游戏崩溃时管道比进程先断）</summary>
     public TimeSpan ExitGrace { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    ///     看当前角色、读职业等级这类只读命令等回应的上限（模块在主线程上执行最多等 3 秒）; 超时跳过这一轮, 不一直占着模块闸
+    /// </summary>
+    public TimeSpan ReadTimeout { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>读职业等级要用的模块注入失败后, 隔多久再试</summary>
+    public TimeSpan AttachRetryInterval { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>读职业等级要用的模块最多注入几次（含第一次）</summary>
+    public int AttachAttempts { get; init; } = 4;
 }
 
 /// <summary>
@@ -149,6 +163,8 @@ public sealed class CatAutoEnter
     private int?                          reportedQueue;
     private string?                       enteredContentId;
     private TimeSpan?                     lobbyUnreadableSince;
+    private CatLevelReader?               levelReader;
+    private CatDutyReader?                dutyReader;
 
     /// <summary>
     ///     创建一次编排
@@ -242,11 +258,15 @@ public sealed class CatAutoEnter
     }
 
     /// <summary>
-    ///     编排结束或停手之后: 隔一段时间看一次游戏里当前是谁, 角色变了（人手动进了游戏、换了角色）就再报一次。
+    ///     编排结束或停手之后: 隔一段时间看一次游戏里当前是谁, 角色变了（人手动进了游戏、换了角色）就再报一次;
+    ///     角色在世界里时顺带读一次全部职业等级与是否在副本中（有变化才发 game.levels / game.duty, 模块太旧就不读）。
     ///     管道被别的操作占着时跳过这一次; 游戏退出或取消即结束。
     /// </summary>
     public async Task ObserveAsync(CancellationToken cancellationToken)
     {
+        levelReader ??= new CatLevelReader(reporter, game.ProcessId, timings.ReadTimeout);
+        dutyReader  ??= new CatDutyReader(reporter, game.ProcessId, timings.ReadTimeout);
+
         while (!cancellationToken.IsCancellationRequested && !game.HasExited)
         {
             await game.DelayAsync(timings.ObserveInterval, cancellationToken).ConfigureAwait(false);
@@ -259,10 +279,19 @@ public sealed class CatAutoEnter
 
             try
             {
-                var who = CatModuleReplies.ParseWhoAmI(await game.SendAsync("WHOAMI", cancellationToken).ConfigureAwait(false));
+                // 有上限: 模块卡住时跳过这一轮, 不一直占着模块闸
+                var response = await CatLevelReader.SendWithTimeoutAsync(game, "WHOAMI", timings.ReadTimeout, cancellationToken).ConfigureAwait(false);
+                var who      = response == null ? null : CatModuleReplies.ParseWhoAmI(response);
 
-                if (who is { Loaded: true } && who.ContentId != EnteredContentId)
-                    ReportEntered(who);
+                if (who is { Loaded: true })
+                {
+                    if (who.ContentId != EnteredContentId)
+                        ReportEntered(who);
+
+                    // 读等级超时了, 这一轮就不再读副本状态
+                    if (await levelReader.ReadAsync(game, who, cancellationToken).ConfigureAwait(false) != CatModuleRead.TimedOut)
+                        await dutyReader.ReadAsync(game, cancellationToken).ConfigureAwait(false);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -275,6 +304,10 @@ public sealed class CatAutoEnter
             finally
             {
                 game.Release();
+
+                // 这一轮没读到副本状态（没载入角色、读失败、超时）记一次, 读到过值之后接连两轮读不到就报"未知"
+                if (!cancellationToken.IsCancellationRequested)
+                    dutyReader.EndRound();
             }
         }
     }

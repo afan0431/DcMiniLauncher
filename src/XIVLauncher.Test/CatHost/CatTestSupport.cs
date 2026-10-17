@@ -324,6 +324,18 @@ internal sealed class RecordingReporter : ICatLaunchReporter
         Entries.Enqueue($"stopped:{code}");
         Messages.Enqueue(message);
     }
+
+    /// <summary>报出来的职业等级（pid, 角色, 等级）, 按顺序; 不进 <see cref="Entries" /></summary>
+    public ConcurrentQueue<(int Pid, CatLevelsCharacter Character, int[] Levels)> LevelReports { get; } = new();
+
+    public void Levels(int pid, CatLevelsCharacter character, IReadOnlyList<int> levels) =>
+        LevelReports.Enqueue((pid, character, levels.ToArray()));
+
+    /// <summary>报出来的副本状态（pid, 是否在副本中, null = 未知）, 按顺序; 不进 <see cref="Entries" /></summary>
+    public ConcurrentQueue<(int Pid, bool? InDuty)> DutyReports { get; } = new();
+
+    public void Duty(int pid, bool? inDuty, DateTimeOffset at) =>
+        DutyReports.Enqueue((pid, inDuty));
 }
 
 /// <summary>

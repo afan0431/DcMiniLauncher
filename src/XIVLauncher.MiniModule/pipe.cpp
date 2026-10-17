@@ -94,8 +94,8 @@ namespace
         if (command == "VERSION")
         {
             char response[512];
-            _snprintf_s(response, sizeof(response), _TRUNCATE, "OK version=%s pid=%lu log=%s",
-                        MINIMODULE_VERSION, GetCurrentProcessId(), LogFilePath().c_str());
+            _snprintf_s(response, sizeof(response), _TRUNCATE, "OK version=%s pid=%lu mode=%s log=%s",
+                        MINIMODULE_VERSION, GetCurrentProcessId(), ModuleReadOnly() ? "readonly" : "full", LogFilePath().c_str());
             return response;
         }
 
@@ -125,6 +125,12 @@ namespace
 
         if (command == "WHOAMI")
             return GameWhoAmI();
+
+        if (command == "LEVELS")
+            return GameLevels();
+
+        if (command == "DUTY")
+            return GameDuty();
 
         if (command.rfind("DIALOG ", 0) == 0)
             return GameDialog(command.substr(7));

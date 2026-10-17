@@ -72,6 +72,7 @@ public static class RunningGameRegistry
             Log.Debug("[RunningGame] 注销 PID={Pid}", processId);
 
         MinionOccupancy.Delete(processId);
+        MiniModuleInjector.DeleteModeFile(processId);
 
         try
         {

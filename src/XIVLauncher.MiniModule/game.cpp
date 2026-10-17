@@ -1154,6 +1154,8 @@ namespace
     bool      g_fireCallbackTried = false;
     uintptr_t g_playerState       = 0;
     bool      g_playerStateTried  = false;
+    uintptr_t g_conditions        = 0;
+    bool      g_conditionsTried   = false;
 
     bool ResolveFireCallback()
     {
@@ -1181,6 +1183,21 @@ namespace
         }
 
         return g_playerState != 0;
+    }
+
+    bool ResolveConditions()
+    {
+        if (!g_conditionsTried)
+        {
+            g_conditionsTried = true;
+            // 要求唯一命中: 这条特征码只有 10 字节, 游戏更新后若多出一处相同的指令, 取第一个可能读到别的静态变量
+            g_conditions      = ScanStaticAddressUnique(offsets::CONDITIONS_SIG, offsets::CONDITIONS_SIG_OFFSET);
+
+            LogF("[game]   Conditions 静态地址     RVA=0x%llX",
+                 static_cast<unsigned long long>(g_conditions ? g_conditions - ModuleBase() : 0));
+        }
+
+        return g_conditions != 0;
     }
 
     // 堆对象指针的合理性: 非空、落在用户态地址范围内、按 8 字节对齐
@@ -2227,6 +2244,135 @@ namespace
         }
     }
 
+    // ---- LEVELS --------------------------------------------------------------
+
+    struct LevelsData
+    {
+        int           status; // 1=正常 -1=异常 -2=PlayerState 读歪
+        int           loaded;
+        unsigned char classJob;
+        short         level;
+        int           synced;
+        short         levels[offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT];
+    };
+
+    void OpLevels(LevelsData* out)
+    {
+        memset(out, 0, sizeof(LevelsData));
+        out->status = -1;
+
+        __try
+        {
+            const auto state  = reinterpret_cast<uint8_t*>(g_playerState);
+            const auto loaded = ReadAt<unsigned char>(state, offsets::PLAYER_STATE_IS_LOADED);
+
+            if (loaded > 1)
+            {
+                out->status = -2;
+                return;
+            }
+
+            // 与 WHOAMI 同一判据: 读盘中途 ContentId 还是 0 时当作还没载入
+            if (loaded == 0 || ReadAt<unsigned long long>(state, offsets::PLAYER_STATE_CONTENT_ID) == 0)
+            {
+                out->status = 1;
+                return;
+            }
+
+            bool any = false;
+
+            for (int i = 0; i < offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT; i++)
+            {
+                const auto level = ReadAt<short>(state, offsets::PLAYER_STATE_CLASS_JOB_LEVELS + static_cast<uintptr_t>(i) * sizeof(short));
+
+                if (level < 0 || level > offsets::PLAYER_STATE_CLASS_JOB_LEVEL_MAX)
+                {
+                    out->status = -2;
+                    return;
+                }
+
+                out->levels[i] = level;
+                any            = any || level != 0;
+            }
+
+            out->classJob = ReadAt<unsigned char>(state, offsets::PLAYER_STATE_CURRENT_CLASS_JOB);
+            out->level    = ReadAt<short>(state, offsets::PLAYER_STATE_CURRENT_LEVEL);
+            out->synced   = ReadAt<unsigned char>(state, offsets::PLAYER_STATE_IS_LEVEL_SYNCED) != 0 ? 1 : 0;
+
+            // 全为 0 = 等级数据还没到（刚进世界的那一刻）, 按还没载入回
+            out->loaded = any ? 1 : 0;
+            out->status = 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] LEVELS 异常 code=0x%08X", GetExceptionCode());
+            out->status = -1;
+        }
+    }
+
+    // ---- DUTY ----------------------------------------------------------------
+
+    struct DutyData
+    {
+        int status; // 1=正常 -1=异常 -2=PlayerState 或 Conditions 读歪
+        int loaded;
+        int boundByDuty;
+        int boundByDuty56;
+        int boundByDuty95;
+        int set;           // 112 个标志里置位的个数（载入了角色时至少有 NormalConditions, 为 0 多半是地址读歪了）
+    };
+
+    void OpDuty(DutyData* out)
+    {
+        memset(out, 0, sizeof(DutyData));
+        out->status = -1;
+
+        __try
+        {
+            const auto state  = reinterpret_cast<uint8_t*>(g_playerState);
+            const auto flags  = reinterpret_cast<uint8_t*>(g_conditions);
+            const auto loaded = ReadAt<unsigned char>(state, offsets::PLAYER_STATE_IS_LOADED);
+
+            if (loaded > 1)
+            {
+                out->status = -2;
+                return;
+            }
+
+            // 与 WHOAMI 同一判据: 没有载入角色时副本标志没有意义, 回未知
+            if (loaded == 0 || ReadAt<unsigned long long>(state, offsets::PLAYER_STATE_CONTENT_ID) == 0)
+            {
+                out->status = 1;
+                return;
+            }
+
+            // 每个标志是一个 bool 字节: 出现 0 / 1 以外的值 = 地址读歪了
+            for (int i = 0; i < offsets::CONDITION_COUNT; i++)
+            {
+                const auto value = ReadAt<unsigned char>(flags, static_cast<uintptr_t>(i));
+
+                if (value > 1)
+                {
+                    out->status = -2;
+                    return;
+                }
+
+                out->set += value;
+            }
+
+            out->boundByDuty   = ReadAt<unsigned char>(flags, offsets::CONDITION_BOUND_BY_DUTY);
+            out->boundByDuty56 = ReadAt<unsigned char>(flags, offsets::CONDITION_BOUND_BY_DUTY_56);
+            out->boundByDuty95 = ReadAt<unsigned char>(flags, offsets::CONDITION_BOUND_BY_DUTY_95);
+            out->loaded        = 1;
+            out->status        = 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] DUTY 异常 code=0x%08X", GetExceptionCode());
+            out->status = -1;
+        }
+    }
+
     // 操作命令共用的前置; 失败时 failure 是要回给启动器的那一行
     bool PrepareAction(CallStatePtr& state, std::string& failure)
     {
@@ -2466,6 +2612,100 @@ std::string GameWhoAmI()
                 data->loaded, data->contentId, data->currentWorldId, data->homeWorldId, data->currentWorldName,
                 data->homeWorldName, data->loggedIn, data->inZone, data->lobbyContentId, data->name);
     return response;
+}
+
+// 全部职业等级, 只读。响应只有一行:
+//   OK loaded=<0|1> job=<当前 ClassJob> level=<当前等级> synced=<0|1 等级同步中> n=<个数> levels=<逗号分隔的等级>
+// job / level / synced 给启动器核对数组有没有读错位（levels[ExpArrayIndex(job)] 应等于 level, 同步中不比）。
+// 下标为 ClassJob 表的 ExpArrayIndex, 未解锁为 0; loaded=0（不在世界里、ContentId 还是 0、或等级全为 0）时 n=0、levels 为空。
+std::string GameLevels()
+{
+    if (!GameResolve())
+        return "FAIL sigscan-failed";
+
+    if (!ResolvePlayerState())
+        return "FAIL sigscan-failed:PlayerState";
+
+    auto data = std::make_shared<LevelsData>();
+
+    if (!MainThreadRun([data] { OpLevels(data.get()); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    switch (data->status)
+    {
+        case 1:  break;
+        case -2: return "FAIL bad-state";
+        default: return "FAIL exception";
+    }
+
+    if (data->loaded == 0)
+        return "OK loaded=0 n=0 levels=";
+
+    std::string response = "OK loaded=1 job=" + std::to_string(data->classJob) + " level=" + std::to_string(data->level) +
+                           " synced=" + std::to_string(data->synced) +
+                           " n=" + std::to_string(offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT) + " levels=";
+
+    for (int i = 0; i < offsets::PLAYER_STATE_CLASS_JOB_LEVEL_COUNT; i++)
+    {
+        if (i > 0)
+            response += ',';
+
+        response += std::to_string(data->levels[i]);
+    }
+
+    return response;
+}
+
+// 角色是否在副本中, 只读。响应只有一行:
+//   OK loaded=1 inDuty=<0|1> set=<112 个标志里置位的个数> flags=<置位的副本标志下标, 逗号分隔>
+//   OK loaded=0                     （没有载入角色: 不知道在不在副本）
+// inDuty = Conditions 的 BoundByDuty(34) / BoundByDuty56(56) / BoundByDuty95(95) 任一为真; flags 只列这三个里置位的, 供核对。
+// set=0 不在这里判失败: 载入了角色时不该全为 0, 由启动器连续几次看到才算读歪。
+std::string GameDuty()
+{
+    if (!GameResolve())
+        return "FAIL sigscan-failed";
+
+    if (!ResolvePlayerState())
+        return "FAIL sigscan-failed:PlayerState";
+
+    if (!ResolveConditions())
+        return "FAIL sigscan-failed:Conditions";
+
+    auto data = std::make_shared<DutyData>();
+
+    if (!MainThreadRun([data] { OpDuty(data.get()); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    switch (data->status)
+    {
+        case 1:  break;
+        case -2: return "FAIL bad-state";
+        default: return "FAIL exception";
+    }
+
+    if (data->loaded == 0)
+        return "OK loaded=0";
+
+    std::string flags;
+    const std::pair<int, int> bits[] = {
+        { offsets::CONDITION_BOUND_BY_DUTY,    data->boundByDuty   },
+        { offsets::CONDITION_BOUND_BY_DUTY_56, data->boundByDuty56 },
+        { offsets::CONDITION_BOUND_BY_DUTY_95, data->boundByDuty95 },
+    };
+
+    for (const auto& [index, value] : bits)
+    {
+        if (value == 0)
+            continue;
+
+        if (!flags.empty())
+            flags += ',';
+
+        flags += std::to_string(index);
+    }
+
+    return std::string("OK loaded=1 inDuty=") + (flags.empty() ? "0" : "1") + " set=" + std::to_string(data->set) + " flags=" + flags;
 }
 
 // 参数: 角色名, 或纯数字的 ContentId。角色在整个大区的列表里找。

@@ -100,6 +100,12 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     /// <summary>本进程守着的游戏的守护记录与守护锁</summary>
     private readonly GameRecordWriter records = new();
 
+    /// <summary>任务单通道（Cat 上号自动开工）: 挂到本机监听上给 Afan 用; 外壳不支持时为 null</summary>
+    private CatJobChannel? jobs;
+
+    /// <summary>任务单与守护记录之间的接线</summary>
+    private CatJobRecords jobRecords = null!;
+
     /// <summary>
     ///     正在交接停止或已交接: 进程退出前不再碰游戏、记录、端口文件, 也不再重开（游戏留给下一个守护进程）。
     ///     没交接成时撤回, 之前被它挡下的收尾由 <see cref="HandOffDecidedAsync" /> 的等待方补做
@@ -122,6 +128,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     public async Task<int> RunAsync(CatLaunchRequest launchRequest, ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
         request = launchRequest;
+        AttachJobs(reporter);
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, closeCts.Token);
 
@@ -194,6 +201,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             record.CharacterName,
             record.CharacterHomeWorld
         );
+
+        AttachJobs(reporter);
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, closeCts.Token);
 
@@ -319,7 +328,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         context = new GameLaunchContext(new LoginResult { State = LoginState.Ok, OAuthLogin = oauth }, area, areas, request.Platform);
 
-        dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel);
+        dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel) { CatEndpoints = jobs };
+
+        // 记录里的任务单（工作台在 game.adopted 之后还会再发一次, 这里只是兜底）; 马上认这个游戏, 游戏内 Afan 取任务单不用等到 game.adopted
+        jobRecords.Restore(record, adoptRequest.Pid);
 
         if (!string.IsNullOrEmpty(tgt) && !string.IsNullOrEmpty(guid))
             new LoginChannelContext(device).BindLoginSessionRefresh(dcTravel, tgt, guid);
@@ -338,6 +350,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             if (context.DcTravelPort == 0)
                 reporter.Log("error", $"跨区端口 {record.DcTravelPort} 没能绑回, 这个游戏的游戏内跨区不可用（崩溃重开照常）");
         }
+
+        UpdateJobAvailability();
 
         // 受理 adopt 时已打开并核对过的进程（一直拿着句柄, 进程号不会被复用）
         var process = adoptRequest.Game;
@@ -364,12 +378,14 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                     GuardPid = Environment.ProcessId,
                     GuardStartedAt = GameRecordWriter.SelfStartedAt,
                     DcTravelSession = null,
+                    CatJob = jobRecords.CurrentOr(record.CatJob),
                     UpdatedAt = DateTimeOffset.UtcNow
                 }
             )
         ).ConfigureAwait(false);
 
         records.MarkRecorded(process.Id, record.ProcessStartedAt);
+        await jobRecords.RecordWrittenAsync().ConfigureAwait(false);
 
         // 受理 adopt 时认领的守护锁: 这个游戏一退出（含崩溃重开换了新进程）就放掉, 不等整个接管流程结束
         records.Hold(process.Id, adoptRequest.GuardClaim);
@@ -408,11 +424,88 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             return launched;
         }
 
-        // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色（编排早就做完了, 不再重做）
-        if (record.AutoEnter && !process.HasExited)
-            StartObserve(launched, reporter, cancellationToken);
+        // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色并读职业等级（编排早就做完了, 不再重做）; 其它游戏只读职业等级
+        if (!process.HasExited)
+        {
+            if (record.AutoEnter)
+                StartObserve(launched, reporter, cancellationToken);
+            else
+                StartLevelWatch(launched, reporter, cancellationToken, true);
+        }
 
         return launched;
+    }
+
+    /// <summary>
+    ///     接上外壳给的任务单通道: 任务单变了就改写当前游戏的守护记录
+    /// </summary>
+    private void AttachJobs(ICatLaunchReporter reporter)
+    {
+        jobs       = reporter.Jobs;
+        jobRecords = new CatJobRecords(records, jobs, () => currentProcess?.ProcessID, () => handingOff);
+    }
+
+    /// <summary>
+    ///     本机接口没开成（端口 0）时游戏内取不到任务单: setJob 回 unsupported 并记一笔; 开成了（含崩溃重开时重新开好）恢复可用
+    /// </summary>
+    private void UpdateJobAvailability()
+    {
+        if (jobs == null)
+            return;
+
+        var reason = context.DcTravelPort > 0 ? null : "本机接口端口没开成（接管时跨区端口绑不回）, 游戏内取不到任务单, 这次上号不能自动做";
+
+        if (reason != null && jobs.UnavailableReason == null)
+            Log.Warning("[CatHost] {Reason}", reason);
+
+        jobs.UnavailableReason = reason;
+    }
+
+    /// <summary>
+    ///     不自动进入角色的游戏: 后台按只读模式注入游戏内模块（不装标题守卫和选角右键菜单, 游戏的行为与没注入时一样; 带 Minion 的已按完整模式注过就照旧）,
+    ///     之后每隔一段时间看一次当前角色、读一次全部职业等级（不挡崩溃守护, 游戏进程收尾时取消）。
+    ///     adopted = 接管来的游戏: 补注入受环境变量开关控制, 多个游戏错开注
+    /// </summary>
+    private void StartLevelWatch(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken token, bool adopted = false)
+    {
+        var process      = launched.UnderlyingProcess;
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var game = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea)
+        {
+            AdoptedGame    = adopted,
+            ReadOnlyModule = true
+        };
+        var watch        = new CatLevelWatch(game, reporter);
+        var watchToken   = cancellation.Token;
+
+        lock (cleanupLock)
+        {
+            autoEnterCancellations[launched.ProcessID] = cancellation;
+            autoEnterTasks.Add
+            (
+                Task.Run
+                (async () =>
+                    {
+                        try
+                        {
+                            await watch.RunAsync(watchToken).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // 游戏退出或收到关闭请求
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, "[CatHost] 读职业等级的后台任务出错（游戏不受影响）");
+                        }
+                        finally
+                        {
+                            game.Dispose();
+                        }
+                    }
+                )
+            );
+        }
     }
 
     /// <summary>
@@ -536,6 +629,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                                   Tgt = await EncryptOrNullAsync(oauth?.TGT).ConfigureAwait(false) ?? record.Tgt,
                                   Guid = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false) ?? record.Guid,
                                   DcTravelSession = await EncryptOrNullAsync(session).ConfigureAwait(false),
+                                  CatJob = jobRecords.CurrentOr(record.CatJob),
                                   UpdatedAt = DateTimeOffset.UtcNow
                               };
                           }
@@ -738,7 +832,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             accountManager.Save(account);
         }
 
-        dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel);
+        // 本机监听同时提供 /cat/job、/cat/progress（Cat 上号自动开工）
+        dcTravel = new DCTravelRuntimeService(SyncAreaFromDcTravel) { CatEndpoints = jobs };
 
         var loginResult = await LoginWithSavedCredentialAsync(reporter, cancellationToken).ConfigureAwait(false);
 
@@ -749,6 +844,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         context.DcTravelPort = await dcTravel.StartAsync().ConfigureAwait(false);
         Log.Information("[CatHost] 跨区会话已建立, 端口 {Port}, 大区 {Area}", context.DcTravelPort, area.AreaName);
+        UpdateJobAvailability();
     }
 
     /// <summary>
@@ -1407,6 +1503,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             context.DcTravelPort = await dcTravel.StartAsync().ConfigureAwait(false);
             Log.Information("[CatHost] 崩溃重开前重新打开跨区服务, 端口 {Port}", context.DcTravelPort);
+            UpdateJobAvailability();
         }
 
         // 票据单次有效且有时效, Dalamud 准备完再现取
@@ -1496,8 +1593,12 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             reporter.Stage(CatStages.RUNNING);
 
+            // 盛趣、WeGame 的游戏一律注入游戏内模块: 自动进入角色的由编排按完整模式注入, 进世界后在看当前角色时顺带读职业等级;
+            // 其它的按只读模式注入（带 Minion 的已在上面按完整模式注过）, 只看当前角色、读职业等级
             if (request.AutoEnter)
                 StartAutoEnter(launched, reporter, startToken);
+            else
+                StartLevelWatch(launched, reporter, startToken);
         }
 
         return (launched, dalamudOk, companionAppManager);
@@ -1738,6 +1839,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             Log.Warning("[CatHost] 游戏 {Pid} 的守护锁拿不到（不该发生）, 照常守护但别的进程可能也来接管", process.Id);
 
         await records.WriteNewAsync(process.Id, startedAt, () => BuildRecordAsync(process, startedAt, options, dalamudOk)).ConfigureAwait(false);
+        await jobRecords.RecordWrittenAsync().ConfigureAwait(false);
     }
 
     private async Task<GameRecord?> BuildRecordAsync(Process process, DateTimeOffset startedAt, RestartMonitor.RestartOptions options, bool dalamudOk)
@@ -1768,6 +1870,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 CharacterName             = request.CharacterName,
                 CharacterHomeWorld        = request.CharacterHomeWorld,
                 CrashDialogTimeoutSeconds = request.CrashDialogTimeoutSeconds,
+                CatJob                    = jobRecords.Current,
                 GuardPid                  = Environment.ProcessId,
                 GuardStartedAt            = GameRecordWriter.SelfStartedAt,
                 UpdatedAt                 = DateTimeOffset.UtcNow

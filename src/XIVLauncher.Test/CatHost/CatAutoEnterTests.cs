@@ -759,6 +759,63 @@ public sealed class CatAutoEnterTests
     }
 
     [Fact]
+    public async Task Observe_ReadsLevelsWhileInWorld_AndStopsAskingAnOldModule()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null));
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+
+        // 编排本身不读等级: 等级只在之后每 15 秒的检查里顺带读
+        Assert.DoesNotContain("LEVELS", game.Commands);
+
+        var ticks = 0;
+        game.Intercept = command => command == "LEVELS" ? (ticks < 3 ? $"OK loaded=1 n=3 levels=90,{80 + ticks},0" : "FAIL unknown-command") : null;
+        game.OnDelay = g =>
+        {
+            if (++ticks == 6)
+                g.HasExited = true;
+        };
+
+        await flow.ObserveAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal([[90, 81, 0], [90, 82, 0]], reporter.LevelReports.Select(x => x.Levels));
+        // 第 3 次回 unknown-command 之后不再问
+        Assert.Equal(3, game.Commands.Count(x => x == "LEVELS"));
+    }
+
+    [Fact]
+    public async Task Observe_ReadsDutyAfterLevels_StopsAskingAModuleWithoutIt_AndReportsUnknown()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null));
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+        Assert.DoesNotContain("DUTY", game.Commands);
+
+        var ticks = 0;
+        game.Intercept = command => command switch
+        {
+            "LEVELS" => "OK loaded=1 n=3 levels=90,80,0",
+            "DUTY"   => ticks < 4 ? (ticks == 2 ? "OK loaded=1 inDuty=1 flags=34" : "OK loaded=1 inDuty=0 flags=") : "FAIL unknown-command",
+            _        => null
+        };
+        game.OnDelay = g =>
+        {
+            if (++ticks == 6)
+                g.HasExited = true;
+        };
+
+        await flow.ObserveAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        // 第 4、5 轮读不到（回 unknown-command 之后不再问）: 读到过值之后接连两轮读不到, 报一次未知
+        Assert.Equal([false, true, false, null], reporter.DutyReports.Select(x => x.InDuty));
+        // 第 4 次回 unknown-command 之后不再问; 每次都排在 LEVELS 之后
+        Assert.Equal(4, game.Commands.Count(x => x == "DUTY"));
+        Assert.All(game.Commands.Select((x, i) => (x, i)).Where(x => x.x == "DUTY"), x => Assert.Equal("LEVELS", game.Commands[x.i - 1]));
+    }
+
+    [Fact]
     public async Task Observe_AfterAStop_ReportsTheCharacterOnceSomeoneEntersByHand()
     {
         var (game, reporter) = Setup(Chara("11", "小白"));

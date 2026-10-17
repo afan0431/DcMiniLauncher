@@ -36,6 +36,12 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
     /// </summary>
     public int DcTravelPort { get; private set; }
 
+    /// <summary>
+    ///     Cat 上号自动开工的本机接口（<c>/cat/job</c>、<c>/cat/progress</c>）的处理方; 在 <see cref="StartAsync" /> 之前设,
+    ///     之后开的监听都挂上它。界面版不设, 两条路由回 404
+    /// </summary>
+    public ICatLocalEndpoints? CatEndpoints { get; set; }
+
     public DCTravelRuntimeService
     (
         Action<string> setSdoAreaAction
@@ -168,7 +174,9 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
             InGameSwitchAreaHandler    = inGameTravel.HandleSwitchAreaAsync,
             InGameLoginAreasProvider   = InGameTravelCoordinator.QueryLoginAreasAsync,
             //   GET/POST /dctravel/ingame-travel/settings  抄 DcTraveler 那四项设置
-            InGameTravelSettingsHandler = InGameTravelCoordinator.HandleSettings
+            InGameTravelSettingsHandler = InGameTravelCoordinator.HandleSettings,
+            //   GET  /cat/job?pid=    POST /cat/progress   Cat 上号自动开工: Afan 取任务单、报进度
+            CatEndpoints                = CatEndpoints
         };
 
     public void ConfigureQuickLoginRefresh

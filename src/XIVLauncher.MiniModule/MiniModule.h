@@ -11,7 +11,12 @@
 #include <string>
 
 // 模块版本, 通过 pipe 的 VERSION 命令回给启动器, 便于确认注进去的是哪一版
-#define MINIMODULE_VERSION "0.7.0"
+#define MINIMODULE_VERSION "0.9.0"
+
+// ---- 模式 (dllmain.cpp) -------------------------------------------------------
+// 只读模式: 启动器只为读角色和等级而注入时, 注入前写 <ProgramData>\DcMiniLauncher\module-<pid>.mode（readonly）,
+// 模块就不装标题守卫和选角右键菜单。VERSION 的回应里带 mode=readonly|full
+bool ModuleReadOnly();
 
 // ---- 日志 (log.cpp) ----------------------------------------------------------
 // 日志落在 %TEMP%\minilauncher-module-<pid>.log —— 游戏目录不保证可写, 且这里天然按 PID 分开
@@ -39,6 +44,7 @@ DWORD ProcessMainThreadId();    // 本进程创建时间最早的线程 = 主线
 uintptr_t ModuleBase();
 uintptr_t ScanText(const char* signature);                     // 命中 E8/E9 时自动跟进目标
 uintptr_t ScanStaticAddress(const char* signature, int offset); // RIP 相对寻址的静态地址
+uintptr_t ScanStaticAddressUnique(const char* signature, int offset); // 同上, 但扫完整个 .text 节, 命中不止一处时返回 0
 uintptr_t ScanTextRaw(const char* signature);                  // 不跟进 E8/E9, 给通配符开头的特征码用
 
 // ---- 游戏结构体 (game.cpp) --------------------------------------------------
@@ -61,6 +67,8 @@ std::string GameFocusCharacter(const std::string& who); // 选角界面切到该
 std::string GameLobbyState();   // 只读: 界面位置、当前服务器、选中项、暂时锁定、排队名次、对话框及提示文字、是否读盘
 std::string GameCharas();       // 只读: 整个大区的角色, 格式同 WHOLIST
 std::string GameWhoAmI();       // 只读: 游戏内当前角色名、ContentId、当前/原始世界
+std::string GameLevels();       // 只读: 全部职业等级（下标为 ClassJob 表的 ExpArrayIndex）
+std::string GameDuty();         // 只读: 角色是否在副本中（Conditions 的 BoundByDuty 类标志）
 std::string GameSelectCharacter(const std::string& who); // 当前服务器的角色列表里选中（高亮）, 不进入
 std::string GameEnterCharacter(const std::string& who);  // 选中并回读确认后左键点击角色: 客户端自己检查并弹登录确认框
 std::string GameDialog(const std::string& arguments);    // "YES <contentId>" 点登录确认框的「是」; "NO"; "OK" 点错误框或确定框（排队提示不点）

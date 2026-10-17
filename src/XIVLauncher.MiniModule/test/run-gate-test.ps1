@@ -3,6 +3,7 @@
 #   powershell -ExecutionPolicy Bypass -File src\XIVLauncher.MiniModule\test\run-gate-test.ps1
 #
 # 覆盖: 注入 → 管道通话 (VERSION/PING) → 没有主线程通道时 MAINTHREAD 回超时 → 自动选角各命令在非游戏进程里安全回 FAIL → 自我卸载 (UNLOAD)
+#       → 注入前写的只读模式文件被模块读到（VERSION 带 mode=readonly）
 # 不覆盖: 主线程派发（通道挂在游戏的 Framework::Tick 上, 假宿主没有）、与 bot/其他 hook 共存 —— 只有真机能答。
 
 param([string]$DllPath)
@@ -190,6 +191,11 @@ try
 {
     Write-Host "testhost pid=$($process.Id)"
 
+    # 与登录器只为读等级而注入时一样: 注入前按 pid 写只读模式文件
+    $modeFile = Join-Path $env:ProgramData "DcMiniLauncher\module-$($process.Id).mode"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $modeFile) | Out-Null
+    [System.IO.File]::WriteAllText($modeFile, 'readonly')
+
     $error1 = [Injector]::Inject($process.Id, $dllPath)
     if ($error1) { throw "注入失败: $error1" }
 
@@ -226,13 +232,16 @@ try
         $unknown = Send-ModuleCommand -Pipe $pipe -Command 'NOSUCHCOMMAND'
         if ($unknown -ne 'FAIL unknown-command') { $failures += "未知命令的回应不对: $unknown" }
 
-        if ($version -notmatch 'version=0\.7\.0 ') { $failures += "模块版本不是 0.7.0: $version" }
+        if ($version -notmatch 'version=0\.9\.0 ') { $failures += "模块版本不是 0.9.0: $version" }
+        if ($version -notmatch 'mode=readonly ') { $failures += "模块没有读到只读模式文件: $version" }
 
         # 自动选角的命令: 假宿主不是游戏, 特征码一条都命中不了, 每条都必须安全地回 FAIL, 宿主不能挂
         $expected = [ordered]@{
             'LOBBYSTATE'            = 'FAIL sigscan-failed'
             'CHARAS'                = 'FAIL sigscan-failed'
             'WHOAMI'                = 'FAIL sigscan-failed'
+            'LEVELS'                = 'FAIL sigscan-failed'
+            'DUTY'                  = 'FAIL sigscan-failed'
             'FOCUSCHARA 测试角色'   = 'FAIL sigscan-failed'
             'SELECTCHARA 测试角色'  = 'FAIL sigscan-failed'
             'SELECTCHARA 123456'    = 'FAIL sigscan-failed'
@@ -271,6 +280,7 @@ try
 finally
 {
     if (-not $process.HasExited) { $process.Kill() }
+    if ($modeFile -and (Test-Path $modeFile)) { Remove-Item $modeFile -Force }
 }
 
 # ---- 4. 结论 ----------------------------------------------------------------

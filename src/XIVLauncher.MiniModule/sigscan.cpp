@@ -6,6 +6,7 @@
 //   - StaticAddress 语义: 取 命中+offset 处的 rel32, 目标 = 命中+offset+4+rel32 (RIP 相对)
 #include "MiniModule.h"
 
+#include <cstdint>
 #include <vector>
 
 namespace
@@ -89,8 +90,11 @@ namespace
         return false;
     }
 
-    uint8_t* ScanRaw(const Pattern& pattern)
+    // 从 .text 节开头扫; limit = 最多数到几个命中就停（1 = 取第一个）。返回第一个命中, count 带回数到的命中个数
+    uint8_t* ScanRaw(const Pattern& pattern, size_t limit, size_t& count)
     {
+        count = 0;
+
         uint8_t* begin = nullptr;
         size_t   size  = 0;
 
@@ -100,6 +104,8 @@ namespace
         const size_t length = pattern.bytes.size();
         if (length == 0 || length > size)
             return nullptr;
+
+        uint8_t* first = nullptr;
 
         for (size_t i = 0; i + length <= size; ++i)
         {
@@ -114,11 +120,23 @@ namespace
                 }
             }
 
-            if (hit)
-                return begin + i;
+            if (!hit)
+                continue;
+
+            if (first == nullptr)
+                first = begin + i;
+
+            if (++count >= limit)
+                break;
         }
 
-        return nullptr;
+        return first;
+    }
+
+    uint8_t* ScanRaw(const Pattern& pattern)
+    {
+        size_t count = 0;
+        return ScanRaw(pattern, 1, count);
     }
 }
 
@@ -187,6 +205,35 @@ uintptr_t ScanStaticAddress(const char* signature, int offset)
     if (hit == nullptr)
     {
         LogF("[sigscan] 未命中: %s", signature);
+        return 0;
+    }
+
+    const int32_t relative = *reinterpret_cast<int32_t*>(hit + offset);
+    return reinterpret_cast<uintptr_t>(hit + offset + 4 + relative);
+}
+
+// 同 ScanStaticAddress, 但扫完整个 .text 节、要求只有一个命中: 多于一个时不取第一个, 当作没命中
+uintptr_t ScanStaticAddressUnique(const char* signature, int offset)
+{
+    Pattern pattern;
+    if (!ParsePattern(signature, pattern))
+    {
+        LogF("[sigscan] 特征码语法错误: %s", signature);
+        return 0;
+    }
+
+    size_t   count = 0;
+    uint8_t* hit   = ScanRaw(pattern, SIZE_MAX, count);
+
+    if (hit == nullptr)
+    {
+        LogF("[sigscan] 未命中: %s", signature);
+        return 0;
+    }
+
+    if (count > 1)
+    {
+        LogF("[sigscan] 命中 %llu 处, 要求唯一, 不用: %s", static_cast<unsigned long long>(count), signature);
         return 0;
     }
 
