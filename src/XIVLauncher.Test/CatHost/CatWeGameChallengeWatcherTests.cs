@@ -1186,6 +1186,77 @@ public sealed class CatWeGameChallengeWatcherTests
         Assert.Contains("cleared:c-1", reporter.Entries);
     }
 
+    [Fact]
+    public async Task PopupOnly_IgnoresQrCodes_UntilTurnedOff()
+    {
+        var watcher = new CatWeGameChallengeWatcher(screen, reporter, redactor, CatWeGameScan.Qq) { ClickSettle = TimeSpan.Zero, SettleTicks = 2, PopupOnly = true };
+        screen.Window = Qr(QQ_LINK);
+
+        await TickAsync(watcher, 4);
+        Assert.Empty(reporter.Entries);
+        Assert.Empty(screen.Clicks);
+
+        // 弹窗照样报
+        screen.Window = Confirm(false);
+        await TickAsync(watcher, 1);
+        Assert.Equal(["challenge:qqConfirm:c-1"], reporter.Entries);
+
+        watcher.PopupOnly = false;
+        screen.Window = Qr(QQ_LINK);
+        await TickAsync(watcher, 3);
+
+        Assert.Contains("challenge:qrcode:q-1", reporter.Entries);
+    }
+
+    [Fact]
+    public async Task Capture_HwLoginRunning_QrOnScreenIsNotReported()
+    {
+        // 硬件流程在跑（导航经过 QQ 扫码页）: 那张二维码不报给客户
+        var environment = new WaitingEnvironment();
+        screen.Window = Qr(QQ_LINK);
+        var capture = new CatWeGameLoginCapture(environment, new EmptyStore(), redactor)
+        {
+            Screen        = screen,
+            WatchInterval = TimeSpan.FromMilliseconds(10),
+            Keyboard      = new StubHidKeyboard(),
+            Foreground    = new StubWeGameForeground()
+        };
+
+        var run = capture.FindRowAsync(Request(null) with { Password = new CatSecret("pw1234Ab") }, reporter, CancellationToken.None);
+        await WaitUntilAsync(() => screen.CaptureCount >= 20);
+
+        environment.Result.TrySetResult(new WeGameCaptureResult("10000000000000001", "captured-token-AAAA"));
+        await run.WaitAsync(Timeout);
+
+        Assert.Empty(reporter.Challenges);
+        Assert.Empty(reporter.HwFallbacks);
+    }
+
+    [Fact]
+    public async Task Capture_HwLoginFellBack_QrIsReportedAgain()
+    {
+        // 没探测到硬件, 退回员工手动: 员工可能改用扫码, 二维码照常报
+        var environment = new WaitingEnvironment();
+        screen.Window = Qr(QQ_LINK);
+        var capture = new CatWeGameLoginCapture(environment, new EmptyStore(), redactor)
+        {
+            Screen        = screen,
+            WatchInterval = TimeSpan.FromMilliseconds(10),
+            Keyboard      = new StubHidKeyboard { OpenResult = false },
+            Foreground    = new StubWeGameForeground()
+        };
+
+        var run = capture.FindRowAsync(Request(null) with { Password = new CatSecret("pw1234Ab") }, reporter, CancellationToken.None);
+        await WaitUntilAsync(() => reporter.Entries.Contains("challenge:qrcode:q-1"));
+
+        environment.Result.TrySetResult(new WeGameCaptureResult("10000000000000001", "captured-token-AAAA"));
+        await run.WaitAsync(Timeout);
+
+        var entries = reporter.Entries.ToList();
+        Assert.True(entries.FindIndex(x => x.StartsWith("hwFallback:")) < entries.IndexOf("challenge:qrcode:q-1"));
+        Assert.Contains("cleared:q-1", entries);
+    }
+
     private CatWeGameChallengeWatcher CreatePopupWatcher(ICatWeGameClicker clicker, TimeSpan? recheck = null) =>
         new(screen, reporter, redactor, null) { Clicker = clicker, TileClickPause = TimeSpan.Zero, AnswerRecheck = recheck ?? TimeSpan.FromHours(1) };
 

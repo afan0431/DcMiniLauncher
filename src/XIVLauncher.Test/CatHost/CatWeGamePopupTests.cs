@@ -143,6 +143,55 @@ public sealed class CatWeGamePopupTests
         AssertReportedImage(popup);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(4)]
+    public void Captcha_Ready_OneFlatTile_IsStillReady(int tile)
+    {
+        // 一格是纯色（天空、白墙这类图）: 不是过渡, 照常就绪
+        var shot = Ready960();
+        var (x0, y0) = (new[] { 24, 139, 254 }[tile % 3], new[] { 151, 266 }[tile / 3]);
+        shot.Fill(Captcha960.X + x0, Captcha960.Y + y0, 112, 112, 230, 236, 240);
+
+        var popup = Read(shot);
+
+        Assert.Equal(CatWeGamePopupKind.CaptchaReady, popup.Kind);
+        Assert.NotNull(popup.CaptchaJpeg);
+    }
+
+    [Fact]
+    public void Captcha_ThreeFlatTiles_IsBusy()
+    {
+        var shot = Ready960();
+
+        foreach (var x0 in new[] { 24, 139, 254 })
+            shot.Fill(Captcha960.X + x0, Captcha960.Y + 151, 112, 112, 245, 245, 245);
+
+        Assert.Equal(CatWeGamePopupKind.CaptchaBusy, Read(shot).Kind);
+    }
+
+    [Fact]
+    public void ClientArea_CroppedFromAFramedWindowShot_GivesClientCoordinates()
+    {
+        // 带边框的窗口: 左右下各 8 像素、上面 31 像素标题栏; 客户区就是 960×540 的那张
+        const int LEFT = 8, TOP = 31, BORDER = 8;
+        var client = Ready960();
+        var window = Shot.Background(client.Width + LEFT + BORDER, client.Height + TOP + BORDER);
+        window.Paste(client, 0, 0, client.Width, client.Height, LEFT, TOP);
+
+        var cropped = CatWeGameRealScreen.CropClient(window.Pixels, window.Width, window.Height, LEFT, TOP, client.Width, client.Height);
+        var popup   = CatWeGamePopupReader.Read(cropped!, client.Width, client.Height);
+
+        Assert.NotNull(popup);
+        Assert.Equal(CatWeGamePopupKind.CaptchaReady, popup.Kind);
+        Assert.Equal(Read(client).TilePoints, popup.TilePoints);
+        Assert.Equal((Captcha960.X + 336, Captcha960.Y + 397), popup.ConfirmPoint);
+
+        // 无边框: 原样用整窗截图; 客户区超出截图: 不认
+        Assert.Same(client.Pixels, CatWeGameRealScreen.CropClient(client.Pixels, client.Width, client.Height, 0, 0, client.Width, client.Height));
+        Assert.Null(CatWeGameRealScreen.CropClient(window.Pixels, window.Width, window.Height, LEFT, TOP, window.Width, window.Height));
+    }
+
     [Fact]
     public void Captcha_GridThumb_SameQuestionMatches_OtherQuestionDoesNot()
     {

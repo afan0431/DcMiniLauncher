@@ -352,6 +352,18 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     /// <summary>点弹窗用的点击器; 不设时给登录窗口发后台鼠标消息</summary>
     public ICatWeGameClicker? Clicker { get; init; }
 
+    private volatile bool popupOnly;
+
+    /// <summary>
+    ///     只看登录窗里的弹窗（图片验证码、手机 QQ 确认）: 不报二维码、不刷新二维码、不切扫码页。
+    ///     硬件自动登录期间开着（它导航时会经过 QQ 扫码页, 那张二维码不是给客户扫的）, 退回员工手动后关掉
+    /// </summary>
+    public bool PopupOnly
+    {
+        get => popupOnly;
+        set => popupOnly = value;
+    }
+
     /// <summary>正在后台点的客户答案（测试用来等点完）</summary>
     internal Task AnswerClicks
     {
@@ -414,6 +426,9 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
         var window = CaptureWanted();
 
         await ObservePopupAsync(window, cancellationToken).ConfigureAwait(false);
+
+        if (popupOnly)
+            return;
 
         if (switchState != SwitchState.Pending)
         {

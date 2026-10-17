@@ -148,6 +148,9 @@ internal static class CatWeGamePopupReader
     /// <summary>「换一组」</summary>
     private static readonly (int X, int Y) RefreshButton = (98, 398);
 
+    /// <summary>至少几格同时偏平或变淡才算过渡</summary>
+    private const int MIN_FADED_TILES = 3;
+
     /// <summary>选中后格子右上角的蓝色对勾圆（边长, 贴着格子的右上角）</summary>
     private const int CHECK_BOX = 24;
 
@@ -311,6 +314,7 @@ internal static class CatWeGamePopupReader
 
         var points   = new List<(int X, int Y)>(6);
         var selected = new List<int>();
+        var faded    = 0;
         var busy     = Count(bgra, width, card, TitleBar, IsAlertRed) >= 20 * s2  // 答错提示
                        || Count(bgra, width, card, Grid, IsSuccessGreen) >= 20 * s2; // 验证成功
 
@@ -331,9 +335,13 @@ internal static class CatWeGamePopupReader
                 var (mean, deviation) = LumaStats(bgra, width, card, (x0, y0, x1, y1));
 
                 if (mean > 210 && deviation < 30 || deviation <= 20)
-                    busy = true;
+                    faded++;
             }
         }
+
+        // 过渡时是整片格子一起变淡（提交中 6 格、验证成功 5 格）; 单独一两格偏平多半是图本身（纯色、天空、白墙）, 照常算就绪
+        if (faded >= MIN_FADED_TILES)
+            busy = true;
 
         var confirm = card.Point(ConfirmButton.X, ConfirmButton.Y);
         var refresh = card.Point(RefreshButton.X, RefreshButton.Y);

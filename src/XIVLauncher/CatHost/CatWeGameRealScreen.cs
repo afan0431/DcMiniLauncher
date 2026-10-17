@@ -150,7 +150,9 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
 
         if (TryCapture(window, out var pixels, out var width, out var height))
         {
-            popup = ReadPopup(pixels, width, height);
+            // 截的是整个窗口, 点击按客户区坐标: 弹窗只在客户区那一块里认, 认出的坐标就是客户区坐标（无边框时两者重合）
+            if (ClientOffset(window) is { } offset)
+                popup = ReadPopup(CropClient(pixels, width, height, offset.X, offset.Y, client.Right, client.Bottom), client.Right, client.Bottom);
 
             var panel = CropLoginPanel(pixels, width, height, out var panelWidth, out var panelHeight);
             thumb = ThumbOf(panel, panelWidth, panelHeight);
@@ -182,10 +184,45 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
     }
 
     /// <summary>
+    ///     客户区左上角相对窗口左上角的偏移（无边框窗口为 0, 0）; 取不到时返回 null
+    /// </summary>
+    private static (int X, int Y)? ClientOffset(IntPtr window)
+    {
+        var origin = new POINT();
+
+        if (!GetWindowRect(window, out var rect) || !ClientToScreen(window, ref origin))
+            return null;
+
+        return (origin.X - rect.Left, origin.Y - rect.Top);
+    }
+
+    /// <summary>
+    ///     从整窗截图里裁出客户区（左上角在 (left, top), 大小 clientWidth×clientHeight）; 偏移为 0 且大小相同时原样返回, 超出截图范围时返回 null
+    /// </summary>
+    internal static byte[]? CropClient(byte[] bgra, int width, int height, int left, int top, int clientWidth, int clientHeight)
+    {
+        if (left == 0 && top == 0 && clientWidth == width && clientHeight == height)
+            return bgra;
+
+        if (left < 0 || top < 0 || clientWidth <= 0 || clientHeight <= 0 || left + clientWidth > width || top + clientHeight > height)
+            return null;
+
+        var client = new byte[clientWidth * clientHeight * 4];
+
+        for (var y = 0; y < clientHeight; y++)
+            Buffer.BlockCopy(bgra, ((top + y) * width + left) * 4, client, y * clientWidth * 4, clientWidth * 4);
+
+        return client;
+    }
+
+    /// <summary>
     ///     认窗口正中的弹窗; 认的时候出错只当没有弹窗（不影响二维码那一套）
     /// </summary>
-    private static CatWeGamePopup? ReadPopup(byte[] pixels, int width, int height)
+    private static CatWeGamePopup? ReadPopup(byte[]? pixels, int width, int height)
     {
+        if (pixels == null)
+            return null;
+
         try
         {
             return CatWeGamePopupReader.Read(pixels, width, height);
@@ -561,6 +598,13 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         public int Bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
     /// <summary>BITMAPINFOHEADER 加上 32 位色用不到的调色板位置</summary>
     [StructLayout(LayoutKind.Sequential)]
     private struct BITMAPINFO
@@ -608,6 +652,9 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
 
     [DllImport("user32.dll")]
     private static extern bool GetClientRect(IntPtr window, out RECT rect);
+
+    [DllImport("user32.dll")]
+    private static extern bool ClientToScreen(IntPtr window, ref POINT point);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PrintWindow(IntPtr window, IntPtr dc, uint flags);
