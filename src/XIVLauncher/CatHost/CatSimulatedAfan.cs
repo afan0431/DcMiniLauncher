@@ -212,7 +212,10 @@ internal sealed class CatSimulatedAfan
         return levels;
     }
 
-    /// <summary>新的 revision: 新增的项按任务单起步, 已有的项保留已做的进度（任务单落后时不倒退）, 删掉的项不再管</summary>
+    /// <summary>
+    ///     新的 revision: 新增的项按任务单起步, 已有的项保留已做的进度（任务单落后时不倒退）, 删掉的项不再管;
+    ///     任务单里该项没做完、已做到的数值低于新目标（员工把目标调高了）时按新目标接着做
+    /// </summary>
     private void Merge(SimJob job)
     {
         var alive = new HashSet<string>(StringComparer.Ordinal);
@@ -230,7 +233,13 @@ internal sealed class CatSimulatedAfan
             if (item.Current is { } fromJob && (local.Current == null || fromJob > local.Current))
                 local.Current = fromJob;
 
-            local.Done |= item.Done;
+            if (item.Done)
+                local.Done = true;
+            else if (local.Done && local.Current is { } reached && item.Target is { } target && reached < target)
+            {
+                local.Done        = false;
+                local.StartedFrom = null;
+            }
         }
 
         foreach (var removed in progress.Keys.Where(x => !alive.Contains(x)).ToArray())

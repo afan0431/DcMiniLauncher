@@ -372,6 +372,53 @@ public sealed class CatSimulatedAfanTests : IDisposable
         Assert.Equal(4, Reports()[^1]["revision"]!.GetValue<long>());
     }
 
+    /// <summary>Job(revision) 改 a 驯兽师的 current / target / done, b 金碟币记为已做完</summary>
+    private static JsonElement JobWithA(long revision, long current, long target, bool done)
+    {
+        var job = JsonNode.Parse(CatJobChannelTests.Job(revision).GetRawText())!.AsObject();
+        var a   = job["items"]![0]!.AsObject();
+        a["current"] = current;
+        a["target"]  = target;
+        a["done"]    = done;
+        var b = job["items"]![1]!.AsObject();
+        b["current"] = 120;
+        b["done"]    = true;
+        return JsonDocument.Parse(job.ToJsonString()).RootElement.Clone();
+    }
+
+    [Fact]
+    public void Done_ThenTargetRaised_GoesOnToTheNewTarget()
+    {
+        channel.SetJob(CatJobChannelTests.Job(3));
+        var afan = NewAfan();
+        var now  = Run(afan, DateTime.UtcNow, 30);
+        Assert.Equal("done", States()[^1]);
+
+        // 任务单落后（还写着旧的 18 / 30、没做完）: 已到目标, 不倒退, 仍是做完
+        channel.SetJob(JobWithA(4, 18, 30, false));
+        now = Run(afan, now, 3);
+        Assert.Equal("done", States()[^1]);
+        Assert.Equal(30L, Reports()[^1]["items"]![0]!["current"]!.GetValue<long>());
+
+        // 员工把驯兽师目标调到 40: 接着做到 40, 再报做完
+        var before = Reports().Length;
+        channel.SetJob(JobWithA(5, 30, 40, false));
+        Run(afan, now, 30);
+
+        var after = Reports().Skip(before).ToArray();
+        Assert.Equal("running", after[0]["state"]!.GetValue<string>());
+        Assert.Equal("a", after[0]["activeItemId"]!.GetValue<string>());
+        Assert.Equal("done", after[^1]["state"]!.GetValue<string>());
+        Assert.Equal(1, after.Count(x => x["state"]!.GetValue<string>() == "done"));
+        Assert.Equal(40L, after[^1]["items"]![0]!["current"]!.GetValue<long>());
+        Assert.True(after[^1]["items"]![0]!["done"]!.GetValue<bool>());
+        Assert.Equal(5, after[^1]["revision"]!.GetValue<long>());
+
+        // 做到新目标再挂一张完成图
+        var completion = after.Where(x => x["shots"] != null).SelectMany(x => x["shots"]!.AsArray()).Where(x => x!["kind"]!.GetValue<string>() == "completion").ToArray();
+        Assert.Equal(["a"], completion.Select(x => x!["itemId"]!.GetValue<string>()));
+    }
+
     [Fact]
     public void PauseAndStop_HoldThePosition_ThenRunResumes()
     {
