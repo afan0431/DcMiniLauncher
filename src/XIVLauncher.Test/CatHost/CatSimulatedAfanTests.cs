@@ -472,6 +472,102 @@ public sealed class CatSimulatedAfanTests : IDisposable
         Assert.Equal(["waiting", "idle"], Reports().Select(x => x["state"]!.GetValue<string>()));
     }
 
+    /// <summary>把任务单里指定项的 selected 改成给定值（null = 去掉这个字段, 当作旧版 Cat）</summary>
+    private static JsonElement WithSelected(JsonElement source, long revision, params (string ItemId, bool? Selected)[] picks)
+    {
+        var job = JsonNode.Parse(source.GetRawText())!.AsObject();
+        job["revision"] = revision;
+
+        foreach (var item in job["items"]!.AsArray().Select(x => x!.AsObject()))
+        {
+            foreach (var (itemId, selected) in picks.Where(x => x.ItemId == item["itemId"]!.GetValue<string>()))
+            {
+                if (selected is { } value)
+                    item["selected"] = value;
+                else
+                    item.Remove("selected");
+            }
+        }
+
+        return JsonDocument.Parse(job.ToJsonString()).RootElement.Clone();
+    }
+
+    [Fact]
+    public void Selected_OnlyTheTickedItemsAreRun_DoneMeansTheTickedOnesAreDone()
+    {
+        channel.SetJob(WithSelected(CatJobChannelTests.Job(3), 3, ("a", false), ("b", true)));
+        Run(NewAfan(), DateTime.UtcNow, 30);
+
+        var reports = Reports();
+        Assert.Equal("done", States()[^1]);
+        Assert.Equal(1, States().Count(x => x == "done"));
+
+        // 只做勾上的金碟币; 没勾的驯兽师不碰, 回报里照样带它的进度（停在任务单的 18, 没做完）
+        Assert.Equal(["b"], reports.Select(x => x["activeItemId"]?.GetValue<string>()).OfType<string>().Distinct());
+        var last = reports[^1]["items"]!.AsArray();
+        Assert.Equal(["a", "b"], last.Select(x => x!["itemId"]!.GetValue<string>()));
+        Assert.Equal([18L, 120L], last.Select(x => x!["current"]!.GetValue<long>()));
+        Assert.Equal([false, true], last.Select(x => x!["done"]!.GetValue<bool>()));
+
+        // 完成图只有勾上的那一项; 驯兽师等级不涨
+        var completion = reports.Where(x => x["shots"] != null).SelectMany(x => x["shots"]!.AsArray()).ToArray();
+        Assert.Equal(["b"], completion.Select(x => x!["itemId"]!.GetValue<string>()));
+        Assert.All(Levels(), x => Assert.Equal(18, x[32]));
+    }
+
+    [Fact]
+    public void Selected_MissingFieldCountsAsTicked_LikeTheOldCat()
+    {
+        channel.SetJob(WithSelected(CatJobChannelTests.Job(3), 3, ("a", null), ("b", true)));
+        Run(NewAfan(), DateTime.UtcNow, 30);
+
+        Assert.Equal("done", States()[^1]);
+        Assert.Equal(["a", "b"], Reports().Select(x => x["activeItemId"]?.GetValue<string>()).OfType<string>().Distinct());
+        Assert.All(Reports()[^1]["items"]!.AsArray(), x => Assert.True(x!["done"]!.GetValue<bool>()));
+    }
+
+    [Fact]
+    public void Selected_UntickedWhileRunning_StopsThatItem_AndGoesOnWithTheRest()
+    {
+        channel.SetJob(CatJobChannelTests.Job(3));
+        var afan = NewAfan();
+        var now  = Run(afan, DateTime.UtcNow, 3);
+        Assert.Equal("a", Reports()[^1]["activeItemId"]!.GetValue<string>());
+
+        // 员工在做驯兽师时去勾: 驯兽师停在这一步的数值, 接着做金碟币, 做完金碟币就是 done
+        channel.SetJob(WithSelected(CatJobChannelTests.Job(3), 4, ("a", false)));
+        var frozen = Reports()[^1]["items"]![0]!["current"]!.GetValue<long>();
+        var before = Reports().Length;
+        Run(afan, now, 30);
+
+        var after = Reports().Skip(before).ToArray();
+        Assert.Equal("b", after[0]["activeItemId"]!.GetValue<string>());
+        Assert.DoesNotContain(after, x => x["activeItemId"]?.GetValue<string>() == "a");
+        Assert.All(after, x => Assert.Equal(frozen, x["items"]![0]!["current"]!.GetValue<long>()));
+        Assert.Equal("done", after[^1]["state"]!.GetValue<string>());
+        Assert.False(after[^1]["items"]![0]!["done"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public void Selected_NothingTicked_IsIdle()
+    {
+        channel.SetJob(WithSelected(CatJobChannelTests.Job(3), 3, ("a", false), ("b", false)));
+        Run(NewAfan(), DateTime.UtcNow, 3);
+
+        Assert.Equal(["waiting", "idle"], States());
+    }
+
+    [Fact]
+    public void Selected_UntickedAutoItem_HasNoStartShot_HumanItemsStillDo()
+    {
+        channel.SetJob(WithSelected(CatJobChannelTests.JobWithStartShots(3), 3, ("b", false)));
+        Run(NewAfan(), DateTime.UtcNow, 40);
+
+        // 金碟币没勾: 不拍它的开工图（糖豆人声誉照样拍）; 人做的骑士照旧和驯兽师共用一张
+        Assert.Equal(["a", "c", "d"], StartShots().Select(x => x["itemId"]!.GetValue<string>()));
+        Assert.Equal("done", States()[^1]);
+    }
+
     [Fact]
     public void Manual_SendsNoReports_ButStillLevels()
     {

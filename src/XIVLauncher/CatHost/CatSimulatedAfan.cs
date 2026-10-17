@@ -289,7 +289,8 @@ internal sealed class CatSimulatedAfan
             start           = StartShots(job);
         }
 
-        if (!job.Items.Any(x => x.Routine != null))
+        // 没有勾上的、也没有做完的可自动做的项: idle（勾上的项都做完了是 done, 没勾的项不看）
+        if (!job.Items.Any(x => x.Routine != null && (x.Selected || Finished(x))))
             return ("idle", null, null, start, false);
 
         var active = FirstPending(job);
@@ -346,13 +347,14 @@ internal sealed class CatSimulatedAfan
     }
 
     /// <summary>
-    ///     开工图: startShot 为 true 的项按要打开的界面分组, 一组一张图, 组里每项各带一条（file 相同）, 按 order 排
+    ///     开工图: startShot 为 true 的项按要打开的界面分组, 一组一张图, 组里每项各带一条（file 相同）, 按 order 排;
+    ///     可自动做的项只拍勾上的（selected 为 true）, 人做的项（routine 为 null）照旧按 startShot 拍
     /// </summary>
     private static List<SimShot> StartShots(SimJob job)
     {
         var shots = new List<SimShot>();
 
-        foreach (var item in job.Items.Where(x => x.StartShot).OrderBy(x => x.Order))
+        foreach (var item in job.Items.Where(x => x.StartShot && (x.Routine == null || x.Selected)).OrderBy(x => x.Order))
         {
             if (StartShotScreen(item.Kind, item.ClassJobId, item.Routine) is { } screen)
                 shots.Add(new SimShot(item.ItemId, "start", $"start:{screen}"));
@@ -374,12 +376,16 @@ internal sealed class CatSimulatedAfan
             _                            => null
         };
 
-    /// <summary>按 order 第一个还没做完（也没被跳过）的可自动做的项</summary>
+    /// <summary>按 order 第一个勾上的（selected 为 true）、还没做完（也没被跳过）的可自动做的项</summary>
     private SimItem? FirstPending(SimJob job) =>
-        job.Items.Where(x => x.Routine != null)
+        job.Items.Where(x => x.Routine != null && x.Selected)
            .OrderBy(x => x.Order)
            .FirstOrDefault
            (x => progress.TryGetValue(x.ItemId, out var local) && !local.Done && !local.Skipped && !(local.Current is { } c && x.Target is { } t && c >= t));
+
+    /// <summary>这一项做完了没有: 任务单里 done、数值到了目标, 或模拟里做完了</summary>
+    private bool Finished(SimItem item) =>
+        item.Done || item.Reached || (progress.TryGetValue(item.ItemId, out var local) && (local.Done || (local.Current is { } c && item.Target is { } t && c >= t)));
 
     /// <summary>reason.text 不超过 20 个字</summary>
     private static string Short(string text) =>
@@ -505,7 +511,8 @@ internal sealed class CatSimulatedAfan
             new(itemId, kind, $"{kind}:{itemId}");
     }
 
-    private sealed record SimItem(string ItemId, int Order, string? Kind, int? ClassJobId, long? Current, long? Target, bool Done, string? Routine, bool StartShot)
+    /// <summary>任务单里的一项; Selected = 这次要不要自动做（任务单没有 selected 字段时按 true, 与旧版 Cat 一致）</summary>
+    private sealed record SimItem(string ItemId, int Order, string? Kind, int? ClassJobId, long? Current, long? Target, bool Done, string? Routine, bool StartShot, bool Selected)
     {
         public bool Reached => Current is { } current && Target is { } target && current >= target;
     }
@@ -540,7 +547,8 @@ internal sealed class CatSimulatedAfan
                             Number(item["target"]),
                             item["done"] is JsonValue done && done.GetValueKind() == JsonValueKind.True,
                             Text(item["routine"]),
-                            item["startShot"] is JsonValue startShot && startShot.GetValueKind() == JsonValueKind.True
+                            item["startShot"] is JsonValue startShot && startShot.GetValueKind() == JsonValueKind.True,
+                            item["selected"] is not JsonValue selected || selected.GetValueKind() != JsonValueKind.False
                         )
                     );
                 }

@@ -357,6 +357,25 @@ public sealed class CatJobChannelTests
         Assert.Equal(job.GetRawText(), adopted.GetJob(1234).Json);
     }
 
+    [Theory]
+    [InlineData("true")]
+    [InlineData("false")]
+    [InlineData(null)]
+    public void Job_ItemSelected_IsAccepted_AndComesBackAsIs(string? selected)
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        var job = JsonNode.Parse(Job(3).GetRawText())!.AsObject();
+
+        if (selected != null)
+            job["items"]![0]!["selected"] = JsonNode.Parse(selected);
+
+        var element = JsonDocument.Parse(job.ToJsonString()).RootElement.Clone();
+        Assert.Equal(CatSetJobResult.Ok(), channel.SetJob(element));
+        Assert.Equal(element.GetRawText(), channel.GetJob(1234).Json);
+    }
+
     [Fact]
     public void PostProgress_TooFrequentFromTheLocalApi_Is429()
     {
