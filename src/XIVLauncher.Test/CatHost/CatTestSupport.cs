@@ -192,6 +192,15 @@ internal sealed class FakeGameRunner : ICatGameRunner
         return challengeId == "s-1" ? CatAcceptResult.Ok() : CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "这条短信验证已经不在了");
     }
 
+    /// <summary>收到的 weGame.answerImageSelect（编号, 格子, 换一组）</summary>
+    public List<(string ChallengeId, int[]? Tiles, bool Refresh)> ImageAnswers { get; } = [];
+
+    public CatAcceptResult AnswerWeGameImageSelect(string challengeId, IReadOnlyList<int>? tiles, bool refresh)
+    {
+        ImageAnswers.Add((challengeId, tiles?.ToArray(), refresh));
+        return challengeId == "i-1" ? CatAcceptResult.Ok() : CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "这道图片验证已经不在了");
+    }
+
     /// <summary>收到的 selectCharacter 的 contentId</summary>
     public List<string> SelectedCharacters { get; } = [];
 
@@ -423,11 +432,14 @@ internal sealed class StubWeGameForeground : ICatWeGameForeground
 }
 
 /// <summary>
-///     假的 WeGame 屏幕操作。页面判断 / 密码错 / 等手机确认用可设的值或探针（测试驱动状态变化）
+///     假的 WeGame 屏幕操作。页面判断 / 密码错用可设的值或探针, 截窗可以换成探针（测试驱动状态变化）
 /// </summary>
 internal sealed class StubWeGameScreen : ICatWeGameScreen
 {
     public CatWeGameLoginWindow? Window { get; set; } = new(1210, 680);
+
+    /// <summary>设了就由它给出每次截窗的结果, 不看 <see cref="Window" /></summary>
+    public Func<CatWeGameLoginWindow?>? CaptureProbe { get; set; }
 
     public bool? QqPasswordPage { get; set; } = true;
 
@@ -435,11 +447,9 @@ internal sealed class StubWeGameScreen : ICatWeGameScreen
 
     public Func<bool> PasswordRejectedProbe { get; set; } = () => false;
 
-    public Func<bool> PhoneConfirmProbe { get; set; } = () => false;
-
     public List<(int X, int Y)> Clicks { get; } = [];
 
-    public CatWeGameLoginWindow? CaptureLoginWindow() => Window;
+    public CatWeGameLoginWindow? CaptureLoginWindow() => CaptureProbe != null ? CaptureProbe() : Window;
 
     public bool ClickLoginWindow(int x, int y)
     {
@@ -456,8 +466,37 @@ internal sealed class StubWeGameScreen : ICatWeGameScreen
     public bool AccountMatches(string account) => AccountIsMatch;
 
     public bool PasswordRejected() => PasswordRejectedProbe();
+}
 
-    public bool AwaitingPhoneConfirm() => PhoneConfirmProbe();
+/// <summary>
+///     记下每一下点击的假点击器; Result 决定点没点出去, OnClick 在点的时候回调（测试用它换画面）
+/// </summary>
+internal sealed class RecordingClicker : ICatWeGameClicker
+{
+    private readonly object sync = new();
+    private readonly List<(int X, int Y)> clicks = [];
+
+    public bool Result { get; set; } = true;
+
+    public Action<int, int>? OnClick { get; set; }
+
+    public List<(int X, int Y)> Clicks
+    {
+        get
+        {
+            lock (sync)
+                return [..clicks];
+        }
+    }
+
+    public Task<bool> ClickAsync(int x, int y, CancellationToken cancellationToken)
+    {
+        lock (sync)
+            clicks.Add((x, y));
+
+        OnClick?.Invoke(x, y);
+        return Task.FromResult(Result);
+    }
 }
 
 internal static class CatTestNames

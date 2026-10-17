@@ -100,6 +100,7 @@ public sealed class CatZxingQrCodec : ICatWeGameQrCodec
 ///         截取用 PrintWindow, 窗口不在最前面也截得到; 点击用给窗口发鼠标消息的办法, 不移动鼠标、不改变前台窗口。
 ///     </para>
 ///     <para>设备验证窗口的读取和点击还没有实现（要等那个窗口出现后做过检查才知道怎么读）: 一律当作没有这个窗口。</para>
+///     <para>登录窗正中的图片验证码与手机 QQ 一键认证在同一张截图上认（见 <see cref="CatWeGamePopupReader" />）, 点击沿用发鼠标消息的办法。</para>
 /// </summary>
 public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScreen
 {
@@ -121,24 +122,36 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
 
     private const int BITMAP_INFO_HEADER_SIZE = 40;
 
+    private readonly object sync = new();
+
     private string? lastLink;
     private byte[]? lastPng;
 
     /// <inheritdoc />
     public CatWeGameLoginWindow? CaptureLoginWindow()
     {
+        // 观察器与硬件自动登录会同时截窗: 上一张二维码的缓存只让一个人改
+        lock (sync)
+            return CaptureLoginWindowCore();
+    }
+
+    private CatWeGameLoginWindow? CaptureLoginWindowCore()
+    {
         var window = FindLoginWindow();
 
         if (window == IntPtr.Zero || IsIconic(window) || !GetClientRect(window, out var client) || client.Right <= 0 || client.Bottom <= 0)
             return null;
 
-        string? link    = null;
-        byte[]? thumb   = null;
-        var     tabs    = true;
-        var     expired = false;
+        string?         link    = null;
+        byte[]?         thumb   = null;
+        var             tabs    = true;
+        var             expired = false;
+        CatWeGamePopup? popup   = null;
 
         if (TryCapture(window, out var pixels, out var width, out var height))
         {
+            popup = ReadPopup(pixels, width, height);
+
             var panel = CropLoginPanel(pixels, width, height, out var panelWidth, out var panelHeight);
             thumb = ThumbOf(panel, panelWidth, panelHeight);
             tabs  = TabsVisible(panel, panelWidth, panelHeight);
@@ -156,7 +169,7 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         }
 
         if (link == null)
-            return new CatWeGameLoginWindow(client.Right, client.Bottom, PanelThumb: thumb, TabsVisible: tabs, QrExpired: expired);
+            return new CatWeGameLoginWindow(client.Right, client.Bottom, PanelThumb: thumb, TabsVisible: tabs, QrExpired: expired, Popup: popup);
 
         // 同一个二维码不重复画
         if (!string.Equals(link, lastLink, StringComparison.Ordinal) || lastPng == null)
@@ -165,7 +178,23 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
             lastLink = link;
         }
 
-        return new CatWeGameLoginWindow(client.Right, client.Bottom, link, lastPng, thumb, tabs);
+        return new CatWeGameLoginWindow(client.Right, client.Bottom, link, lastPng, thumb, tabs, Popup: popup);
+    }
+
+    /// <summary>
+    ///     认窗口正中的弹窗; 认的时候出错只当没有弹窗（不影响二维码那一套）
+    /// </summary>
+    private static CatWeGamePopup? ReadPopup(byte[] pixels, int width, int height)
+    {
+        try
+        {
+            return CatWeGamePopupReader.Read(pixels, width, height);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning("[CatHost] 认 WeGame 登录窗口里的弹窗时出错: {Type}: {Message}", ex.GetType().Name, ex.Message);
+            return null;
+        }
     }
 
     /// <inheritdoc />
@@ -208,9 +237,9 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         false;
 
     /// <summary>
-    ///     硬件自动登录要用到的页面判断（账号密码页、密码错误、等手机确认）。这几项的图像特征（密码框边框、「登录」橙块、错误/确认提示的位置与颜色）
+    ///     硬件自动登录要用到的页面判断（账号密码页、密码错误）。这几项的图像特征（密码框边框、「登录」橙块、错误提示的位置与颜色）
     ///     要在接了 CH9329 的挂机电脑上对 StartFor 拉起的 1210×680 窗口实机核对后再定阈值（见 window-geometry.md 待实测项）。
-    ///     核对前一律返回「认不出」的保守值: 导航时按在页上继续试、不误报密码错 / 等确认, 自动登录走不通就按超时退回员工手动。
+    ///     核对前一律返回「认不出」的保守值: 导航时按在页上继续试、不误报密码错, 自动登录走不通就按超时退回员工手动。
     /// </summary>
     public bool? OnQqPasswordPage() =>
         null;
@@ -221,10 +250,6 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
 
     /// <inheritdoc />
     public bool PasswordRejected() =>
-        false;
-
-    /// <inheritdoc />
-    public bool AwaitingPhoneConfirm() =>
         false;
 
     /// <summary>

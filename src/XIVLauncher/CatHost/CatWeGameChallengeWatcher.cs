@@ -57,26 +57,31 @@ public static class CatWeGameChallengeKinds
 
     /// <summary>首次在新设备用 QQ 账号密码登录, 要客户在手机 QQ 上点确认（不是扫码、不是短信）</summary>
     public const string QQ_CONFIRM = "qqConfirm";
+
+    /// <summary>QQ 账号密码登录后的图片验证码, 要客户选出符合描述的图片</summary>
+    public const string IMAGE_SELECT = "imageSelect";
 }
 
 /// <summary>
 ///     等 WeGame 登录期间要客户配合的一项验证（weGame.challenge 的内容）。
-///     二维码: image = 二维码 PNG 的 base64, link = 二维码内容; 短信: code = 要发的内容, phone = 发到哪个号码, text = 窗口原文
+///     二维码: image = 二维码 PNG 的 base64, link = 二维码内容; 短信: code = 要发的内容, phone = 发到哪个号码, text = 窗口原文;
+///     选图: image = 题目条与图片格那一块的 JPEG base64, tiles = 各格在这张图里的位置（千分比 [x, y, w, h], 左上→右下逐行）
 /// </summary>
 public sealed record CatWeGameChallenge
 (
-    string  Kind,
-    string  ChallengeId,
-    string? Image            = null,
-    string? Link             = null,
-    int?    ExpiresInSeconds = null,
-    string? Code             = null,
-    string? Phone            = null,
-    string? Text             = null
+    string                Kind,
+    string                ChallengeId,
+    string?               Image            = null,
+    string?               Link             = null,
+    int?                  ExpiresInSeconds = null,
+    string?               Code             = null,
+    string?               Phone            = null,
+    string?               Text             = null,
+    IReadOnlyList<int[]>? Tiles            = null
 )
 {
     /// <summary>
-    ///     record 自动生成的 ToString 会打印所有成员, 这里只留种类和编号, 免得二维码内容、短信内容被写进日志
+    ///     record 自动生成的 ToString 会打印所有成员, 这里只留种类和编号, 免得二维码内容、短信内容、验证码图片被写进日志
     /// </summary>
     public override string ToString() =>
         $"CatWeGameChallenge {{ Kind = {Kind}, ChallengeId = {ChallengeId} }}";
@@ -86,12 +91,28 @@ public sealed record CatWeGameChallenge
 public sealed record CatWeGameConfirmSmsParams(string? ChallengeId);
 
 /// <summary>
+///     weGame.answerImageSelect 参数: 客户选的格子序号（从 0 起, 左上→右下逐行）, 或 refresh = true 点「换一组」（此时不带 tiles）
+/// </summary>
+public sealed record CatWeGameAnswerImageSelectParams(string? ChallengeId, int[]? Tiles, bool Refresh);
+
+/// <summary>
 ///     WeGame 登录窗口的一次截取: 宽高是窗口客户区的实际大小; 窗口上有二维码时带二维码内容和一张可以直接给客户扫的 PNG;
 ///     PanelThumb 是登录栏那一块画面缩成的小图（每格一个亮度, null = 没算）, 用来看画面稳没稳、点击之后变没变;
 ///     TabsVisible = QQ / 微信两个页签画出来了没有（WeGame 刚启动的头两三秒窗口在但里面还是空的）;
-///     QrExpired = 窗口上的二维码已经失效（变暗、中间一个刷新图标, 要点一下才出新的）, 这时不带二维码内容
+///     QrExpired = 窗口上的二维码已经失效（变暗、中间一个刷新图标, 要点一下才出新的）, 这时不带二维码内容;
+///     Popup = 窗口正中的弹窗（图片验证码或手机 QQ 一键认证）, 没有时为 null
 /// </summary>
-public sealed record CatWeGameLoginWindow(int Width, int Height, string? QrLink = null, byte[]? QrPng = null, byte[]? PanelThumb = null, bool TabsVisible = true, bool QrExpired = false)
+public sealed record CatWeGameLoginWindow
+(
+    int              Width,
+    int              Height,
+    string?          QrLink      = null,
+    byte[]?          QrPng       = null,
+    byte[]?          PanelThumb  = null,
+    bool             TabsVisible = true,
+    bool             QrExpired   = false,
+    CatWeGamePopup?  Popup       = null
+)
 {
     /// <summary>两格亮度差在这以内算一样（登录栏是半透明的, 后面的动态背景会让画面有很轻微的浮动）</summary>
     public const int THUMB_TOLERANCE = 10;
@@ -171,17 +192,12 @@ public interface ICatWeGameScreen
     /// </summary>
     bool PasswordRejected() =>
         false;
-
-    /// <summary>
-    ///     登录窗口是不是停在「等客户在手机 QQ 上确认登录」的画面（硬件自动登录用, 真实图像识别阈值留实机核对）
-    /// </summary>
-    bool AwaitingPhoneConfirm() =>
-        false;
 }
 
 /// <summary>
 ///     等 WeGame 登录期间（拉起 WeGame 之后, 到取到登录信息、取消或超时）定时看 WeGame 的窗口,
-///     把要客户配合的验证报给工作台: 登录二维码（weGame.challenge kind=qrcode）、设备验证短信（kind=sms）。
+///     把要客户配合的验证报给工作台: 登录二维码（weGame.challenge kind=qrcode）、设备验证短信（kind=sms）、
+///     登录窗正中的图片验证码（kind=imageSelect, 客户答了由 <see cref="AnswerImageSelect" /> 点上去）与手机 QQ 一键认证（kind=qqConfirm, 过期了自动点「重新验证」）。
 ///     <para>
 ///         launch 带了 weGameScan 时, 登录窗口出现后先自动切到对应的扫码页: 给窗口发鼠标消息点页签, 每点一下等一会儿再用识别结果核对;
 ///         几轮都没有二维码就报 weGame.scanSwitchFailed, 之后只看不点。没带 weGameScan 时从头到尾只看不点。
@@ -245,6 +261,29 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     private int                 smsMisses;
     private int                 smsConfirmTicks;
 
+    private string?               imgId;
+    private int                   imgSeq;
+    private byte[]?               imgThumb;
+    private byte[]?               imgJpeg;
+    private IReadOnlyList<int[]>? imgTiles;
+    private byte[]?               imgCandidate;
+    private int                   imgMisses;
+    private bool                  imgClicking;
+    private string?               imgAnsweredId;
+    private long                  imgAnsweredAt;
+    private bool                  imgTransition;
+    private Task                  imgClicks = Task.CompletedTask;
+
+    private string? confirmId;
+    private int     confirmSeq;
+    private int     confirmMisses;
+    private long?   reverifiedAt;
+
+    private volatile bool     popupSeen;
+    private CancellationToken running;
+
+    private ICatWeGameClicker? screenClicker;
+
     private SwitchState switchState = scan == null ? SwitchState.Off : SwitchState.Pending;
     private int         switchRounds;
     private long        switchDoneAt;
@@ -298,11 +337,38 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     /// <summary>报给工作台的二维码有效期（WeGame 没有给出确切时间; 二维码刷新后会作为新的验证再报）</summary>
     public int QrExpiresInSeconds { get; init; } = 120;
 
+    /// <summary>登录窗里有弹窗（图片验证码、手机 QQ 确认）时多久看一次</summary>
+    public TimeSpan PopupInterval { get; init; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>按客户的答案点完之后, 过了这么久画面还是同一题、中间没有过渡, 就当作没点上, 以新编号重报这一题</summary>
+    public TimeSpan AnswerRecheck { get; init; } = TimeSpan.FromSeconds(8);
+
+    /// <summary>点格子时每下之间停多久</summary>
+    public TimeSpan TileClickPause { get; init; } = TimeSpan.FromMilliseconds(300);
+
+    /// <summary>手机 QQ 确认过期后两次点「重新验证」至少隔多久</summary>
+    public TimeSpan ReverifyGap { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>点弹窗用的点击器; 不设时给登录窗口发后台鼠标消息</summary>
+    public ICatWeGameClicker? Clicker { get; init; }
+
+    /// <summary>正在后台点的客户答案（测试用来等点完）</summary>
+    internal Task AnswerClicks
+    {
+        get
+        {
+            lock (gate)
+                return imgClicks;
+        }
+    }
+
     /// <summary>
     ///     一直看到被取消为止; 结束时把还没清掉的验证报成已清除
     /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken)
     {
+        running = cancellationToken;
+
         try
         {
             while (true)
@@ -317,8 +383,11 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
                     Log.Warning("[CatHost] 看 WeGame 窗口时出错: {Type}: {Message}", ex.GetType().Name, redactor.Redact(ex.Message));
                 }
 
-                // 还在等登录窗口出现、还没切到扫码页时看得勤一些, 切好之后按正常间隔看
-                await Task.Delay(switchState == SwitchState.Pending ? SwitchInterval : Interval, cancellationToken).ConfigureAwait(false);
+                // 还在等登录窗口出现、还没切到扫码页时看得勤一些; 有弹窗时（客户在做验证）每秒看一次; 其余按正常间隔看
+                var delay = switchState == SwitchState.Pending ? SwitchInterval
+                            : popupSeen ? PopupInterval < Interval ? PopupInterval : Interval
+                            : Interval;
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -332,7 +401,7 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
     }
 
     /// <summary>
-    ///     看一轮: 设备验证窗口、登录窗口上的二维码; 该切扫码页时切一轮
+    ///     看一轮: 设备验证窗口、登录窗里的弹窗、登录窗口上的二维码; 该切扫码页时切一轮
     /// </summary>
     internal async Task TickAsync(CancellationToken cancellationToken)
     {
@@ -343,6 +412,8 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
             Log.Information("[CatHost] WeGame 登录窗口被最小化了, 已还原到其它窗口后面");
 
         var window = CaptureWanted();
+
+        await ObservePopupAsync(window, cancellationToken).ConfigureAwait(false);
 
         if (switchState != SwitchState.Pending)
         {
@@ -371,8 +442,8 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
             return;
         }
 
-        // 还没切到要的扫码页: 这时窗口上的二维码可能是另一种扫码方式的, 先不报
-        if (window == null)
+        // 还没切到要的扫码页: 这时窗口上的二维码可能是另一种扫码方式的, 先不报; 登录窗里有弹窗时不切
+        if (window == null || window.Popup != null)
         {
             windowSeen = 0;
             return;
@@ -443,6 +514,47 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
 
             smsConfirmTicks = Math.Max(1, (int)Math.Ceiling(SmsConfirmWait.TotalMilliseconds / Math.Max(1, Interval.TotalMilliseconds)));
             Log.Information("[CatHost] 已点设备验证窗口的确定 ({ChallengeId})", smsId);
+            return CatAcceptResult.Ok();
+        }
+    }
+
+    /// <summary>
+    ///     客户答了图片验证码: 在后台按答案点格子再点「确定」（或点「换一组」）, 立即返回是否接受。
+    ///     编号不是当前这一题回 notRunning; 同一题的答案再来一次（工作台补发）不重复点。
+    ///     点完之后画面换了新题就作为新的一题再报; 一直还是这一题就以新编号重报, 让客户重答
+    /// </summary>
+    /// <param name="challengeId">报出去的那一题的编号</param>
+    /// <param name="tiles">客户选的格子序号（从 0 起）; 点「换一组」时为 null</param>
+    /// <param name="refresh">点「换一组」</param>
+    public CatAcceptResult AnswerImageSelect(string? challengeId, IReadOnlyList<int>? tiles, bool refresh)
+    {
+        lock (gate)
+        {
+            if (imgId == null || !string.Equals(imgId, challengeId, StringComparison.Ordinal))
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "这道图片验证已经不在了");
+
+            if (string.Equals(imgAnsweredId, challengeId, StringComparison.Ordinal))
+                return CatAcceptResult.Ok();
+
+            var   count  = imgTiles?.Count ?? 0;
+            int[] chosen = [];
+
+            if (!refresh)
+            {
+                chosen = tiles?.Distinct().Order().ToArray() ?? [];
+
+                if (chosen.Length == 0 || chosen.Length != tiles!.Count || chosen.Any(x => x < 0 || x >= count))
+                    return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"tiles 必须是 1–{count} 个不重复的格子序号（0–{count - 1}）");
+            }
+
+            imgAnsweredId = challengeId;
+            imgClicking   = true;
+            imgCandidate  = null;
+
+            var question = imgThumb;
+            var token    = running;
+            Log.Information("[CatHost] 客户答了图片验证 ({ChallengeId}): {Answer}", challengeId, refresh ? "换一组" : string.Join(",", chosen));
+            imgClicks = Task.Run(() => ClickAnswerAsync(question, chosen, refresh, token), CancellationToken.None);
             return CatAcceptResult.Ok();
         }
     }
@@ -614,6 +726,239 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
         qrMisses = 0;
     }
 
+    private ICatWeGameClicker PopupClicker =>
+        Clicker ?? (screenClicker ??= new CatWeGameScreenClicker(screen));
+
+    /// <summary>
+    ///     登录窗里的弹窗: 图片验证码与手机 QQ 一键认证
+    /// </summary>
+    private async Task ObservePopupAsync(CatWeGameLoginWindow? window, CancellationToken cancellationToken)
+    {
+        var popup = window?.Popup;
+        popupSeen = popup != null;
+
+        ObserveImageSelect(popup);
+        await ObserveQqConfirmAsync(popup, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     图片验证码: 连续两轮就绪且网格一样才报（换题时会闪过半张图）; 与报过的是同一题时不重报, 除非答过之后出现过过渡又回到这一题（答错后原题重来）,
+    ///     或者答过之后等够 <see cref="AnswerRecheck" /> 还是原样（没点上）。过渡与加载中时不动当前这一题。
+    ///     换成手机确认马上清除, 别的情况连续几轮看不到验证码才清除
+    /// </summary>
+    private void ObserveImageSelect(CatWeGamePopup? popup)
+    {
+        lock (gate)
+        {
+            if (popup is not { IsCaptcha: true })
+            {
+                imgCandidate = null;
+
+                if (imgId == null || imgClicking)
+                    return;
+
+                if (popup is { IsQqConfirm: true } || ++imgMisses >= MISSES_TO_CLEAR)
+                {
+                    Log.Information("[CatHost] WeGame 登录窗口里的图片验证不在了 ({ChallengeId})", imgId);
+                    reporter.WeGameChallengeCleared(imgId);
+                    ResetImage();
+                }
+
+                return;
+            }
+
+            imgMisses = 0;
+
+            // 正在按客户的答案点: 画面在变, 这时不报
+            if (imgClicking)
+                return;
+
+            var answered   = imgAnsweredAt != 0;
+            var recheckDue = answered && Environment.TickCount64 - imgAnsweredAt >= (long)AnswerRecheck.TotalMilliseconds;
+
+            switch (popup.Kind)
+            {
+                case CatWeGamePopupKind.CaptchaReady:
+                {
+                    var stable = CatWeGamePopup.SameGrid(imgCandidate, popup.GridThumb);
+                    imgCandidate = popup.GridThumb;
+
+                    if (!stable || popup is not { GridThumb: { } thumb, CaptchaJpeg: { } jpeg, Tiles: { } tiles })
+                        return;
+
+                    if (imgId != null && CatWeGamePopup.SameGrid(imgThumb, thumb) && (!answered || !imgTransition && !recheckDue))
+                        return;
+
+                    ReportImage(thumb, jpeg, tiles);
+                    return;
+                }
+
+                case CatWeGamePopupKind.CaptchaSelected:
+                    imgCandidate = null;
+
+                    // 点了格子却没点上「确定」: 等够了按原来的图重报, 客户重答时按当前打勾的情况补点
+                    if (imgId != null && answered && !imgTransition && recheckDue && imgThumb != null && imgJpeg != null && imgTiles != null)
+                        ReportImage(imgThumb, imgJpeg, imgTiles);
+
+                    return;
+
+                default:
+                    imgCandidate = null;
+
+                    if (answered)
+                        imgTransition = true;
+
+                    return;
+            }
+        }
+    }
+
+    /// <summary>
+    ///     以新编号报一道选图题
+    /// </summary>
+    private void ReportImage(byte[] thumb, byte[] jpeg, IReadOnlyList<int[]> tiles)
+    {
+        imgId         = $"i-{++imgSeq}";
+        imgThumb      = thumb;
+        imgJpeg       = jpeg;
+        imgTiles      = tiles;
+        imgAnsweredId = null;
+        imgAnsweredAt = 0;
+        imgTransition = false;
+
+        Log.Information("[CatHost] WeGame 登录窗口里有图片验证 ({ChallengeId})", imgId);
+        reporter.WeGameChallenge(new CatWeGameChallenge(CatWeGameChallengeKinds.IMAGE_SELECT, imgId, Convert.ToBase64String(jpeg), Tiles: tiles));
+    }
+
+    private void ResetImage()
+    {
+        imgId         = null;
+        imgThumb      = null;
+        imgJpeg       = null;
+        imgTiles      = null;
+        imgCandidate  = null;
+        imgMisses     = 0;
+        imgAnsweredId = null;
+        imgAnsweredAt = 0;
+        imgTransition = false;
+    }
+
+    /// <summary>
+    ///     按客户的答案点: 再截一次确认还是这一题, 按当前打勾的情况只点要改的格子, 再点「确定」; 或点「换一组」
+    /// </summary>
+    private async Task ClickAnswerAsync(byte[]? question, int[] chosen, bool refresh, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var popup = screen.CaptureLoginWindow()?.Popup;
+
+            if (popup is not { Kind: CatWeGamePopupKind.CaptchaReady or CatWeGamePopupKind.CaptchaSelected, TilePoints: { } points, ConfirmPoint: { } confirm, RefreshPoint: { } change }
+                || popup.Kind == CatWeGamePopupKind.CaptchaReady && !CatWeGamePopup.SameGrid(question, popup.GridThumb))
+            {
+                Log.Warning("[CatHost] 要按客户的答案点图片验证时, 登录窗口里已经不是这一题了, 没点");
+                return;
+            }
+
+            var clicker = PopupClicker;
+            var missed  = 0;
+
+            if (refresh)
+            {
+                if (!await clicker.ClickAsync(change.X, change.Y, cancellationToken).ConfigureAwait(false))
+                    missed++;
+            }
+            else
+            {
+                var selected = popup.SelectedTiles ?? [];
+
+                for (var i = 0; i < points.Count; i++)
+                {
+                    if (chosen.Contains(i) == selected.Contains(i))
+                        continue;
+
+                    if (!await clicker.ClickAsync(points[i].X, points[i].Y, cancellationToken).ConfigureAwait(false))
+                        missed++;
+
+                    await DelayAsync(TileClickPause, cancellationToken).ConfigureAwait(false);
+                }
+
+                if (!await clicker.ClickAsync(confirm.X, confirm.Y, cancellationToken).ConfigureAwait(false))
+                    missed++;
+            }
+
+            if (missed > 0)
+                Log.Warning("[CatHost] 按客户的答案点图片验证时有 {Count} 下没点出去", missed);
+            else
+                Log.Information("[CatHost] 已按客户的答案点了图片验证");
+        }
+        catch (OperationCanceledException)
+        {
+            // 等登录结束
+        }
+        catch (Exception ex)
+        {
+            Log.Warning("[CatHost] 按客户的答案点图片验证时出错: {Type}: {Message}", ex.GetType().Name, redactor.Redact(ex.Message));
+        }
+        finally
+        {
+            lock (gate)
+            {
+                imgClicking   = false;
+                imgAnsweredAt = Environment.TickCount64;
+                imgTransition = false;
+                imgCandidate  = null;
+            }
+        }
+    }
+
+    /// <summary>
+    ///     手机 QQ 一键认证: 出现时报一次; 过期了点「重新验证」（两次之间至少隔 <see cref="ReverifyGap" />, 不限次数）, 客户那边不变; 连续几轮不在才清除
+    /// </summary>
+    private async Task ObserveQqConfirmAsync(CatWeGamePopup? popup, CancellationToken cancellationToken)
+    {
+        if (popup is not { IsQqConfirm: true })
+        {
+            if (confirmId == null || ++confirmMisses < MISSES_TO_CLEAR)
+                return;
+
+            Log.Information("[CatHost] WeGame 登录窗口里的手机 QQ 确认不在了 ({ChallengeId})", confirmId);
+            reporter.WeGameChallengeCleared(confirmId);
+            confirmId     = null;
+            confirmMisses = 0;
+            reverifiedAt  = null;
+            return;
+        }
+
+        confirmMisses = 0;
+
+        if (confirmId == null)
+        {
+            confirmId = $"c-{++confirmSeq}";
+            Log.Information("[CatHost] WeGame 登录窗口里在等手机 QQ 确认 ({ChallengeId})", confirmId);
+            reporter.WeGameChallenge(new CatWeGameChallenge(CatWeGameChallengeKinds.QQ_CONFIRM, confirmId));
+        }
+
+        if (popup is not { Kind: CatWeGamePopupKind.QqConfirmExpired, ReverifyPoint: { } point })
+            return;
+
+        var now = Environment.TickCount64;
+
+        if (reverifiedAt is { } last && now - last < (long)ReverifyGap.TotalMilliseconds)
+            return;
+
+        reverifiedAt = now;
+        Log.Information("[CatHost] 手机 QQ 确认已过期, 点「重新验证」 ({ChallengeId})", confirmId);
+
+        if (!await PopupClicker.ClickAsync(point.X, point.Y, cancellationToken).ConfigureAwait(false))
+            Log.Warning("[CatHost] 点「重新验证」没点出去");
+    }
+
+    private static async Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
+    {
+        if (delay > TimeSpan.Zero)
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>
     ///     设备验证窗口: 出现或换了内容就报; 点过「确定」后窗口不在了算通过, 等够时间还在或换了内容算没通过
     /// </summary>
@@ -687,8 +1032,21 @@ public sealed class CatWeGameChallengeWatcher(ICatWeGameScreen screen, ICatLaunc
             qrLink = null;
         }
 
+        if (confirmId != null)
+        {
+            reporter.WeGameChallengeCleared(confirmId);
+            confirmId    = null;
+            reverifiedAt = null;
+        }
+
         lock (gate)
         {
+            if (imgId != null)
+            {
+                reporter.WeGameChallengeCleared(imgId);
+                ResetImage();
+            }
+
             if (smsId == null)
                 return;
 

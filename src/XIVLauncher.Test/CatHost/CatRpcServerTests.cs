@@ -636,6 +636,85 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Fact]
+    public async Task ImageSelectChallenge_IsPublishedWithTiles()
+    {
+        await using var client = await ConnectAndHelloAsync();
+        await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin = true });
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        runner.Reporter!.WeGameChallenge(new CatWeGameChallenge("imageSelect", "i-1", "/9j/AA==", Tiles: [[0, 268, 327, 361], [336, 268, 327, 361]]));
+        runner.Reporter!.WeGameChallenge(new CatWeGameChallenge("qqConfirm", "c-1"));
+
+        Assert.Equal
+        (
+            """{"operationId":"op1","kind":"imageSelect","challengeId":"i-1","image":"/9j/AA==","tiles":[[0,268,327,361],[336,268,327,361]]}""",
+            client.WaitForEvent("weGame.challenge", Timeout).Params!.ToJsonString(CatProtocol.JsonOptions)
+        );
+        Assert.Equal
+        (
+            """{"operationId":"op1","kind":"qqConfirm","challengeId":"c-1"}""",
+            client.WaitForEvent("weGame.challenge", Timeout).Params!.ToJsonString(CatProtocol.JsonOptions)
+        );
+    }
+
+    [Fact]
+    public async Task AnswerImageSelect_ValidatesParams_ThenHandsToTheRunner()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        // 还没 launch: 没有在等的验证
+        var early = await client.RequestAsync("weGame.answerImageSelect", new { challengeId = "i-1", tiles = new[] { 0 } });
+        Assert.Equal("notRunning", early["result"]!["code"]!.GetValue<string>());
+
+        await client.RequestAsync("launch", new { operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin = true });
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        object[] invalid =
+        [
+            new { },
+            new { challengeId = " ", tiles = new[] { 0 } },
+            new { challengeId = new string('i', 129), tiles = new[] { 0 } },
+            new { challengeId = "i-1" },
+            new { challengeId = "i-1", tiles = Array.Empty<int>() },
+            new { challengeId = "i-1", tiles = new[] { 9 } },
+            new { challengeId = "i-1", tiles = new[] { -1 } },
+            new { challengeId = "i-1", tiles = new[] { 1, 1 } },
+            new { challengeId = "i-1", tiles = Enumerable.Range(0, 17).ToArray() },
+            new { challengeId = "i-1", tiles = new[] { 0 }, refresh = true }
+        ];
+
+        foreach (var parameters in invalid)
+        {
+            var response = await client.RequestAsync("weGame.answerImageSelect", parameters);
+            Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+        }
+
+        var answered = await client.RequestAsync("weGame.answerImageSelect", new { challengeId = " i-1 ", tiles = new[] { 5, 0, 2 } });
+        Assert.True(answered["result"]!["accepted"]!.GetValue<bool>());
+
+        var refreshed = await client.RequestAsync("weGame.answerImageSelect", new { challengeId = "i-1", refresh = true });
+        Assert.True(refreshed["result"]!["accepted"]!.GetValue<bool>());
+
+        var stale = await client.RequestAsync("weGame.answerImageSelect", new { challengeId = "i-0", tiles = new[] { 0 } });
+        Assert.Equal("notRunning", stale["result"]!["code"]!.GetValue<string>());
+
+        Assert.Equal(3, runner.ImageAnswers.Count);
+        Assert.Equal("i-1", runner.ImageAnswers[0].ChallengeId);
+        Assert.Equal(new[] { 5, 0, 2 }, runner.ImageAnswers[0].Tiles);
+        Assert.False(runner.ImageAnswers[0].Refresh);
+        Assert.Equal(("i-1", (int[]?)null, true), runner.ImageAnswers[1]);
+        Assert.Equal("i-0", runner.ImageAnswers[2].ChallengeId);
+    }
+
+    [Fact]
+    public void AnswerImageSelect_RunnersThatNeverWaitForWeGame_AnswerNotRunning()
+    {
+        ICatGameRunner international = new CatInternationalGameRunner(new CatLogRedactor(), null!);
+
+        Assert.Equal(CatCodes.NOT_RUNNING, international.AnswerWeGameImageSelect("i-1", [0], false).Code);
+    }
+
+    [Fact]
     public void ConfirmSms_RunnersThatNeverWaitForWeGame_AnswerNotRunning()
     {
         ICatGameRunner international = new CatInternationalGameRunner(new CatLogRedactor(), null!);

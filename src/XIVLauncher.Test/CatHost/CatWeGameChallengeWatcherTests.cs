@@ -794,6 +794,439 @@ public sealed class CatWeGameChallengeWatcherTests
 
     #endregion
 
+    #region 图片验证码与手机 QQ 确认（登录窗里的弹窗）
+
+    private static readonly byte[] GridA = [10, 20, 30, 40];
+    private static readonly byte[] GridB = [200, 150, 100, 50];
+    private static readonly byte[] JpegA = [0xFF, 0xD8, 0xAA];
+    private static readonly byte[] JpegB = [0xFF, 0xD8, 0xBB];
+
+    private static readonly (int X, int Y)[] TilePoints = [(364, 259), (479, 259), (594, 259), (364, 374), (479, 374), (594, 374)];
+    private static readonly (int X, int Y)   ConfirmPoint = (620, 449);
+    private static readonly (int X, int Y)   ChangePoint  = (382, 450);
+    private static readonly (int X, int Y)   ReverifyPoint = (577, 357);
+
+    [Fact]
+    public void ImageSelectKind_IsStable()
+    {
+        Assert.Equal("imageSelect", CatWeGameChallengeKinds.IMAGE_SELECT);
+    }
+
+    [Fact]
+    public async Task ImageSelect_ReportedAfterTwoSteadyRounds_Once()
+    {
+        var watcher = CreatePopupWatcher(new RecordingClicker());
+        screen.Window = Ready(GridA, JpegA);
+
+        await TickAsync(watcher, 1);
+        Assert.Empty(reporter.Entries);
+
+        await TickAsync(watcher, 3);
+
+        var challenge = Assert.Single(reporter.Challenges);
+        Assert.Equal("imageSelect", challenge.Kind);
+        Assert.Equal("i-1", challenge.ChallengeId);
+        Assert.Equal(Convert.ToBase64String(JpegA), challenge.Image);
+        Assert.Same(CatWeGamePopupReader.TileRatios, challenge.Tiles);
+        Assert.Equal("CatWeGameChallenge { Kind = imageSelect, ChallengeId = i-1 }", challenge.ToString());
+    }
+
+    [Fact]
+    public async Task ImageSelect_LoadingAndTransitions_KeepTheCurrentQuestion_NewGridIsANewQuestion()
+    {
+        var watcher = CreatePopupWatcher(new RecordingClicker());
+
+        screen.Window = Captcha(CatWeGamePopupKind.CaptchaLoading);
+        await TickAsync(watcher, 2);
+        Assert.Empty(reporter.Entries);
+
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        screen.Window = Captcha(CatWeGamePopupKind.CaptchaBusy);
+        await TickAsync(watcher, 3);
+
+        // 员工自己点了一格: 不算新题
+        screen.Window = Captcha(CatWeGamePopupKind.CaptchaSelected, 1);
+        await TickAsync(watcher, 3);
+
+        screen.Window = Ready(GridB, JpegB);
+        await TickAsync(watcher, 2);
+
+        // 新题算新的验证, 不单独清旧的
+        Assert.Equal(["challenge:imageSelect:i-1", "challenge:imageSelect:i-2"], reporter.Entries);
+        Assert.Equal(Convert.ToBase64String(JpegB), reporter.Challenges.Last().Image);
+    }
+
+    [Fact]
+    public async Task ImageSelect_Answer_ClicksChosenTilesThenConfirm()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = CreatePopupWatcher(clicker);
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        Assert.True(watcher.AnswerImageSelect("i-1", [2, 0], false).Accepted);
+        await watcher.AnswerClicks.WaitAsync(Timeout);
+
+        Assert.Equal([TilePoints[0], TilePoints[2], ConfirmPoint], clicker.Clicks);
+
+        // 工作台补发同一题的答案: 接受但不再点
+        Assert.True(watcher.AnswerImageSelect("i-1", [2, 0], false).Accepted);
+        await watcher.AnswerClicks.WaitAsync(Timeout);
+        Assert.Equal(3, clicker.Clicks.Count);
+    }
+
+    [Fact]
+    public async Task ImageSelect_Answer_OnlyTogglesTilesWhoseTickDiffers()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = CreatePopupWatcher(clicker);
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        // 上一次点了格子没点上「确定」: 0 和 1 已打勾, 客户这次要 1 和 2
+        screen.Window = Captcha(CatWeGamePopupKind.CaptchaSelected, 0, 1);
+
+        Assert.True(watcher.AnswerImageSelect("i-1", [1, 2], false).Accepted);
+        await watcher.AnswerClicks.WaitAsync(Timeout);
+
+        Assert.Equal([TilePoints[0], TilePoints[2], ConfirmPoint], clicker.Clicks);
+    }
+
+    [Fact]
+    public async Task ImageSelect_Refresh_ClicksChangeSetOnly()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = CreatePopupWatcher(clicker);
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        Assert.True(watcher.AnswerImageSelect("i-1", null, true).Accepted);
+        await watcher.AnswerClicks.WaitAsync(Timeout);
+
+        Assert.Equal([ChangePoint], clicker.Clicks);
+    }
+
+    [Fact]
+    public async Task ImageSelect_Answer_WrongIdOrTiles_IsRejected_WithoutClicking()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = CreatePopupWatcher(clicker);
+
+        Assert.Equal(CatCodes.NOT_RUNNING, watcher.AnswerImageSelect("i-1", [0], false).Code);
+
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        Assert.Equal(CatCodes.NOT_RUNNING, watcher.AnswerImageSelect("i-0", [0], false).Code);
+        Assert.Equal(CatCodes.INVALID_PARAMS, watcher.AnswerImageSelect("i-1", [6], false).Code);
+        Assert.Equal(CatCodes.INVALID_PARAMS, watcher.AnswerImageSelect("i-1", [1, 1], false).Code);
+        Assert.Equal(CatCodes.INVALID_PARAMS, watcher.AnswerImageSelect("i-1", [], false).Code);
+        Assert.Equal(CatCodes.INVALID_PARAMS, watcher.AnswerImageSelect("i-1", null, false).Code);
+
+        await watcher.AnswerClicks.WaitAsync(Timeout);
+        Assert.Empty(clicker.Clicks);
+    }
+
+    [Fact]
+    public async Task ImageSelect_AnswerArrivesWhenAnotherQuestionIsShowing_DoesNotClick()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = CreatePopupWatcher(clicker);
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        screen.Window = Ready(GridB, JpegB);
+
+        Assert.True(watcher.AnswerImageSelect("i-1", [0], false).Accepted);
+        await watcher.AnswerClicks.WaitAsync(Timeout);
+
+        Assert.Empty(clicker.Clicks);
+    }
+
+    [Fact]
+    public async Task ImageSelect_SameQuestionStillThereAfterRecheck_IsReportedAgainWithANewId()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = CreatePopupWatcher(clicker, TimeSpan.Zero);
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        Assert.True(watcher.AnswerImageSelect("i-1", [0], false).Accepted);
+        await watcher.AnswerClicks.WaitAsync(Timeout);
+
+        // 点了没反应: 画面还是同一题, 也没有过渡
+        await TickAsync(watcher, 2);
+
+        Assert.Equal(["challenge:imageSelect:i-1", "challenge:imageSelect:i-2"], reporter.Entries);
+        Assert.Equal(Convert.ToBase64String(JpegA), reporter.Challenges.Last().Image);
+    }
+
+    [Fact]
+    public async Task ImageSelect_SameQuestionRightAfterAnswer_IsNotReportedAgainBeforeRecheck()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = CreatePopupWatcher(clicker, TimeSpan.FromHours(1));
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        Assert.True(watcher.AnswerImageSelect("i-1", [0], false).Accepted);
+        await watcher.AnswerClicks.WaitAsync(Timeout);
+        await TickAsync(watcher, 4);
+
+        Assert.Equal(["challenge:imageSelect:i-1"], reporter.Entries);
+    }
+
+    [Fact]
+    public async Task ImageSelect_WrongAnswer_SameImagesAfterTheRetryNotice_IsReportedAgain()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = CreatePopupWatcher(clicker, TimeSpan.FromHours(1));
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        Assert.True(watcher.AnswerImageSelect("i-1", [0], false).Accepted);
+        await watcher.AnswerClicks.WaitAsync(Timeout);
+
+        // 提交中 → 「请再作答一次」→ 原来那组图
+        screen.Window = Captcha(CatWeGamePopupKind.CaptchaBusy);
+        await TickAsync(watcher, 2);
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        Assert.Equal(["challenge:imageSelect:i-1", "challenge:imageSelect:i-2"], reporter.Entries);
+        Assert.True(watcher.AnswerImageSelect("i-2", [1], false).Accepted);
+    }
+
+    [Fact]
+    public async Task ImageSelect_TickedButNotSubmitted_IsReportedAgainWithTheOriginalImage()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = CreatePopupWatcher(clicker, TimeSpan.Zero);
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        Assert.True(watcher.AnswerImageSelect("i-1", [0], false).Accepted);
+        await watcher.AnswerClicks.WaitAsync(Timeout);
+
+        screen.Window = Captcha(CatWeGamePopupKind.CaptchaSelected, 0);
+        await TickAsync(watcher, 1);
+
+        Assert.Equal(["challenge:imageSelect:i-1", "challenge:imageSelect:i-2"], reporter.Entries);
+        Assert.Equal(Convert.ToBase64String(JpegA), reporter.Challenges.Last().Image);
+    }
+
+    [Fact]
+    public async Task ImageSelect_Gone_ClearedAfterTwoMisses_OrRightAwayWhenQqConfirmShows()
+    {
+        var watcher = CreatePopupWatcher(new RecordingClicker());
+        screen.Window = Ready(GridA, JpegA);
+        await TickAsync(watcher, 2);
+
+        screen.Window = Page();
+        await TickAsync(watcher, 1);
+        Assert.DoesNotContain("cleared:i-1", reporter.Entries);
+        await TickAsync(watcher, 1);
+        Assert.Contains("cleared:i-1", reporter.Entries);
+
+        screen.Window = Ready(GridB, JpegB);
+        await TickAsync(watcher, 2);
+        screen.Window = Confirm(false);
+        await TickAsync(watcher, 1);
+
+        Assert.Equal
+        (
+            ["challenge:imageSelect:i-1", "cleared:i-1", "challenge:imageSelect:i-2", "cleared:i-2", "challenge:qqConfirm:c-1"],
+            reporter.Entries
+        );
+    }
+
+    [Fact]
+    public async Task QqConfirm_ReportedOnce_ClearedAfterTwoMisses()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = CreatePopupWatcher(clicker);
+        screen.Window = Confirm(false);
+
+        await TickAsync(watcher, 3);
+        Assert.Equal(["challenge:qqConfirm:c-1"], reporter.Entries);
+        Assert.Equal("qqConfirm", reporter.Challenges.Single().Kind);
+
+        screen.Window = null;
+        await TickAsync(watcher, 2);
+
+        Assert.Equal(["challenge:qqConfirm:c-1", "cleared:c-1"], reporter.Entries);
+        Assert.Empty(clicker.Clicks);
+    }
+
+    [Fact]
+    public async Task QqConfirm_Expired_ClicksReverify_NoMoreOftenThanTheGap_CustomerPageUnchanged()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = new CatWeGameChallengeWatcher(screen, reporter, redactor, null) { Clicker = clicker, ReverifyGap = TimeSpan.FromHours(1) };
+        screen.Window = Confirm(true);
+
+        await TickAsync(watcher, 4);
+
+        Assert.Equal([ReverifyPoint], clicker.Clicks);
+        Assert.Equal(["challenge:qqConfirm:c-1"], reporter.Entries);
+    }
+
+    [Fact]
+    public async Task QqConfirm_ExpiresAgainAndAgain_ReverifyHasNoCountLimit()
+    {
+        var clicker = new RecordingClicker();
+        var watcher = new CatWeGameChallengeWatcher(screen, reporter, redactor, null) { Clicker = clicker, ReverifyGap = TimeSpan.Zero };
+
+        for (var i = 0; i < 30; i++)
+        {
+            screen.Window = Confirm(true);
+            await TickAsync(watcher, 1);
+            screen.Window = Confirm(false);
+            await TickAsync(watcher, 1);
+        }
+
+        Assert.Equal(30, clicker.Clicks.Count);
+        Assert.Equal(["challenge:qqConfirm:c-1"], reporter.Entries);
+    }
+
+    [Fact]
+    public async Task Popup_WithoutClicker_ClicksByWindowMessages()
+    {
+        var watcher = new CatWeGameChallengeWatcher(screen, reporter, redactor, null);
+        screen.Window = Confirm(true);
+
+        await TickAsync(watcher, 1);
+
+        Assert.Equal([ReverifyPoint], screen.Clicks);
+    }
+
+    [Fact]
+    public async Task Popup_RunEnds_ClearsBothKinds()
+    {
+        using var stop = new CancellationTokenSource();
+        var watcher = new CatWeGameChallengeWatcher(screen, reporter, redactor, null) { Interval = TimeSpan.FromMilliseconds(10), PopupInterval = TimeSpan.FromMilliseconds(10), Clicker = new RecordingClicker() };
+        screen.Window = Ready(GridA, JpegA);
+        var run = watcher.RunAsync(stop.Token);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("challenge:imageSelect:i-1"));
+        screen.Window = Confirm(false);
+        await WaitUntilAsync(() => reporter.Entries.Contains("challenge:qqConfirm:c-1"));
+        screen.Window = Ready(GridB, JpegB);
+        await WaitUntilAsync(() => reporter.Entries.Contains("challenge:imageSelect:i-2"));
+
+        await stop.CancelAsync();
+        await run.WaitAsync(Timeout);
+
+        Assert.Equal
+        (
+            [
+                "challenge:imageSelect:i-1", "cleared:i-1", "challenge:qqConfirm:c-1", "challenge:imageSelect:i-2",
+                "cleared:c-1", "cleared:i-2"
+            ],
+            reporter.Entries
+        );
+    }
+
+    [Fact]
+    public async Task Popup_WhileSwitchingToScanPage_DoesNotClickTabs()
+    {
+        var watcher = Create(CatWeGameScan.Qq);
+        screen.Window = Confirm(false) with { TabsVisible = true };
+
+        await TickAsync(watcher, 5);
+
+        Assert.Empty(screen.Clicks);
+        Assert.Equal(["challenge:qqConfirm:c-1"], reporter.Entries);
+    }
+
+    [Fact]
+    public async Task Capture_AnswerImageSelect_OnlyWhileWaitingForLogin()
+    {
+        var environment = new WaitingEnvironment();
+        screen.Window = Ready(GridA, JpegA);
+        var capture = CreateCapture(environment);
+
+        Assert.Equal(CatCodes.NOT_RUNNING, capture.AnswerImageSelect("i-1", [0], false).Code);
+
+        var run = capture.FindRowAsync(Request(null), reporter, CancellationToken.None);
+        await WaitUntilAsync(() => reporter.Entries.Contains("challenge:imageSelect:i-1"));
+
+        Assert.True(capture.AnswerImageSelect("i-1", null, true).Accepted);
+        await WaitUntilAsync(() => screen.Clicks.Contains(ChangePoint));
+
+        environment.Result.TrySetResult(new WeGameCaptureResult("10000000000000001", "captured-token-AAAA"));
+        await run.WaitAsync(Timeout);
+
+        Assert.Equal(CatCodes.NOT_RUNNING, capture.AnswerImageSelect("i-1", [0], false).Code);
+        Assert.Equal("cleared:i-1", reporter.Entries.Reverse().Skip(1).First());
+    }
+
+    [Fact]
+    public async Task Capture_HwLogin_AlsoWatches_SoQqConfirmIsReportedByTheWatcher()
+    {
+        var environment = new WaitingEnvironment();
+        screen.Window = Confirm(false);
+        var capture = new CatWeGameLoginCapture(environment, new EmptyStore(), redactor)
+        {
+            Screen        = screen,
+            WatchInterval = TimeSpan.FromMilliseconds(10),
+            Keyboard      = new StubHidKeyboard { OpenResult = false },
+            Foreground    = new StubWeGameForeground()
+        };
+
+        var run = capture.FindRowAsync(Request(null) with { Password = new CatSecret("pw1234Ab") }, reporter, CancellationToken.None);
+        await WaitUntilAsync(() => reporter.Entries.Contains("challenge:qqConfirm:c-1") && !reporter.HwFallbacks.IsEmpty);
+
+        environment.Result.TrySetResult(new WeGameCaptureResult("10000000000000001", "captured-token-AAAA"));
+        await run.WaitAsync(Timeout);
+
+        Assert.Single(reporter.Challenges);
+        Assert.Contains("cleared:c-1", reporter.Entries);
+    }
+
+    private CatWeGameChallengeWatcher CreatePopupWatcher(ICatWeGameClicker clicker, TimeSpan? recheck = null) =>
+        new(screen, reporter, redactor, null) { Clicker = clicker, TileClickPause = TimeSpan.Zero, AnswerRecheck = recheck ?? TimeSpan.FromHours(1) };
+
+    private static CatWeGameLoginWindow Ready(byte[] grid, byte[] jpeg) =>
+        new
+        (
+            CatWeGameChallengeWatcher.DESIGN_WIDTH,
+            CatWeGameChallengeWatcher.DESIGN_HEIGHT,
+            Popup: new CatWeGamePopup
+            (
+                CatWeGamePopupKind.CaptchaReady,
+                jpeg,
+                CatWeGamePopupReader.TileRatios,
+                TilePoints,
+                ConfirmPoint,
+                ChangePoint,
+                GridThumb: grid,
+                SelectedTiles: []
+            )
+        );
+
+    private static CatWeGameLoginWindow Captcha(CatWeGamePopupKind kind, params int[] selected) =>
+        new
+        (
+            CatWeGameChallengeWatcher.DESIGN_WIDTH,
+            CatWeGameChallengeWatcher.DESIGN_HEIGHT,
+            Popup: kind == CatWeGamePopupKind.CaptchaLoading
+                       ? new CatWeGamePopup(kind)
+                       : new CatWeGamePopup(kind, TilePoints: TilePoints, ConfirmPoint: ConfirmPoint, RefreshPoint: ChangePoint, SelectedTiles: selected)
+        );
+
+    private static CatWeGameLoginWindow Confirm(bool expired) =>
+        new
+        (
+            CatWeGameChallengeWatcher.DESIGN_WIDTH,
+            CatWeGameChallengeWatcher.DESIGN_HEIGHT,
+            Popup: expired ? new CatWeGamePopup(CatWeGamePopupKind.QqConfirmExpired, ReverifyPoint: ReverifyPoint) : new CatWeGamePopup(CatWeGamePopupKind.QqConfirm)
+        );
+
+    #endregion
+
     private CatWeGameChallengeWatcher Create(CatWeGameScan? scan) =>
         new(screen, reporter, redactor, scan) { ClickSettle = TimeSpan.Zero, SettleTicks = 2 };
 

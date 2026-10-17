@@ -121,7 +121,8 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
     public TimeSpan? WatchInterval { get; init; }
 
     /// <summary>
-    ///     本机外接的硬件键鼠; 设了才会对 QQ 账号密码方式的号自动输入账号密码（见 <see cref="CatWeGameHwLogin" />）, 为 null 时一律等员工手动
+    ///     本机外接的硬件键鼠; 设了才会对 QQ 账号密码方式的号自动输入账号密码（见 <see cref="CatWeGameHwLogin" />）, 为 null 时一律等员工手动。
+    ///     接着硬件时点登录窗里的弹窗（图片验证码、重新验证）也用硬件鼠标
     /// </summary>
     public ICatHidKeyboard? Keyboard { get; init; }
 
@@ -133,6 +134,12 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
     /// </summary>
     public CatAcceptResult ConfirmSms(string challengeId) =>
         watcher?.ConfirmSms(challengeId) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证");
+
+    /// <summary>
+    ///     客户答了图片验证码（见 <see cref="CatWeGameChallengeWatcher.AnswerImageSelect" />）; 不在等登录时回 notRunning
+    /// </summary>
+    public CatAcceptResult AnswerImageSelect(string challengeId, IReadOnlyList<int>? tiles, bool refresh) =>
+        watcher?.AnswerImageSelect(challengeId, tiles, refresh) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的图片验证");
 
     /// <summary>
     ///     找上号请求指的那一行: 账号库里 WeGame 行的账号名是 WeGame 给的用户号, 请求带的通常是客户的 QQ 号或手机号,
@@ -361,9 +368,12 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
                                () =>
                                {
                                    reporter.Stage(CatStages.WAITING_WE_GAME_LOGIN);
+
+                                   // 观察器一直看（验证码、手机确认都由它报）; QQ 账号密码方式且接了硬件的再同时自动输入
+                                   var watched = StartWatcher(request, reporter, watching.Token);
                                    watch = ShouldHwLogin(request)
-                                               ? StartHwLogin(request, reporter, watching.Token)
-                                               : StartWatcher(request, reporter, watching.Token);
+                                               ? Task.WhenAll(watched, StartHwLogin(request, reporter, watching.Token))
+                                               : watched;
                                },
                                timeout.Token
                            ).ConfigureAwait(false);
@@ -475,7 +485,7 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
         && Screen != null;
 
     /// <summary>
-    ///     WeGame 已拉起: 用硬件键鼠自动输入账号密码登录; 停在等手机确认时提醒客户、登录成功后清除; 走不通则退回员工手动（报原因, 不判上号失败）
+    ///     WeGame 已拉起: 用硬件键鼠自动输入账号密码登录; 走不通则退回员工手动（报原因, 不判上号失败）
     /// </summary>
     private Task StartHwLogin(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
@@ -493,21 +503,6 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
             Log.Information("[CatHost] 本机接了硬件键鼠, 对 QQ 账号密码方式的 WeGame 号自动输入账号密码: 请求的号={Requested}", request.AccountName);
 
             var result = await flow.RunAsync(request.AccountName, password, cancellationToken).ConfigureAwait(false);
-
-            if (result.Outcome == CatWeGameHwLoginOutcome.NeedsPhoneConfirm)
-            {
-                const string challengeId = "qq-confirm";
-                reporter.WeGameChallenge(new CatWeGameChallenge(CatWeGameChallengeKinds.QQ_CONFIRM, challengeId));
-
-                try
-                {
-                    result = await flow.ResumeAfterPhoneConfirmAsync(cancellationToken).ConfigureAwait(false);
-                }
-                finally
-                {
-                    reporter.WeGameChallengeCleared(challengeId);
-                }
-            }
 
             switch (result.Outcome)
             {
@@ -537,16 +532,17 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
     }
 
     /// <summary>
-    ///     WeGame 已拉起: 开始看它的窗口（没给 <see cref="Screen" /> 时不看）
+    ///     WeGame 已拉起: 开始看它的窗口（没给 <see cref="Screen" /> 时不看）。点弹窗时接了硬件键鼠用硬件鼠标, 否则发后台鼠标消息
     /// </summary>
     private Task StartWatcher(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
         if (Screen == null)
             return Task.CompletedTask;
 
+        var clicker = new CatWeGameClicker(Screen, Keyboard, Foreground);
         var created = WatchInterval is { } interval
-                          ? new CatWeGameChallengeWatcher(Screen, reporter, redactor, request.WeGameScan) { Interval = interval, ClickSettle = interval }
-                          : new CatWeGameChallengeWatcher(Screen, reporter, redactor, request.WeGameScan);
+                          ? new CatWeGameChallengeWatcher(Screen, reporter, redactor, request.WeGameScan) { Interval = interval, ClickSettle = interval, Clicker = clicker }
+                          : new CatWeGameChallengeWatcher(Screen, reporter, redactor, request.WeGameScan) { Clicker = clicker };
 
         watcher = created;
         return Task.Run(() => created.RunAsync(cancellationToken), CancellationToken.None);
