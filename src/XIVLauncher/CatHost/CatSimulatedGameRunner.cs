@@ -40,11 +40,11 @@ namespace XIVLauncher.CatHost;
 ///             desired 为 run 时, 有 startShot 为 true 且要拍的项就在之后的第一条回报里带开工图（每个占位进程只拍这一次）:
 ///             要开工时这条是只带开工图、不推进的 running, 没有可自动做的项时是 idle, 都做完了时是 done;
 ///             练级项（含 routine 为 null 的）按职业分组, 战斗职业（含 classJobId 为 null 的）共用一张、生产采集职业（ClassJob 8–18）共用一张,
-///             金碟币（mgp）与糖豆人声誉（fallguys-rep）共用一张, 勾选类等不拍, 每项各带一条 kind=start、同一张图的 file 相同;
-///             再按 order 把 routine 不为 null 的项一项项做完（running, current 每步加 (target − 起点)/5, 勾选类三步完成）, 一项做完且 shots.completion
+///             金碟币（mgp）与糖豆人声誉（fallguys-rep）共用一张, 勾选类等不拍, 每项各带一条 kind=start、同一张图的 file 相同, 可自动做的项只拍勾上的;
+///             再按 order 把 routine 不为 null 且勾上的项（selected 为 true, 任务单没有这个字段按 true）一项项做完（running, current 每步加 (target − 起点)/5, 勾选类三步完成）, 一项做完且 shots.completion
 ///             为 true 时在截图目录写 <c>&lt;pid&gt;-&lt;seq&gt;.png</c> 并带在回报的 shots 里（progressAt 不为空时开工后先带一张 progress 图）,
-///             全部做完报 done; desired 为 pause / stop 报 paused / stopped; desired 为 finish 时走完正在做的这一把再报 stopped（不在一把里立即报）;
-///             没有可自动做的项报 idle; 没有变化时每 <see cref="AfanHeartbeat" /> 心跳一次。
+///             勾上的项全部做完报 done（没勾的项不看, 去勾的项不再推进）; desired 为 pause / stop 报 paused / stopped; desired 为 finish 时走完正在做的这一把再报 stopped（不在一把里立即报）;
+///             没有勾上的、也没有做完的可自动做的项报 idle; 没有变化时每 <see cref="AfanHeartbeat" /> 心跳一次。
 ///             职业等级按任务单里练级项的当前值（ClassJob → ExpArrayIndex 用国服表）连同当前角色每步报一次, 有变化才发 game.levels;
 ///             不自动进入角色时与真实启动一样, 进世界先报一次 game.character（模拟角色, 名字取 launch 的 character.name）。
 ///             是否在副本中每步报一次, 有变化才发 game.duty（进世界后第一步必发）: 例程进行中每走 <see cref="CatSimulatedAfan.DUTY_ROUND_STEPS" /> 步算一把、

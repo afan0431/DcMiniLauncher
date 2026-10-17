@@ -583,16 +583,23 @@ public sealed class CatJobChannel : ICatLocalEndpoints
         var desired = job.TryGetProperty("desired", out var d) && d.ValueKind == JsonValueKind.String ? d.GetString() : "?";
         var items   = job.TryGetProperty("items", out var i) && i.ValueKind == JsonValueKind.Array ? i.GetArrayLength() : 0;
         var auto    = 0;
+        var picked  = 0;
 
         if (items > 0)
         {
             foreach (var item in i.EnumerateArray())
             {
-                if (item.ValueKind == JsonValueKind.Object && item.TryGetProperty("routine", out var routine) && routine.ValueKind == JsonValueKind.String)
-                    auto++;
+                if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty("routine", out var routine) || routine.ValueKind != JsonValueKind.String)
+                    continue;
+
+                auto++;
+
+                // selected 缺省（旧版 Cat）按勾上算
+                if (!item.TryGetProperty("selected", out var selected) || selected.ValueKind != JsonValueKind.False)
+                    picked++;
             }
         }
 
-        return $"desired={desired}, 项 {items} 个（可自动做 {auto} 个）";
+        return $"desired={desired}, 项 {items} 个（可自动做 {auto} 个, 勾上 {picked} 个）";
     }
 }
