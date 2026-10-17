@@ -21,6 +21,11 @@ namespace XIVLauncher.CatHost;
 ///             账号名以 <c>sms:</c> 开头: 二维码之后再发一条设备验证短信（kind=sms）, 一直等到收到 weGame.confirmSms 才发 weGame.challengeCleared 并继续
 ///         </item>
 ///         <item>
+///             WeGame 号带了 weGameLogin、账号名以 <c>img:</c> 开头（不论带没带 weGameScan）: 停的这段时间里发一道选图题（kind=imageSelect, 编号 i-1 起,
+///             图见 <see cref="CatSimulatedImageSelect" />）, 等 weGame.answerImageSelect: 答案恰为 0,3 → 清除这一题、发手机 QQ 确认（kind=qqConfirm, 编号 c-1）,
+///             <see cref="QqConfirmDelay" /> 后清除并照常继续; 其它答案或换一组 → 以新编号再发一题
+///         </item>
+///         <item>
 ///             launch 带了 authOnly（只登录）: 上面的等登录与失败前缀照旧, 之后发 launch.authorized 结束, 不起占位进程;
 ///             weGameAccountId 取 launch 下发的用户号, 没带时为 <see cref="SIMULATED_WE_GAME_ACCOUNT_ID" />; captured = launch 带了 weGameLogin（模拟里一律当作在 WeGame 里登录过）
 ///         </item>
@@ -87,6 +92,12 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     /// <summary>模拟扫码后还要设备验证短信的前缀</summary>
     public const string SMS_PREFIX = "sms:";
 
+    /// <summary>模拟 QQ 账号密码登录后的图片验证码与手机 QQ 确认的前缀</summary>
+    public const string IMAGE_SELECT_PREFIX = "img:";
+
+    /// <summary>模拟的手机 QQ 确认编号</summary>
+    public const string SIMULATED_QQ_CONFIRM_CHALLENGE_ID = "c-1";
+
     /// <summary>自动进入角色: 多个角色等人选的前缀</summary>
     public const string CHARACTERS_PREFIX = "chars:";
 
@@ -146,6 +157,10 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
     private TaskCompletionSource? smsConfirmed;
 
+    private TaskCompletionSource<(int[]? Tiles, bool Refresh)>? imageAnswered;
+    private string?                                             imageChallengeId;
+    private string?                                             imageAnsweredId;
+
     private TaskCompletionSource<string>?    characterChosen;
     private IReadOnlyList<CatCharacterInfo>  characterChoices = [];
     private Task                             autoEnterTask    = Task.CompletedTask;
@@ -156,6 +171,9 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
     /// <summary>带了 weGameLogin 时在 waitingWeGameLogin 阶段停多久</summary>
     public TimeSpan WeGameLoginDelay { get; init; } = TimeSpan.FromSeconds(8);
+
+    /// <summary>选图答对后手机 QQ 确认停多久</summary>
+    public TimeSpan QqConfirmDelay { get; init; } = TimeSpan.FromSeconds(3);
 
     /// <summary>崩溃前运行多久</summary>
     public TimeSpan CrashAfter { get; init; } = TimeSpan.FromSeconds(3);
@@ -259,6 +277,27 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
         pending.TrySetResult();
         return CatAcceptResult.Ok();
+    }
+
+    /// <inheritdoc />
+    public CatAcceptResult AnswerWeGameImageSelect(string challengeId, IReadOnlyList<int>? tiles, bool refresh)
+    {
+        lock (stateLock)
+        {
+            // 同一题的答案再来一次（工作台补发）: 照真实启动一样回已接受
+            if (imageAnsweredId != null && challengeId == imageAnsweredId)
+                return CatAcceptResult.Ok();
+
+            if (imageAnswered == null || challengeId != imageChallengeId)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的图片验证（模拟）");
+
+            if (!refresh && (tiles is not { Count: > 0 } || tiles.Any(x => x < 0 || x >= CatSimulatedImageSelect.Tiles.Count)))
+                return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "格子序号不对（模拟）");
+
+            imageAnsweredId = challengeId;
+            imageAnswered.TrySetResult((tiles?.ToArray(), refresh));
+            return CatAcceptResult.Ok();
+        }
     }
 
     /// <inheritdoc />
@@ -396,6 +435,12 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     /// </summary>
     private async Task WaitForWeGameLoginAsync(CatLaunchRequest request, ICatLaunchReporter reporter, CancellationToken token)
     {
+        if (request.AccountName.StartsWith(IMAGE_SELECT_PREFIX, StringComparison.Ordinal))
+        {
+            await SimulateImageSelectAsync(reporter, token).ConfigureAwait(false);
+            return;
+        }
+
         if (request.WeGameScan is not { } scan)
         {
             await Task.Delay(WeGameLoginDelay, token).ConfigureAwait(false);
@@ -466,6 +511,80 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
         {
             lock (stateLock)
                 smsConfirmed = null;
+
+            // 等的途中被 close 取消: 没清的验证也报成已清除, 与真实启动一致
+            if (open != null)
+                reporter.WeGameChallengeCleared(open);
+        }
+    }
+
+    /// <summary>
+    ///     模拟 QQ 账号密码登录后的图片验证码: 答对了换成手机 QQ 确认, 答错或换一组出新题
+    /// </summary>
+    private async Task SimulateImageSelectAsync(ICatLaunchReporter reporter, CancellationToken token)
+    {
+        var     quarter = WeGameLoginDelay / 4;
+        string? open    = null;
+        var     seq     = 0;
+
+        try
+        {
+            await Task.Delay(quarter, token).ConfigureAwait(false);
+
+            while (true)
+            {
+                var answered = new TaskCompletionSource<(int[]? Tiles, bool Refresh)>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var id       = $"i-{++seq}";
+
+                lock (stateLock)
+                {
+                    imageAnswered    = answered;
+                    imageChallengeId = id;
+                }
+
+                open = id;
+                reporter.WeGameChallenge
+                (
+                    new CatWeGameChallenge
+                    (
+                        CatWeGameChallengeKinds.IMAGE_SELECT,
+                        id,
+                        Convert.ToBase64String(CatSimulatedImageSelect.DrawJpeg(seq)),
+                        Tiles: CatSimulatedImageSelect.Tiles
+                    )
+                );
+
+                var (tiles, refresh) = await answered.Task.WaitAsync(token).ConfigureAwait(false);
+
+                lock (stateLock)
+                    imageAnswered = null;
+
+                if (!refresh && tiles != null && tiles.Distinct().Order().SequenceEqual(CatSimulatedImageSelect.Answer))
+                    break;
+
+                // 答错或换一组: 停一下（真实的会先显示提示再换题）, 再出新题
+                await Task.Delay(StepDelay, token).ConfigureAwait(false);
+            }
+
+            reporter.WeGameChallengeCleared(open);
+            open = SIMULATED_QQ_CONFIRM_CHALLENGE_ID;
+            reporter.WeGameChallenge(new CatWeGameChallenge(CatWeGameChallengeKinds.QQ_CONFIRM, SIMULATED_QQ_CONFIRM_CHALLENGE_ID));
+
+            await Task.Delay(QqConfirmDelay, token).ConfigureAwait(false);
+
+            reporter.WeGameChallengeCleared(SIMULATED_QQ_CONFIRM_CHALLENGE_ID);
+            open = null;
+
+            await Task.Delay(quarter, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (stateLock)
+            {
+                imageAnswered    = null;
+                imageChallengeId = null;
+                imageAnsweredId  = null;
+            }
 
             // 等的途中被 close 取消: 没清的验证也报成已清除, 与真实启动一致
             if (open != null)

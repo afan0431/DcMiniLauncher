@@ -24,6 +24,10 @@
     </ItemGroup>
 
     <ItemGroup>
+        <None Update="CatHost\WeGameShots\*.png" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+
+    <ItemGroup>
         <ProjectReference Include="..\XIVLauncher\XIVLauncher.csproj" />
         <ProjectReference Include="..\XIVLauncher.GamePatchV3\XIVLauncher.GamePatchV3.csproj" />
     </ItemGroup>
