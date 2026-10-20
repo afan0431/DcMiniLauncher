@@ -528,7 +528,8 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
                     reporter.Agent(CatAgentKinds.DALAMUD, true);
             }
 
-            if (request.Minion)
+            // 与真实启动一致: 自动进入角色的等进了世界再挂 Minion（RunAutoEnterAsync）
+            if (request.Minion && !request.AutoEnter)
                 await AttachMinionAsync(failAgent, reporter, token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (closeCts.IsCancellationRequested)
@@ -540,7 +541,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
         // 不自动进入角色时没有进世界的信号, running 就当进了世界
         if (request.AutoEnter)
-            autoEnterTask = RunAutoEnterAsync(request, process, reporter, token);
+            autoEnterTask = RunAutoEnterAsync(request, process, failAgent, reporter, token);
         else
             StartSimulatedAfan(request, process, reporter);
 
@@ -720,7 +721,7 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
     /// <summary>
     ///     模拟自动进入角色: 按账号名前缀发与真实编排同样顺序的事件; 占位进程一结束就停, 不再发任何事件
     /// </summary>
-    private async Task RunAutoEnterAsync(CatLaunchRequest request, Process process, ICatLaunchReporter reporter, CancellationToken token)
+    private async Task RunAutoEnterAsync(CatLaunchRequest request, Process process, string? failAgent, ICatLaunchReporter reporter, CancellationToken token)
     {
         using var alive = CancellationTokenSource.CreateLinkedTokenSource(token);
         var exited = process.WaitForExitAsync(alive.Token);
@@ -829,6 +830,13 @@ public sealed class CatSimulatedGameRunner : ICatGameRunner
 
                 reporter.Character(entered);
                 Stage(CatStages.IN_WORLD);
+
+                if (request.Minion)
+                {
+                    await AttachMinionAsync(failAgent, reporter, alive.Token).ConfigureAwait(false);
+                    reporter.Stage(CatStages.IN_WORLD);
+                }
+
                 StartSimulatedAfan(request, process, reporter, entered);
             }
         }

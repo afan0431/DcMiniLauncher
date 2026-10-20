@@ -154,6 +154,7 @@ public sealed class CatAutoEnter
     private readonly object              stateLock = new();
 
     private readonly Dictionary<int, string> worldCodes = [];
+    private readonly TaskCompletionSource    entered    = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private IReadOnlyList<CatAutoEnterWorld> worlds = [];
     private IReadOnlyList<CharaSelectReader.Entry> knownEntries = [];
@@ -190,6 +191,11 @@ public sealed class CatAutoEnter
                 return currentStage;
         }
     }
+
+    /// <summary>
+    ///     第一次报告角色已进入游戏时完成: 编排登录进去的、编排停手后人手动进去的都算; 游戏没进世界就退出时一直不完成
+    /// </summary>
+    public Task EnteredWorld => entered.Task;
 
     /// <summary>最近一次报告的已进入游戏的角色</summary>
     public string? EnteredContentId
@@ -1028,6 +1034,7 @@ public sealed class CatAutoEnter
         );
 
         SetStage(CatStages.IN_WORLD);
+        entered.TrySetResult();
     }
 
     private CatCharacterInfo ToInfo(CharaSelectReader.Entry entry) =>
