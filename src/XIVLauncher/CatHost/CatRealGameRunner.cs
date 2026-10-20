@@ -590,6 +590,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         weGameLogin?.ConfirmSms(challengeId) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证");
 
     /// <inheritdoc />
+    public CatAcceptResult AnswerWeGameImageSelect(string challengeId, IReadOnlyList<int>? tiles, bool refresh) =>
+        weGameLogin?.AnswerImageSelect(challengeId, tiles, refresh) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的图片验证");
+
+    /// <inheritdoc />
     public CatAcceptResult SelectCharacter(string contentId) =>
         autoEnter?.SelectCharacter(contentId) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等人选角色");
 

@@ -335,6 +335,99 @@ public sealed class CatSimulatedGameRunnerTests
         );
     }
 
+    [Fact]
+    public async Task Run_ImageSelectAccount_WrongAnswerAndRefreshGiveNewQuestions_RightAnswerMovesToQqConfirm()
+    {
+        var simulated = new CatSimulatedGameRunner
+        {
+            StepDelay        = TimeSpan.FromMilliseconds(10),
+            WeGameLoginDelay = TimeSpan.FromMilliseconds(50),
+            QqConfirmDelay   = TimeSpan.FromMilliseconds(50)
+        };
+        var reporter = new RecordingReporter();
+        var request  = new CatLaunchRequest("op", CatSimulatedGameRunner.IMAGE_SELECT_PREFIX + "acc", false, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true);
+        var run      = simulated.RunAsync(request, reporter, CancellationToken.None);
+
+        Assert.Equal(CatCodes.NOT_RUNNING, simulated.AnswerWeGameImageSelect("i-1", [0, 3], false).Code);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("challenge:imageSelect:i-1"));
+
+        var first = reporter.Challenges.Single();
+        Assert.Equal(CatSimulatedImageSelect.Tiles, first.Tiles);
+        AssertJpeg(first.Image!);
+
+        // 没答之前一直停在这一题
+        await Task.Delay(150);
+        Assert.Equal(["stage:preparing", "stage:waitingWeGameLogin", "challenge:imageSelect:i-1"], reporter.Entries);
+
+        Assert.Equal(CatCodes.NOT_RUNNING, simulated.AnswerWeGameImageSelect("i-2", [0], false).Code);
+        Assert.True(simulated.AnswerWeGameImageSelect("i-1", [0], false).Accepted);
+        Assert.True(simulated.AnswerWeGameImageSelect("i-1", [0], false).Accepted);   // 补发同一题: 照样接受
+        await WaitUntilAsync(() => reporter.Entries.Contains("challenge:imageSelect:i-2"));
+        Assert.NotEqual(first.Image, reporter.Challenges.Last().Image);
+
+        Assert.True(simulated.AnswerWeGameImageSelect("i-2", null, true).Accepted);
+        await WaitUntilAsync(() => reporter.Entries.Contains("challenge:imageSelect:i-3"));
+
+        Assert.True(simulated.AnswerWeGameImageSelect("i-3", [3, 0], false).Accepted);
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        using (var placeholder = Process.GetProcessById(reporter.Pid!.Value))
+            placeholder.Kill();
+
+        await run.WaitAsync(Timeout);
+        Assert.Equal
+        (
+            [
+                "stage:preparing", "stage:waitingWeGameLogin",
+                "challenge:imageSelect:i-1", "challenge:imageSelect:i-2", "challenge:imageSelect:i-3", "cleared:i-3",
+                "challenge:qqConfirm:c-1", "cleared:c-1",
+                "stage:preparing", "stage:starting", "started", "stage:running", "exited"
+            ],
+            reporter.Entries
+        );
+    }
+
+    [Fact]
+    public void SimulatedImage_IsA342x310Jpeg_WithRedTilesAtTheAnswer()
+    {
+        var bitmap = Decode(CatSimulatedImageSelect.DrawJpeg(1));
+
+        Assert.Equal((342, 310), (bitmap.PixelWidth, bitmap.PixelHeight));
+
+        var pixels = new byte[342 * 310 * 4];
+        bitmap.CopyPixels(pixels, 342 * 4, 0);
+
+        for (var i = 0; i < CatSimulatedImageSelect.Tiles.Count; i++)
+        {
+            var tile = CatSimulatedImageSelect.Tiles[i];
+            var x    = (tile[0] + tile[2] / 2) * 342 / 1000;
+            var y    = (tile[1] + tile[3] / 2) * 310 / 1000;
+            var o    = (y * 342 + x) * 4;
+            var red  = pixels[o + 2] > 180 && pixels[o + 1] < 80 && pixels[o] < 80;
+
+            Assert.Equal(CatSimulatedImageSelect.Answer.Contains(i), red);
+        }
+
+        // 最上面是蓝色题目条
+        Assert.True(pixels[(5 * 342 + 200) * 4] > 200 && pixels[(5 * 342 + 200) * 4 + 2] < 40);
+    }
+
+    private static void AssertJpeg(string base64)
+    {
+        var bitmap = Decode(Convert.FromBase64String(base64));
+        Assert.Equal((342, 310), (bitmap.PixelWidth, bitmap.PixelHeight));
+    }
+
+    private static System.Windows.Media.Imaging.BitmapSource Decode(byte[] jpeg)
+    {
+        Assert.Equal(new byte[] { 0xFF, 0xD8 }, jpeg[..2]);
+
+        using var stream = new System.IO.MemoryStream(jpeg);
+        var frame = System.Windows.Media.Imaging.BitmapFrame.Create(stream, System.Windows.Media.Imaging.BitmapCreateOptions.None, System.Windows.Media.Imaging.BitmapCacheOption.OnLoad);
+        return new System.Windows.Media.Imaging.FormatConvertedBitmap(frame, System.Windows.Media.PixelFormats.Bgra32, null, 0);
+    }
+
     private static CatLaunchRequest WeGameScanRequest(string account, CatWeGameScan scan) =>
         new("op", account, false, null, Platform: XIVLauncher.Common.Game.XIVAccountType.WeGame, WeGameLogin: true, WeGameScan: scan);
 

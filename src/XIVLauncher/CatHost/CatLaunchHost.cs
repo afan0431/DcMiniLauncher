@@ -146,7 +146,7 @@ public interface ICatLaunchReporter
     /// <summary>脱敏后的日志</summary>
     void Log(string level, string message);
 
-    /// <summary>等 WeGame 登录期间出现了要客户配合的验证（二维码或设备验证短信）</summary>
+    /// <summary>等 WeGame 登录期间出现了要客户配合的验证（二维码、设备验证短信、图片验证码、手机 QQ 确认）</summary>
     void WeGameChallenge(CatWeGameChallenge challenge);
 
     /// <summary>那项验证已经不在了（客户已完成、员工自己处理了、或等登录结束）</summary>
@@ -223,6 +223,14 @@ public interface ICatGameRunner
         CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的设备验证");
 
     /// <summary>
+    ///     客户答了图片验证码: 按格子序号点格子再点「确定」, 或 refresh 时点「换一组」。立即返回是否接受, 之后的画面变化照常经
+    ///     <see cref="ICatLaunchReporter.WeGameChallenge" /> / <see cref="ICatLaunchReporter.WeGameChallengeCleared" /> 报告。
+    ///     不在等 WeGame 登录的启动器一律回 notRunning。
+    /// </summary>
+    CatAcceptResult AnswerWeGameImageSelect(string challengeId, IReadOnlyList<int>? tiles, bool refresh) =>
+        CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的图片验证");
+
+    /// <summary>
     ///     员工在工作台选了要登录的角色（contentId 来自 game.characters）。立即返回是否接受, 之后的进度照常走事件。
     ///     不在等人选角色的启动器一律回 notRunning。
     /// </summary>
@@ -244,6 +252,12 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
     /// <summary>launch 的 character.homeWorld 最长字符数</summary>
     public const int MAX_HOME_WORLD_LENGTH = 64;
+
+    /// <summary>weGame.answerImageSelect 的 challengeId 最长字符数</summary>
+    public const int MAX_CHALLENGE_ID_LENGTH = 128;
+
+    /// <summary>weGame.answerImageSelect 的 tiles 最多几个（序号也在 0 到它减一之间）</summary>
+    public const int MAX_IMAGE_TILES = 9;
 
     /// <summary>游戏起来后本进程内部出错, 已等游戏结束并发 game.exited{reason:"guardError"}</summary>
     public const int EXIT_GUARD_ERROR = 5;
@@ -361,6 +375,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             "close"  => Task.FromResult<object?>(Close(Deserialize<CatCloseParams>(parameters))),
             CatHandOff.METHOD => HandOffBoxedAsync(cancellationToken),
             "weGame.confirmSms" => Task.FromResult<object?>(ConfirmWeGameSms(Deserialize<CatWeGameConfirmSmsParams>(parameters))),
+            "weGame.answerImageSelect" => Task.FromResult<object?>(AnswerWeGameImageSelect(Deserialize<CatWeGameAnswerImageSelectParams>(parameters))),
             "selectCharacter" => Task.FromResult<object?>(SelectCharacter(Deserialize<CatSelectCharacterParams>(parameters))),
             CatJobChannel.METHOD => Task.FromResult<object?>(SetJob(Deserialize<CatSetJobParams>(parameters))),
             _        => throw new CatRpcException(CatRpcException.METHOD_NOT_FOUND, $"未知方法: {method}")
@@ -872,6 +887,44 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     }
 
     /// <summary>
+    ///     客户答了图片验证码: 校验参数（challengeId 不为空且不超过 128 个字符; 换一组时不带 tiles, 否则 tiles 是 1–9 个不重复的 0–8 序号）,
+    ///     交给启动器在后台点, 立即回是否接受
+    /// </summary>
+    public CatAcceptResult AnswerWeGameImageSelect(CatWeGameAnswerImageSelectParams? parameters)
+    {
+        var challengeId = parameters?.ChallengeId?.Trim();
+
+        if (string.IsNullOrEmpty(challengeId) || challengeId.Length > MAX_CHALLENGE_ID_LENGTH)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"challengeId 不能为空, 且不超过 {MAX_CHALLENGE_ID_LENGTH} 个字符");
+
+        var tiles = parameters!.Tiles;
+
+        if (parameters.Refresh)
+        {
+            if (tiles is { Length: > 0 })
+                return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "换一组时不能带 tiles");
+
+            tiles = null;
+        }
+        else if (tiles is not { Length: > 0 and <= MAX_IMAGE_TILES } || tiles.Any(x => x is < 0 or >= MAX_IMAGE_TILES) || tiles.Distinct().Count() != tiles.Length)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"tiles 必须是 1–{MAX_IMAGE_TILES} 个不重复的格子序号（0–{MAX_IMAGE_TILES - 1}）");
+
+        ICatGameRunner? current;
+
+        lock (stateLock)
+        {
+            if (closeRequested || runnerFaulted || CatStages.IsFinished(stage))
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的图片验证");
+
+            current = runner;
+        }
+
+        return current == null
+                   ? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等 WeGame 的图片验证")
+                   : current.AnswerWeGameImageSelect(challengeId, tiles, parameters.Refresh);
+    }
+
+    /// <summary>
     ///     setJob: 国际服和只登录的上号没有人来取任务单（没有本机接口、不起游戏）, 回 unsupported;
     ///     正在交接停止或已收到 close 回 busy（工作台在 game.adopted 之后对接管的进程重发）; 其余交给 <see cref="CatJobChannel.SetJob" />
     /// </summary>
@@ -1111,7 +1164,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 expiresInSeconds = challenge.ExpiresInSeconds,
                 code             = challenge.Code,
                 phone            = challenge.Phone,
-                text             = challenge.Text
+                text             = challenge.Text,
+                tiles            = challenge.Tiles
             }
         );
 
