@@ -12,6 +12,8 @@ public static class NativeAclFix
     {
         Process process = null;
 
+        GameInstanceLimit.Release();
+
         var userName = Environment.UserName;
 
         var pExplicitAccess = new PInvoke.EXPLICIT_ACCESS();
