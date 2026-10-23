@@ -2209,6 +2209,7 @@ namespace charconfig
         json += "\"moduleVersion\":" + JsonQuoteOrNull(heartbeat.moduleVersion) + ",";
         json += std::string("\"hooked\":") + (heartbeat.hooked ? "true" : "false") + ",";
         json += "\"lastCid\":" + JsonQuoteOrNull(heartbeat.lastCid) + ",";
+        json += "\"lastName\":" + JsonQuoteOrNull(heartbeat.lastName) + ",";
         json += "\"lastError\":" + JsonQuoteOrNull(heartbeat.lastError) + ",";
         json += "\"updatedAt\":" + JsonQuote(UtcNowIso()) + "}";
 

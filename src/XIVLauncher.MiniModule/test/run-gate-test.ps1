@@ -470,6 +470,8 @@ try
         {
             if ($status -notmatch [regex]::Escape($expected)) { $failures += "CHARCONFIG 最近动作里没有「$expected」" }
         }
+        if ($status -notmatch "(?m)^lastCid=$cid\r?$") { $failures += 'CHARCONFIG 没有输出 lastCid' }
+        if ($status -notmatch '(?m)^lastName=\r?$') { $failures += 'CHARCONFIG 查不到角色名时 lastName 应为空' }
 
         $unload = Send-ModuleCommand -Pipe $hookPipe -Command 'UNLOAD'
         Write-Host "UNLOAD → $unload"
@@ -496,6 +498,9 @@ try
         $heartbeat = [IO.File]::ReadAllText($hookHeartbeatPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
         if ($heartbeat.hooked -ne $false -or "$($heartbeat.lastError)" -ne '模块已卸载') { $failures += "卸载后心跳不对: $($heartbeat | ConvertTo-Json -Compress)" }
         if ($heartbeat.lastCid -ne $cid) { $failures += "心跳 lastCid 不对: $($heartbeat.lastCid)" }
+        # 假宿主查不到角色名: 心跳带 lastName 字段, 值为 null
+        if (@($heartbeat.PSObject.Properties.Name) -notcontains 'lastName') { $failures += '心跳没有 lastName 字段' }
+        elseif ($null -ne $heartbeat.lastName) { $failures += "查不到角色名时心跳 lastName 应为 null: $($heartbeat.lastName)" }
     }
 
     if (-not $hookHost.HasExited) { [void](Send-HostCommand 'QUIT') }

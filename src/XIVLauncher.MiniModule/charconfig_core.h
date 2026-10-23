@@ -30,9 +30,10 @@
 //      "cid":"00400012DC10855C","charName":"…","at":"…","gamePid":67408}
 //     baseVersion = 发布时 state.json 里这个文件的 version。
 //   modules\<pid>.json:
-//     {"schema":1,"pid":67408,"moduleVersion":"0.9.1","hooked":true,"lastCid":"…","lastError":"…","updatedAt":"…"}
+//     {"schema":1,"pid":67408,"moduleVersion":"0.9.1","hooked":true,"lastCid":"…","lastName":"…","lastError":"…","updatedAt":"…"}
+//     lastName = lastCid 那个号的角色名（查不到为 null）; 旧版模块没有这个字段, 读时缺失当作 null。
 //   cid 一律是 16 位大写十六进制字符串（与角色目录名 FFXIV_CHR<cid> 相同）, 不用数字: 超出 double 的精确范围。
-//   可空的字符串字段（source 各项、cid、charName、lastCid、lastError 等）为空时写 null, 读时 null 当作空串。
+//   可空的字符串字段（source 各项、cid、charName、lastCid、lastName、lastError 等）为空时写 null, 读时 null 当作空串。
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -323,6 +324,7 @@ namespace charconfig
         std::string moduleVersion;
         bool        hooked = false;
         std::string lastCid;
+        std::string lastName; // lastCid 那个号的角色名（UTF-8）, 查不到为空
         std::string lastError;
     };
 

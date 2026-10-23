@@ -784,14 +784,23 @@ namespace
         CHECK(!PublishFile(root, "bad/id", hotbarSpec, first.data(), first.size(), source, &seq4, &error));
 
         // 心跳
-        ModuleHeartbeat heartbeat{ "0.9.1", true, "00400012DC10855C", "" };
+        ModuleHeartbeat heartbeat{ "0.9.1", true, "00400012DC10855C", "鱼鱼无敌啦", "" };
         CHECK(WriteHeartbeat(root, 4242, heartbeat, &error));
         const Bytes beat = ReadBytes(root + L"\\modules\\4242.json");
         const std::string beatText(beat.begin(), beat.end());
         CHECK(beatText.find("\"pid\":4242") != std::string::npos);
         CHECK(beatText.find("\"hooked\":true") != std::string::npos);
+        CHECK(beatText.find("\"lastCid\":\"00400012DC10855C\"") != std::string::npos);
+        CHECK(beatText.find("\"lastName\":\"鱼鱼无敌啦\"") != std::string::npos);
         CHECK(beatText.find("\"lastError\":null") != std::string::npos);
         CHECK(beatText.find("\"moduleVersion\":\"0.9.1\"") != std::string::npos);
+
+        // 查不到角色名: lastName 写 null
+        ModuleHeartbeat nameless{ "0.9.1", true, "00400012DC10855C", "", "" };
+        CHECK(WriteHeartbeat(root, 4243, nameless, &error));
+        const Bytes namelessBeat = ReadBytes(root + L"\\modules\\4243.json");
+        const std::string namelessText(namelessBeat.begin(), namelessBeat.end());
+        CHECK(namelessText.find("\"lastName\":null") != std::string::npos);
 
         CHECK(CountTemporaries(root) == 0);
         RemoveTree(root);

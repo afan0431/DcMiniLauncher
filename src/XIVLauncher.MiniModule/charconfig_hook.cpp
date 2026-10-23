@@ -184,6 +184,8 @@ namespace
         g_lastCid = ToUtf8(cidHex);
     }
 
+    std::string CachedName(const std::string& cid, bool noWait);
+
     void Heartbeat(bool noWait = false)
     {
         ModuleHeartbeat heartbeat;
@@ -198,6 +200,9 @@ namespace
             heartbeat.lastCid   = g_lastCid;
             heartbeat.lastError = g_lastError;
         }
+
+        if (!heartbeat.lastCid.empty())
+            heartbeat.lastName = CachedName(heartbeat.lastCid, noWait);
 
         std::string error;
         if (!WriteHeartbeat(g_root, g_pid, heartbeat, &error))
@@ -279,6 +284,7 @@ namespace
         {
             g_names[cid] = name;
             g_nameLookups.erase(it);
+            g_heartbeatDirty.store(true);
             LogF("[charconfig] 角色名 cid=%s → %s", cid.c_str(), name.c_str());
             return;
         }
@@ -938,6 +944,14 @@ std::string CharConfigStatus()
         baselines = g_baselines.size();
     }
 
+    std::string lastCid;
+    {
+        std::lock_guard<std::mutex> lock(g_statusMutex);
+        lastCid = g_lastCid;
+    }
+
+    const std::string lastName = lastCid.empty() ? std::string() : CachedName(lastCid, false);
+
     std::lock_guard<std::mutex> lock(g_statusMutex);
 
     char head[160];
@@ -951,6 +965,7 @@ std::string CharConfigStatus()
     response += "\nconfigError=" + configError;
     response += "\nhookError=" + g_hookError;
     response += "\nlastCid=" + g_lastCid;
+    response += "\nlastName=" + lastName;
     response += "\nlastError=" + g_lastError;
     response += "\nrecent:";
 
