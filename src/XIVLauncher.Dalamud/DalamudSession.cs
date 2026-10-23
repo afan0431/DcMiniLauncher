@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Serilog;
+using XIVLauncher.Common.Game;
 
 namespace XIVLauncher.Dalamud;
 
@@ -77,6 +78,8 @@ public class DalamudSession
     public Process LaunchGame(FileInfo gameExe, string gameArgs, IDictionary<string, string> environment)
     {
         Log.Information("[Dalamud Session] 开始运行, 游戏路径: {0}", gamePath.FullName);
+
+        GameInstanceLimit.Release();
 
         var startInfo = CreateStartInfo();
 
