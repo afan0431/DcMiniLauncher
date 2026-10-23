@@ -533,6 +533,50 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     }
 
     [Fact]
+    public async Task Minion_AttachesFromClientDir_AndRetiresItAfterGameExits()
+    {
+        var request = Request(minion: true) is var plain
+                          ? plain with { MinionCard = plain.MinionCard! with { Profile = "AfanTest", EnsureMods = ["Afan"] } }
+                          : null!;
+        var run = NewRunner().RunAsync(request, reporter, CancellationToken.None);
+
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        Assert.Equal(["prepare:op-intl:AfanTest:Afan"], environment.FakeMinion.ClientDirs.Calls);
+        Assert.Equal(FakeClientDirs.PATH, environment.FakeMinion.AttachedOptions!.InstallPath);
+        Assert.True(environment.FakeMinion.AttachedOptions.TensorCoreEnabled);
+        Assert.Contains("agent:minion:ok", reporter.Entries);
+
+        environment.KillGame();
+        Assert.Equal(CatHostRuntime.EXIT_OK, await run.WaitAsync(Timeout));
+
+        Assert.Equal(["prepare:op-intl:AfanTest:Afan", "retire"], environment.FakeMinion.ClientDirs.Calls);
+        Assert.Equal("exited", reporter.Entries.Last());
+    }
+
+    [Theory]
+    [InlineData(CatCodes.MINION_PROFILE_NOT_FOUND, "本机 Minion 没有配置 EX")]
+    [InlineData(CatCodes.MINION_SETTINGS_UNREADABLE, "Minion 配置文件读不出")]
+    public async Task Minion_ClientDirFailure_ReportsCode_AndDoesNotAttach(string code, string message)
+    {
+        environment.FakeMinion.ClientDirs.Result = CatMinionClientDirPrepared.Fail(code, message);
+        var run = NewRunner().RunAsync(Request(minion: true), reporter, CancellationToken.None);
+
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        Assert.Contains($"agent:minion:{code}", reporter.Entries);
+        Assert.Contains(message, reporter.Messages);
+        Assert.Equal(0, environment.FakeMinion.AttachCount);
+        Assert.Equal([environment.GameProcess!.Id], environment.FakeMinion.Released);
+
+        environment.KillGame();
+        await run.WaitAsync(Timeout);
+
+        // 没组装成就没有要收尾的目录
+        Assert.DoesNotContain("retire", environment.FakeMinion.ClientDirs.Calls);
+    }
+
+    [Fact]
     public async Task MinionCardBusyAtAttachTime_ReportsAlreadyAttached_AndGameKeepsRunning()
     {
         environment.FakeMinion.ReserveError = (CatCodes.ALREADY_ATTACHED, "这张卡已挂在这台电脑的另一个游戏上");
@@ -895,8 +939,9 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         public Task<MinionAttachResult> AttachAsync(CatMinionLaunch minion, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken, MinionAttachOptions? options = null)
         {
             AttachCount++;
-            Attached     = (process.Id, gamePath.FullName, dalamudInjected, accountName);
-            AttachedCard = minion;
+            Attached        = (process.Id, gamePath.FullName, dalamudInjected, accountName);
+            AttachedCard    = minion;
+            AttachedOptions = options;
             return Task.FromResult(AttachResult);
         }
 
@@ -907,6 +952,49 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         public List<int> ReportedStopped { get; } = [];
 
         public void ReportStopped(int gamePid) => ReportedStopped.Add(gamePid);
+
+        public MinionAttachOptions? AttachedOptions { get; private set; }
+
+        public FakeClientDirs ClientDirs { get; } = new();
+
+        public ICatMinionClientDirs CreateClientDirs() => ClientDirs;
+    }
+
+    /// <summary>记下准备与收尾的假客户端目录</summary>
+    private sealed class FakeClientDirs : ICatMinionClientDirs
+    {
+        public const string PATH = @"X:\MINI-clients\fake";
+
+        public CatMinionClientDirPrepared? Result { get; set; }
+
+        public List<string> Calls { get; } = [];
+
+        public string? CurrentPath { get; private set; }
+
+        public Task<CatMinionClientDirPrepared> PrepareAsync(CatMinionLaunch card, string operationId, Process game, DateTimeOffset gameStartedAt, CancellationToken cancellationToken)
+        {
+            lock (Calls)
+                Calls.Add($"prepare:{operationId}:{card.Profile}:{string.Join(",", card.EnsureMods ?? [])}");
+
+            var result = Result ?? new CatMinionClientDirPrepared(PATH, true);
+
+            if (!result.Failed)
+                CurrentPath = result.InstallPath;
+
+            return Task.FromResult(result);
+        }
+
+        public void Adopt(string? clientDir, int gamePid, DateTimeOffset gameStartedAt) =>
+            CurrentPath = clientDir;
+
+        public Task RetireAsync()
+        {
+            lock (Calls)
+                Calls.Add("retire");
+
+            CurrentPath = null;
+            return Task.CompletedTask;
+        }
     }
 
     #endregion

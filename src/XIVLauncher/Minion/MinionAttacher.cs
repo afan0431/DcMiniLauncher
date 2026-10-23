@@ -187,6 +187,18 @@ public static class MinionAttacher
     }
 
     /// <summary>
+    ///     挂载用的目录（主目录或客户端目录）下的 <c>-botpath</c>
+    /// </summary>
+    internal static string BotPathOf(string installPath) =>
+        Path.Combine(installPath, BOT_DIR_NAME);
+
+    /// <summary>
+    ///     挂载用的目录下的 <c>-datpath</c>
+    /// </summary>
+    internal static string DatPathOf(string installPath, string variant) =>
+        Path.Combine(BotPathOf(installPath), MINION_FILES_DIR_NAME, DatNameOf(variant));
+
+    /// <summary>
     ///     自己拉 MinionLauncher（probe-P1 验证过的路径）
     /// </summary>
     private static async Task<MinionAttachResult> SpawnLauncherAsync
@@ -207,8 +219,8 @@ public static class MinionAttacher
         if (ResolveGameExePath(gamePath, gameProcess, minion.Variant) is not { } gameExePath)
             return MinionAttachResult.Failed($"找不到可用的游戏 exe 给 -path 用（游戏目录 {gamePath?.FullName ?? "(未配置)"} 下没找到, 也读不到游戏进程的 exe）");
 
-        var botPath = Path.Combine(installPath, BOT_DIR_NAME);
-        var datPath = Path.Combine(botPath, MINION_FILES_DIR_NAME, DatNameOf(minion.Variant));
+        var botPath = BotPathOf(installPath);
+        var datPath = DatPathOf(installPath, minion.Variant);
 
         if (!File.Exists(datPath))
             return MinionAttachResult.Failed($"找不到 bot 文件 {datPath}");

@@ -100,6 +100,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     /// <summary>本进程守着的游戏的守护记录与守护锁</summary>
     private readonly GameRecordWriter records = new();
 
+    /// <summary>这次上号挂 Minion 用的客户端目录: 首次挂载前组装, 崩溃重开与补挂复用, 游戏最终退出后收尾</summary>
+    private readonly CatMinionClientDirs clientDirs = new();
+
     /// <summary>任务单通道（Cat 上号自动开工）: 挂到本机监听上给 Afan 用; 外壳不支持时为 null</summary>
     private CatJobChannel? jobs;
 
@@ -151,6 +154,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             // 交接途中游戏退出、交接又没成: 当时被挡下的收尾补上（已做过的不会重做）
             CleanupProcess(final, null);
             await WaitAutoEnterEndAsync().ConfigureAwait(false);
+            await RetireClientDirAsync().ConfigureAwait(false);
 
             if (IsCloseRequested)
                 reporter.Exited(lastPid, lastExitCode, CatExitReasons.CLOSED);
@@ -175,6 +179,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
         finally
         {
+            // 兜底: 上面各条退出路径没收尾到的客户端目录（游戏已退出、没交接时才删）
+            await RetireClientDirAsync().ConfigureAwait(false);
             dcTravel?.Dispose();
         }
     }
@@ -219,6 +225,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             // 交接途中游戏退出、交接又没成: 当时被挡下的收尾补上（已做过的不会重做）
             CleanupProcess(final, null);
             await WaitAutoEnterEndAsync().ConfigureAwait(false);
+            await RetireClientDirAsync().ConfigureAwait(false);
 
             if (IsCloseRequested)
                 reporter.Exited(lastPid, lastExitCode, CatExitReasons.CLOSED);
@@ -260,6 +267,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
         finally
         {
+            // 兜底: 上面各条退出路径没收尾到的客户端目录（游戏已退出、没交接时才删）
+            await RetireClientDirAsync().ConfigureAwait(false);
             dcTravel?.Dispose();
         }
     }
@@ -389,6 +398,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         // 受理 adopt 时认领的守护锁: 这个游戏一退出（含崩溃重开换了新进程）就放掉, 不等整个接管流程结束
         records.Hold(process.Id, adoptRequest.GuardClaim);
+
+        // 原守护进程组装的 Minion 客户端目录: 改由本进程负责, 崩溃重开时复用, 游戏最终退出后由本进程收尾
+        clientDirs.Adopt(record.MinionClientDir, process.Id, record.ProcessStartedAt);
 
         context.InGameAgents = (record.Dalamud ? InGameAgents.Dalamud : InGameAgents.None) | (record.MinionFingerprint != null ? InGameAgents.Minion : InGameAgents.None);
         RunningGameRegistry.Register(process, context.InGameAgents, context.DcTravelPort);
@@ -635,6 +647,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                                   Tgt = await EncryptOrNullAsync(oauth?.TGT).ConfigureAwait(false) ?? record.Tgt,
                                   Guid = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false) ?? record.Guid,
                                   DcTravelSession = await EncryptOrNullAsync(session).ConfigureAwait(false),
+                                  MinionClientDir = clientDirs.CurrentPath ?? record.MinionClientDir,
                                   CatJob = jobRecords.CurrentOr(record.CatJob),
                                   UpdatedAt = DateTimeOffset.UtcNow
                               };
@@ -690,6 +703,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         CleanupProcess(process, null);
         await WaitAutoEnterEndAsync().ConfigureAwait(false);
+        await RetireClientDirAsync().ConfigureAwait(false);
 
         var closed = IsCloseRequested;
         reporter.Exited(process.ProcessID, TryGetExitCode(process), closed ? CatExitReasons.CLOSED : CatExitReasons.GUARD_ERROR, null, closed ? null : detail);
@@ -1915,6 +1929,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 Guid                      = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false),
                 MinionFingerprint         = request.CardFingerprint,
                 MinionVariant             = request.Variant,
+                MinionClientDir           = clientDirs.CurrentPath,
                 AutoEnter                 = request.AutoEnter,
                 CharacterName             = request.CharacterName,
                 CharacterHomeWorld        = request.CharacterHomeWorld,
@@ -1952,6 +1967,53 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 };
             }
         );
+
+    /// <summary>
+    ///     组装了客户端目录后写进当前游戏的守护记录, 交接后接管方凭它接着负责这个目录
+    /// </summary>
+    private Task RewriteGameRecordMinionDirAsync(int processId, string? clientDir) =>
+        records.WriteAsync
+        (() =>
+            {
+                if (!records.TryGetRecorded(processId, out var startedAt))
+                    return Task.FromResult<GameRecord?>(null);
+
+                if (GameRecords.ReadMatching(processId, startedAt) is not { } record || record.MinionClientDir == clientDir)
+                    return Task.FromResult<GameRecord?>(null);
+
+                return Task.FromResult<GameRecord?>(record with { MinionClientDir = clientDir, UpdatedAt = DateTimeOffset.UtcNow });
+            }
+        );
+
+    /// <summary>
+    ///     游戏最终退出后收尾客户端目录: 交接了（目录归接管方）或游戏还在跑时不动
+    /// </summary>
+    private async Task RetireClientDirAsync()
+    {
+        if (handingOff || clientDirs.CurrentPath == null)
+            return;
+
+        if (currentProcess is { } process && !HasExited(process.UnderlyingProcess))
+        {
+            Log.Warning("[CatHost] 游戏 {Pid} 还在跑, 先不收尾客户端目录 {Dir}（游戏退出后由下次上号按残留清理）", process.ProcessID, clientDirs.CurrentPath);
+            return;
+        }
+
+        await clientDirs.RetireAsync().ConfigureAwait(false);
+    }
+
+    private static bool HasExited(Process process)
+    {
+        try
+        {
+            return process.HasExited;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[CatHost] 读不到游戏进程是否退出, 按已退出处理");
+            return true;
+        }
+    }
 
     /// <summary>
     ///     游戏退出（或崩溃重开换了新进程）时删掉它的守护记录并放掉守护锁
@@ -2081,11 +2143,31 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         try
         {
+            // 这个游戏自己的客户端目录（崩溃重开、补挂时复用同一个）
+            var process  = launched.UnderlyingProcess;
+            var prepared = await clientDirs.PrepareAsync(request.MinionCard!, request.OperationId, process, SafeProcessStartedAt(process), cancellationToken)
+                                           .ConfigureAwait(false);
+
+            if (prepared.Failed)
+            {
+                Log.Error("[CatHost] 准备 Minion 客户端目录失败, 不挂: {Code} {Error}", prepared.ErrorCode, prepared.ErrorMessage);
+
+                if (!IsCloseRequested && !process.HasExited)
+                    reporter.Agent(CatAgentKinds.MINION, false, prepared.ErrorCode, prepared.ErrorMessage);
+
+                return;
+            }
+
+            if (prepared.InstallPath != null)
+                await RewriteGameRecordMinionDirAsync(process.Id, prepared.InstallPath).ConfigureAwait(false);
+
             // 占用记录里写上号请求带的账号名（外壳认得的那个）: 按备注找到的 WeGame 号, 它与账号库里的账号名不同
             var options = new MinionAttachOptions
             {
-                Queued   = () => reporter.Stage(CatStages.MINION_QUEUED),
-                Dequeued = () => reporter.Stage(CatStages.ATTACHING_MINION)
+                InstallPath       = prepared.InstallPath,
+                TensorCoreEnabled = prepared.TensorCoreEnabled,
+                Queued            = () => reporter.Stage(CatStages.MINION_QUEUED),
+                Dequeued          = () => reporter.Stage(CatStages.ATTACHING_MINION)
             };
             var result = await MinionAttacher.AttachAsync(request.MinionCard!, launched.UnderlyingProcess, gamePath, dalamudInjected, request.AccountName, cancellationToken, options)
                                              .ConfigureAwait(false);

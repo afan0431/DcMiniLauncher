@@ -159,6 +159,23 @@ public sealed class MinionClientDir
     public string LauncherExe => Path.Combine(DirectoryPath, MinionInstall.LAUNCHER_EXE_NAME);
 
     /// <summary>
+    ///     客户端目录里这个插件是否开着: 插件目录下有 <c>module.def</c> 或 <c>.paf</c> 文件（不区分大小写）
+    /// </summary>
+    public bool IsModEnabled(string mod)
+    {
+        var directory = new DirectoryInfo(Path.Combine(BotPath, LUA_MODS_DIR_NAME));
+
+        if (!directory.Exists)
+            return false;
+
+        var plugin = directory.EnumerateDirectories("*", AllEntries).FirstOrDefault(x => Is(x, mod));
+
+        return plugin != null
+               && plugin.EnumerateFiles("*", AllEntries)
+                        .Any(x => Is(x, MODULE_ON) || x.Name.EndsWith(PAF_ON, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
     ///     某个主目录对应的客户端目录根: 同一个盘下的 <c>MINI-clients</c>（硬链接不能跨盘）
     /// </summary>
     public static string RootFor(string mainInstall) =>
@@ -325,6 +342,32 @@ public sealed class MinionClientDir
             }
 
             throw;
+        }
+    }
+
+    /// <summary>
+    ///     起游戏前先看主目录的 Profiler 里有没有这个配置: 有（或 <paramref name="profile" /> 为 null、主目录没有 Profiler 配置文件时不查）返回 null,
+    ///     否则返回与 <see cref="Assemble" /> 相同的 <see cref="MinionClientDirError.SettingsUnreadable" /> / <see cref="MinionClientDirError.ProfileNotFound" /> 异常（不抛出）
+    /// </summary>
+    public static MinionClientDirException? CheckProfile(string mainInstall, string? profile)
+    {
+        if (profile == null)
+            return null;
+
+        var path = Path.Combine(Normalize(mainInstall), BOTS_DIR_NAME, BOT_DIR_NAME, LUA_MODS_DIR_NAME, PROFILER_DIR_NAME, PROFILER_SETTINGS);
+
+        if (!File.Exists(path))
+            return new MinionClientDirException(MinionClientDirError.ProfileNotFound, $"本机 Minion 没有配置 {profile}");
+
+        try
+        {
+            return ProfilerSettings.Load(path).Find(profile) == null
+                       ? new MinionClientDirException(MinionClientDirError.ProfileNotFound, $"本机 Minion 没有配置 {profile}")
+                       : null;
+        }
+        catch (FormatException ex)
+        {
+            return new MinionClientDirException(MinionClientDirError.SettingsUnreadable, "Minion 配置文件读不出", ex);
         }
     }
 

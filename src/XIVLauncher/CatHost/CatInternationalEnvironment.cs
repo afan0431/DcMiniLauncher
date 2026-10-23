@@ -71,6 +71,9 @@ public interface ICatInternationalMinion
 
     /// <summary>游戏退出后告诉 MINIONAPP 这一行停机了（MINIONAPP 没在运行时什么也不做）</summary>
     void ReportStopped(int gamePid);
+
+    /// <summary>给一次上号新建它的 Minion 客户端目录管理（每个启动器实例一个）</summary>
+    ICatMinionClientDirs CreateClientDirs();
 }
 
 /// <summary>
@@ -322,4 +325,7 @@ internal sealed class CatInternationalMinion : ICatInternationalMinion
 
     public void ReportStopped(int gamePid) =>
         MinionAppStatusReporter.ReportStopped(gamePid);
+
+    public ICatMinionClientDirs CreateClientDirs() =>
+        new CatMinionClientDirs();
 }

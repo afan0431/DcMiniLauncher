@@ -311,6 +311,16 @@ public sealed class LauncherSettingsV3 : IAccountSettingsStore
     }
 
     /// <summary>
+    ///     Cat 上号挂 Minion 时是否给每个游戏组装自己的客户端目录（<c>X:\MINI-clients\…</c>）, 默认开。
+    ///     关掉后照旧直接挂主目录, 上号指定的配置不生效; 同机挂载排队照旧
+    /// </summary>
+    public bool MinionClientDirEnabled
+    {
+        get;
+        set => Set(ref field, value);
+    } = true;
+
+    /// <summary>
     ///     Minion 账号密码，明文 —— MinionLauncher 的 <c>-minionpass</c> 只接受明文，
     ///     传 Accounts.json 里加密的 KeyPassword 会注入成功但 bot 不运行。
     ///     只在本机没有 Cat 工作台的卡文件时使用（配置一次）
