@@ -892,7 +892,7 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         public Task<((string Code, string Message)? Error, bool Reserved)> ReserveAsync(CatLaunchRequest request, Process process) =>
             Task.FromResult<((string Code, string Message)?, bool)>(ReserveError == null ? (null, true) : (ReserveError, false));
 
-        public Task<MinionAttachResult> AttachAsync(CatMinionLaunch minion, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken)
+        public Task<MinionAttachResult> AttachAsync(CatMinionLaunch minion, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken, MinionAttachOptions? options = null)
         {
             AttachCount++;
             Attached     = (process.Id, gamePath.FullName, dalamudInjected, accountName);

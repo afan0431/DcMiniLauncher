@@ -94,6 +94,9 @@ public static class CatStages
     /// <summary>挂 Minion</summary>
     public const string ATTACHING_MINION = "attachingMinion";
 
+    /// <summary>挂 Minion 前排队: 本机另有游戏正在挂载 Minion（含 TensorCore 的第二次注入）, 排到后回到 <see cref="ATTACHING_MINION" /></summary>
+    public const string MINION_QUEUED = "minionQueued";
+
     /// <summary>游戏运行中</summary>
     public const string RUNNING = "running";
 

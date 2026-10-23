@@ -2082,7 +2082,12 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         try
         {
             // 占用记录里写上号请求带的账号名（外壳认得的那个）: 按备注找到的 WeGame 号, 它与账号库里的账号名不同
-            var result = await MinionAttacher.AttachAsync(request.MinionCard!, launched.UnderlyingProcess, gamePath, dalamudInjected, request.AccountName, cancellationToken)
+            var options = new MinionAttachOptions
+            {
+                Queued   = () => reporter.Stage(CatStages.MINION_QUEUED),
+                Dequeued = () => reporter.Stage(CatStages.ATTACHING_MINION)
+            };
+            var result = await MinionAttacher.AttachAsync(request.MinionCard!, launched.UnderlyingProcess, gamePath, dalamudInjected, request.AccountName, cancellationToken, options)
                                              .ConfigureAwait(false);
             ok = result.Ok;
 

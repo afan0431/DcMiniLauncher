@@ -565,7 +565,12 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
 
         try
         {
-            var result = await minion.AttachAsync(request.MinionCard, process, gamePath, dalamudInjected, request.AccountName, cancellationToken).ConfigureAwait(false);
+            var options = new MinionAttachOptions
+            {
+                Queued   = () => reporter.Stage(CatStages.MINION_QUEUED),
+                Dequeued = () => reporter.Stage(CatStages.ATTACHING_MINION)
+            };
+            var result = await minion.AttachAsync(request.MinionCard, process, gamePath, dalamudInjected, request.AccountName, cancellationToken, options).ConfigureAwait(false);
             ok = result.Ok;
 
             if (IsCloseRequested)
