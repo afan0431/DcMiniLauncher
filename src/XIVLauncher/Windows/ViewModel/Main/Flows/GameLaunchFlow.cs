@@ -212,6 +212,10 @@ internal sealed class GameLaunchFlow
 
         CatMinionLaunch? attachedMinion = null;
 
+        // 国服游戏一律注入自家模块（所有角色共用一套游戏配置在里面, 是否生效只看本机 machine.json）: 后台等窗口注上, 不等挂 Minion,
+        // 赶在进入角色读配置之前。挂 Minion 的按完整模式（下面的自检照旧）, 其它按只读模式, 游戏的行为与没注入时一样
+        StartModuleInjection(launched, CatModuleInjection.ReadOnlyForLaunch(false, gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion)));
+
         if (gameLaunchContext.InGameAgents.HasFlag(InGameAgents.Minion))
             attachedMinion = await AttachMinionAsync(launched, gamePath, dalamudOk, minionSelection).ConfigureAwait(false);
 
@@ -457,6 +461,33 @@ internal sealed class GameLaunchFlow
             Log.Warning(ex, "[Minion] 读取游戏进程创建时间失败, 用当前时间代替");
             return DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         }
+    }
+
+    /// <summary>
+    ///     后台等游戏窗口出现后注入自家的游戏内模块（已在就不动）。模块文件不在就安静跳过; 没注成只记日志, 绝不影响已经在跑的游戏
+    /// </summary>
+    private void StartModuleInjection(FFXIVProcess launched, bool readOnly)
+    {
+        if (!MiniModuleInjector.ModulePath.Exists)
+            return;
+
+        // 不跟登录流程的取消走: 游戏起来以后取消登录不该影响注入; 游戏退出或等窗口超时就结束
+        var target = new CatProcessModuleTarget(launched.UnderlyingProcess);
+
+        _ = Task.Run
+        (async () =>
+            {
+                try
+                {
+                    if (await CatModuleInjection.InjectWhenReadyAsync(target, readOnly, false, null, CancellationToken.None).ConfigureAwait(false) is { } error)
+                        Log.Warning("[MiniModule] 没有注入游戏内模块: {Error}", error);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "[MiniModule] 注入游戏内模块出错（游戏不受影响）");
+                }
+            }
+        );
     }
 
     /// <summary>

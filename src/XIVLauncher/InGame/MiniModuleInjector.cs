@@ -19,6 +19,9 @@ public static class MiniModuleInjector
     /// <summary>LoadLibraryW 要跑完整个 DllMain, 给足时间; 超时说明目标进程卡住了</summary>
     private const int REMOTE_THREAD_TIMEOUT_MS = 30_000;
 
+    /// <summary>本进程内的注入一个一个做: 同一个游戏被几处同时注入时, 后到的看到模块已在就跳过, 不会写两次模式文件、注两次</summary>
+    private static readonly object InjectSync = new();
+
     /// <summary>
     ///     模块和启动器一起发布, 就在启动器自己的目录下。开发时由
     ///     <c>src\XIVLauncher.MiniModule\build.ps1</c> 直接产到同一个输出目录。
@@ -60,6 +63,12 @@ public static class MiniModuleInjector
     ///     模块已经在了就不再注入, 它的模式也不变
     /// </summary>
     public static string? Inject(Process gameProcess, bool readOnly = false)
+    {
+        lock (InjectSync)
+            return InjectCore(gameProcess, readOnly);
+    }
+
+    private static string? InjectCore(Process gameProcess, bool readOnly)
     {
         var modulePath = ModulePath;
 

@@ -43,6 +43,9 @@ namespace
         g_readOnly = ReadModeFile();
         LogF("=== MiniLauncher 模块 %s 已注入 pid=%lu 模式=%s ===", MINIMODULE_VERSION, GetCurrentProcessId(), g_readOnly ? "只读" : "完整");
 
+        // 共用游戏配置不依赖主线程通道, 也不分模式（是否生效由本机 machine.json 决定）; 先装, 赶在进入角色读配置之前
+        CharConfigInstall();
+
         const bool mainThreadOk = MainThreadInstall();
 
         if (!mainThreadOk)
@@ -65,8 +68,9 @@ namespace
         // 右键菜单的 hook 要在 Tick 之前还原 —— 它安装时借的是主线程通道。
         GameStopKeepAlive();
 
-        const bool menuRestored = ContextMenuUninstall();
-        const bool restored     = MainThreadUninstall() && menuRestored;
+        const bool charConfigRestored = CharConfigUninstall();
+        const bool menuRestored       = ContextMenuUninstall();
+        const bool restored           = MainThreadUninstall() && menuRestored && charConfigRestored;
 
         LogF("=== MiniLauncher 模块退出 (窗口已还原=%d) ===", restored ? 1 : 0);
         LogShutdown();
@@ -84,8 +88,12 @@ bool ModuleReadOnly()
     return g_readOnly;
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
+    // reserved 非空 = 进程正在退出（别的线程已被结束）; 为空 = FreeLibrary, 卸载流程已处理过
+    if (reason == DLL_PROCESS_DETACH && reserved != nullptr)
+        CharConfigProcessExit();
+
     if (reason != DLL_PROCESS_ATTACH)
         return TRUE;
 
