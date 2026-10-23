@@ -84,8 +84,18 @@ public sealed class ProfilerSettings
     /// <summary>
     ///     读文件并解析; 读不懂时抛 <see cref="FormatException" />, 文件不存在时抛对应的 IO 异常
     /// </summary>
-    public static ProfilerSettings Load(string path) =>
-        Parse(File.ReadAllText(path, new UTF8Encoding(false)));
+    public static ProfilerSettings Load(string path)
+    {
+        // 严格按 UTF-8 读: 非 UTF-8 的字节若被替换成 U+FFFD 再写回, 会悄悄毁掉主目录的文件
+        try
+        {
+            return Parse(File.ReadAllText(path, new UTF8Encoding(false, true)));
+        }
+        catch (DecoderFallbackException ex)
+        {
+            throw new FormatException("Settings.lua 不是有效的 UTF-8", ex);
+        }
+    }
 
     /// <summary>
     ///     解析文本; 读不懂时抛 <see cref="FormatException" />

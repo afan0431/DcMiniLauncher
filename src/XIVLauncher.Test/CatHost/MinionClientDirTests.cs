@@ -380,6 +380,42 @@ public sealed class MinionClientDirTests : IDisposable
     }
 
     [Fact]
+    public async Task Retire_ClientSettingsWithoutProfilesTable_DoesNotWipeMainProfiles()
+    {
+        var client = MinionClientDir.Assemble(main, ClientPath("1"), "EX", []).DirectoryPath;
+        File.WriteAllText(Path.Combine(client, @"Bots\FFXIVMinion64\LuaMods\Profiler\Settings.lua"), "return { currentProfile = \"EX\" }");
+
+        var result = await MinionClientDir.RetireAsync(client, main);
+
+        Assert.False(result.ProfilesWrittenBack);
+        Assert.True(result.Deleted);
+        Assert.Equal(["EX", "Main"], ProfilerSettings.Load(Path.Combine(LuaMods, @"Profiler\Settings.lua")).Profiles.Select(p => p.Name));
+    }
+
+    [Fact]
+    public async Task Retire_MainFileNewerThanClientCopy_IsNotOverwritten()
+    {
+        var client = MinionClientDir.Assemble(main, ClientPath("1"), null, []).DirectoryPath;
+        var mods   = Path.Combine(client, @"Bots\FFXIVMinion64\LuaMods");
+
+        var replaced = Path.Combine(mods, @"TensorCore\settings.lua");
+        File.WriteAllText(replaced + ".new", "client old");
+        File.Move(replaced + ".new", replaced, true);
+        File.SetLastWriteTimeUtc(replaced, DateTime.UtcNow.AddMinutes(1));
+
+        // 之后别的客户端写进主目录的更新
+        var mainFile = Path.Combine(LuaMods, @"TensorCore\settings.lua");
+        File.WriteAllText(mainFile, "main newer");
+        File.SetLastWriteTimeUtc(mainFile, DateTime.UtcNow.AddMinutes(5));
+
+        var result = await MinionClientDir.RetireAsync(client, main);
+
+        Assert.Equal(0, result.FilesWrittenBack);
+        Assert.Equal("main newer", File.ReadAllText(mainFile));
+        Assert.False(Directory.Exists(client));
+    }
+
+    [Fact]
     public async Task Retire_AndDelete_RefusePathsOutsideClientsRoot()
     {
         var retire = await Assert.ThrowsAsync<MinionClientDirException>(() => MinionClientDir.RetireAsync(main, main));

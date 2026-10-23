@@ -827,6 +827,13 @@ public sealed class MinionClientDir
 
             try
             {
+                // 主目录那份比客户端的新: 期间别的客户端或人改过, 不拿旧的盖掉它
+                if (File.Exists(target) && File.GetLastWriteTimeUtc(target) > File.GetLastWriteTimeUtc(source))
+                {
+                    warnings.Add($"主目录的 {relative} 比客户端的新, 不写回");
+                    return;
+                }
+
                 File.Copy(source, target, true);
                 copied++;
             }
@@ -903,6 +910,13 @@ public sealed class MinionClientDir
         catch (FormatException ex)
         {
             warnings.Add($"客户端的 Profiler 配置读不出, 不写回: {ex.Message}");
+            return false;
+        }
+
+        // 客户端文件里没有 profiles 表（被写坏或改了结构）: 不当成「删光了所有配置」写回
+        if (!edited.HasProfilesTable)
+        {
+            warnings.Add("客户端的 Profiler 配置里没有 profiles 表, 不写回");
             return false;
         }
 

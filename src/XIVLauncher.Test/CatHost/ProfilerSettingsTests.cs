@@ -162,6 +162,22 @@ public sealed class ProfilerSettingsTests
     }
 
     [Fact]
+    public void Load_InvalidUtf8_Throws()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "cat-profiler-" + Guid.NewGuid().ToString("N") + ".lua");
+
+        try
+        {
+            File.WriteAllBytes(path, [.. "return { currentProfile = \"A".Select(c => (byte)c), 0xB0, 0xA1, (byte)'"', (byte)' ', (byte)'}']);
+            Assert.Throws<FormatException>(() => ProfilerSettings.Load(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void Merge_NoClientChange_ReturnsNull()
     {
         IReadOnlyList<ProfilerProfile> baseline = [new("Main", ["a"])];
