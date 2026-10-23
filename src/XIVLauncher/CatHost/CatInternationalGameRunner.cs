@@ -36,6 +36,7 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
     private bool                      closeRequested;
     private TimeSpan                  closeTimeout = TimeSpan.FromSeconds(CatProtocol.DEFAULT_CLOSE_TIMEOUT_SECONDS);
     private int                       cleaned;
+    private ICatMinionClientDirs?     clientDirs;
 
     /// <summary>等 Dalamud.dll 出现在游戏进程里的上限</summary>
     public TimeSpan DalamudInjectTimeout { get; init; } = TimeSpan.FromMinutes(1);
@@ -77,6 +78,7 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
 
             Cleanup(process);
+            await RetireClientDirAsync().ConfigureAwait(false);
             reporter.Exited(process.Id, TryGetExitCode(process), IsCloseRequested ? CatExitReasons.CLOSED : null);
 
             return CatHostRuntime.EXIT_OK;
@@ -101,6 +103,8 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
         }
         finally
         {
+            // 兜底: 上面各条退出路径没收尾到的客户端目录（游戏已退出时才删）
+            await RetireClientDirAsync().ConfigureAwait(false);
             loginClient?.Dispose();
         }
     }
@@ -481,10 +485,41 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
         }
 
         Cleanup(process);
+        await RetireClientDirAsync().ConfigureAwait(false);
 
         var closed = IsCloseRequested;
         reporter.Exited(process.Id, TryGetExitCode(process), closed ? CatExitReasons.CLOSED : CatExitReasons.GUARD_ERROR, null, closed ? null : detail);
         return CatLaunchHost.EXIT_GUARD_ERROR;
+    }
+
+    /// <summary>
+    ///     游戏退出后收尾客户端目录; 游戏还在跑时不动
+    /// </summary>
+    private async Task RetireClientDirAsync()
+    {
+        if (clientDirs?.CurrentPath == null)
+            return;
+
+        if (currentProcess is { } process && !HasExited(process))
+        {
+            Log.Warning("[CatHost] 国际服游戏 {Pid} 还在跑, 先不收尾客户端目录 {Dir}（游戏退出后由下次上号按残留清理）", process.Id, clientDirs.CurrentPath);
+            return;
+        }
+
+        await clientDirs.RetireAsync().ConfigureAwait(false);
+    }
+
+    private static bool HasExited(Process process)
+    {
+        try
+        {
+            return process.HasExited;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[CatHost] 读不到国际服游戏进程是否退出, 按已退出处理");
+            return true;
+        }
     }
 
     private void Cleanup(Process process)
@@ -565,7 +600,28 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
 
         try
         {
-            var result = await minion.AttachAsync(request.MinionCard, process, gamePath, dalamudInjected, request.AccountName, cancellationToken).ConfigureAwait(false);
+            // 这个游戏自己的客户端目录
+            clientDirs ??= minion.CreateClientDirs();
+            var prepared = await clientDirs.PrepareAsync(request.MinionCard, request.OperationId, process, SafeProcessStartedAt(process), cancellationToken).ConfigureAwait(false);
+
+            if (prepared.Failed)
+            {
+                Log.Error("[CatHost] 准备 Minion 客户端目录失败, 不挂: {Code} {Error}", prepared.ErrorCode, prepared.ErrorMessage);
+
+                if (!IsCloseRequested)
+                    reporter.Agent(CatAgentKinds.MINION, false, prepared.ErrorCode, prepared.ErrorMessage);
+
+                return;
+            }
+
+            var options = new MinionAttachOptions
+            {
+                InstallPath       = prepared.InstallPath,
+                TensorCoreEnabled = prepared.TensorCoreEnabled,
+                Queued            = () => reporter.Stage(CatStages.MINION_QUEUED),
+                Dequeued          = () => reporter.Stage(CatStages.ATTACHING_MINION)
+            };
+            var result = await minion.AttachAsync(request.MinionCard, process, gamePath, dalamudInjected, request.AccountName, cancellationToken, options).ConfigureAwait(false);
             ok = result.Ok;
 
             if (IsCloseRequested)

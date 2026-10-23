@@ -60,8 +60,8 @@ public interface ICatInternationalMinion
     /// <summary>加跨进程锁检查这张卡没挂在本机别的游戏上, 并为这个游戏写预占记录</summary>
     Task<((string Code, string Message)? Error, bool Reserved)> ReserveAsync(CatLaunchRequest request, Process process);
 
-    /// <summary>挂载（国际服）</summary>
-    Task<MinionAttachResult> AttachAsync(CatMinionLaunch minion, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken);
+    /// <summary>挂载（国际服）; options 带排队回调等, 见 <see cref="MinionAttachOptions" /></summary>
+    Task<MinionAttachResult> AttachAsync(CatMinionLaunch minion, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken, MinionAttachOptions? options = null);
 
     /// <summary>撤掉预占</summary>
     void ReleaseReservation(int gamePid);
@@ -71,6 +71,9 @@ public interface ICatInternationalMinion
 
     /// <summary>游戏退出后告诉 MINIONAPP 这一行停机了（MINIONAPP 没在运行时什么也不做）</summary>
     void ReportStopped(int gamePid);
+
+    /// <summary>给一次上号新建它的 Minion 客户端目录管理（每个启动器实例一个）</summary>
+    ICatMinionClientDirs CreateClientDirs();
 }
 
 /// <summary>
@@ -311,8 +314,8 @@ internal sealed class CatInternationalMinion : ICatInternationalMinion
     public Task<((string Code, string Message)? Error, bool Reserved)> ReserveAsync(CatLaunchRequest request, Process process) =>
         CatMinionReservations.ReserveAsync(request.MinionCard, process, request.AccountName, CatInternationalGameRunner.SafeProcessStartedAt);
 
-    public Task<MinionAttachResult> AttachAsync(CatMinionLaunch minion, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken) =>
-        MinionAttacher.AttachAsync(minion, process, gamePath, dalamudInjected, accountName, cancellationToken);
+    public Task<MinionAttachResult> AttachAsync(CatMinionLaunch minion, Process process, DirectoryInfo gamePath, bool dalamudInjected, string accountName, CancellationToken cancellationToken, MinionAttachOptions? options = null) =>
+        MinionAttacher.AttachAsync(minion, process, gamePath, dalamudInjected, accountName, cancellationToken, options);
 
     public void ReleaseReservation(int gamePid) =>
         MinionOccupancy.Delete(gamePid);
@@ -322,4 +325,7 @@ internal sealed class CatInternationalMinion : ICatInternationalMinion
 
     public void ReportStopped(int gamePid) =>
         MinionAppStatusReporter.ReportStopped(gamePid);
+
+    public ICatMinionClientDirs CreateClientDirs() =>
+        new CatMinionClientDirs();
 }
