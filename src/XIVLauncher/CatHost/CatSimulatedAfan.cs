@@ -9,7 +9,8 @@ namespace XIVLauncher.CatHost;
 ///     模拟模式里的游戏内 Afan（供 Cat 不开游戏联调上号自动开工）: 每一步按当前任务单推进一次, 回报经
 ///     <see cref="CatJobChannel.PostProgress" />（与真 Afan 的 <c>POST /cat/progress</c> 同一条路, 一样校验、去重、发 game.jobProgress）,
 ///     职业等级经 <see cref="CatJobChannel.ReportLevels" />（有变化才发 game.levels）, 是否在副本中经 <see cref="CatDutyTracker" /> 与
-///     <see cref="CatJobChannel.ReportDuty" />（有变化才发 game.duty, 读到过值之后接连两步读不到发"未知"; 真实启动时这两样由小模块读, 模拟里一起在这里产生）。
+///     <see cref="CatJobChannel.ReportDuty" />（有变化才发 game.duty, 读到过值之后接连两步读不到发"未知"; 真实启动时这两样由小模块读, 模拟里一起在这里产生）,
+///     进世界后发一份最小的角色快照经 <see cref="CatJobChannel.PostSnapshot" />（与真 Afan 的 <c>POST /cat/snapshot</c> 同一条路, 发 game.snapshot）。
 ///     规则见 <see cref="CatSimulatedGameRunner" />。
 /// </summary>
 internal sealed class CatSimulatedAfan
@@ -39,6 +40,9 @@ internal sealed class CatSimulatedAfan
     /// <summary>回报里的 afan 版本号</summary>
     public const string VERSION = "sim";
 
+    /// <summary>模拟快照 gear 分区的平均品级与各件品级</summary>
+    public const int SAMPLE_ITEM_LEVEL = 710;
+
     /// <summary>模拟的"一把"（在副本中）有几步; 两把之间隔一步不在副本中</summary>
     public const int DUTY_ROUND_STEPS = 2;
 
@@ -63,6 +67,10 @@ internal sealed class CatSimulatedAfan
 
     /// <summary>上一条回报的 seq; 与真 Afan 一样以"加载"时的 Unix 毫秒为起点（13 位, 超出 int32）, 之后逐条加 1</summary>
     private long      seq = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+    /// <summary>上一份快照的 seq; 起点同回报, 与回报的 seq 各自递增</summary>
+    private long      snapshotSeq = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    private bool      snapshotSent;
     private long?     lastRevision;
     private bool      characterChecked;
     private bool      startShotsTaken;
@@ -141,7 +149,8 @@ internal sealed class CatSimulatedAfan
     }
 
     /// <summary>
-    ///     推进一步: 按任务单推进并在有变化（或到了心跳时间）时回报一次, 再按推进后的进度报等级与是否在副本中
+    ///     推进一步: 按任务单推进并在有变化（或到了心跳时间）时回报一次, 再按推进后的进度报等级与是否在副本中;
+    ///     第一次读到角色时发一份快照（没被收下的下一步再发）
     /// </summary>
     internal void Tick(DateTime nowUtc)
     {
@@ -171,8 +180,65 @@ internal sealed class CatSimulatedAfan
 
         // 模拟里没有服务器 Id: 原始服务器 Id 取任务单里的（没有为 0）
         var homeWorldId = (job?.Character as JsonObject)?["homeWorldId"] is JsonValue id && id.TryGetValue(out int value) ? value : 0;
-        jobs.ReportLevels(pid, new CatLevelsCharacter(character.Name, character.ContentId, homeWorldId), Levels(job));
+        var levels      = Levels(job);
+        jobs.ReportLevels(pid, new CatLevelsCharacter(character.Name, character.ContentId, homeWorldId), levels);
         duty.Read(AlwaysInDuty || inRound, nowUtc);
+
+        if (!snapshotSent)
+            SendSnapshot(homeWorldId, levels, nowUtc);
+    }
+
+    /// <summary>
+    ///     发一份 kind 为 start 的最小快照: levels（与 game.levels 同一份数组）、gear（骑士两件）、story（7.0 主线完成、未追上）三个分区,
+    ///     原始服务器 Id 为 0 时角色里不带; 收下（200）后这个游戏进程里不再发
+    /// </summary>
+    private void SendSnapshot(int homeWorldId, int[] levels, DateTime nowUtc)
+    {
+        var number  = ++snapshotSeq;
+        var subject = new JsonObject { ["name"] = character.Name, ["contentId"] = character.ContentId };
+
+        if (homeWorldId > 0)
+            subject["homeWorldId"] = homeWorldId;
+
+        var snapshot = new JsonObject
+        {
+            ["schema"]        = CatJobChannel.SNAPSHOT_SCHEMA,
+            ["snapshotId"]    = $"{pid}-{character.ContentId}-{number}",
+            ["pid"]           = pid,
+            ["seq"]           = number,
+            ["kind"]          = "start",
+            ["capturedAt"]    = CatProtocol.FormatTimestamp(nowUtc),
+            ["afan"]          = VERSION,
+            ["schemaVersion"] = 1,
+            ["character"]     = subject,
+            ["sections"] = new JsonObject
+            {
+                ["levels"] = new JsonArray(levels.Select(x => (JsonNode?)x).ToArray()),
+                ["gear"] = new JsonObject
+                {
+                    ["itemLevel"]  = SAMPLE_ITEM_LEVEL,
+                    ["classJobId"] = 19,
+                    ["slots"] = new JsonArray
+                    {
+                        new JsonObject { ["slot"] = "mainHand", ["itemId"] = 44000, ["itemLevel"] = SAMPLE_ITEM_LEVEL },
+                        new JsonObject { ["slot"] = "head", ["itemId"] = 44001, ["itemLevel"] = SAMPLE_ITEM_LEVEL }
+                    }
+                },
+                ["story"] = new JsonObject
+                {
+                    ["msqExpansion"] = "7.0",
+                    ["msqCaughtUp"]  = false,
+                    ["expansions"]   = new JsonArray { new JsonObject { ["version"] = "7.0", ["flyingZones"] = 2, ["zones"] = 6 } }
+                }
+            }
+        };
+
+        var response = jobs.PostSnapshot(snapshot.ToJsonString());
+
+        if (response.StatusCode == 200)
+            snapshotSent = true;
+        else
+            Log.Warning("[CatSimAfan] 模拟快照没有被接受: {Status} {Body}", response.StatusCode, response.Json);
     }
 
     /// <summary>

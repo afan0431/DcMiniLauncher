@@ -23,7 +23,7 @@ public interface ICatRpcHandler
 /// <summary>
 ///     dml-cat/1 命名管道服务端: 一行一帧的 JSON-RPC 2.0, 第一帧必须是带正确令牌的 hello;
 ///     同一时刻只有一个连接, 断开后可用同一令牌重连; 没有连接时事件先缓存, 重连握手后补发。
-///     缓存满时先丢最旧的 launcher.log, 再丢上号自动开工的进度回报与等级读数（等级只留最新一条）, 最后才丢最旧的其它事件。
+///     缓存满时先丢最旧的 launcher.log, 再丢上号自动开工的进度回报、等级读数与角色快照（等级只留最新一条, 快照每个游戏只留最新一份）, 最后才丢最旧的其它事件。
 /// </summary>
 public sealed class CatRpcServer : IDisposable
 {
@@ -477,6 +477,22 @@ public sealed class CatRpcServer : IDisposable
             }
         }
 
+        // 角色快照每份都是整份: 同一个游戏只留最新一份
+        if (method == CatJobChannel.SNAPSHOT_EVENT)
+        {
+            var pid = SnapshotPidOf(frame);
+
+            for (var node = bufferedEvents.First; node != null;)
+            {
+                var next = node.Next;
+
+                if (node.Value.Method == method && SnapshotPidOf(node.Value.Frame) == pid)
+                    bufferedEvents.Remove(node);
+
+                node = next;
+            }
+        }
+
         bufferedEvents.AddLast((method, frame));
 
         while (bufferedEvents.Count > MAX_BUFFERED_EVENTS)
@@ -500,17 +516,38 @@ public sealed class CatRpcServer : IDisposable
     }
 
     /// <summary>
-    ///     缓存满时先丢谁（小的先丢, 同级丢最旧的）: 日志 → 不带截图的进度回报 → 等级读数与副本状态 → 带截图的进度回报（丢了截图就传不上去）→ 其它（阶段、起停、退出等）
+    ///     缓存满时先丢谁（小的先丢, 同级丢最旧的）: 日志 → 不带截图的进度回报 → 等级读数、副本状态与角色快照 → 带截图的进度回报（丢了截图就传不上去）→ 其它（阶段、起停、退出等）
     /// </summary>
     private static int EvictionRank(string method, byte[] frame) =>
         method switch
         {
-            LOG_EVENT_METHOD                                                     => 0,
-            CatJobChannel.PROGRESS_EVENT when frame.AsSpan().IndexOf("\"shots\""u8) < 0 => 1,
-            CatJobChannel.LEVELS_EVENT or CatJobChannel.DUTY_EVENT               => 2,
-            CatJobChannel.PROGRESS_EVENT                                         => 3,
-            _                                                                    => 4
+            LOG_EVENT_METHOD                                                                       => 0,
+            CatJobChannel.PROGRESS_EVENT when frame.AsSpan().IndexOf("\"shots\""u8) < 0            => 1,
+            CatJobChannel.LEVELS_EVENT or CatJobChannel.DUTY_EVENT or CatJobChannel.SNAPSHOT_EVENT => 2,
+            CatJobChannel.PROGRESS_EVENT                                                           => 3,
+            _                                                                                      => 4
         };
+
+    /// <summary>缓存的 game.snapshot 帧里的 params.pid; 读不出为 null</summary>
+    private static int? SnapshotPidOf(byte[] frame)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(frame);
+
+            return document.RootElement.TryGetProperty("params", out var parameters) &&
+                   parameters.ValueKind == JsonValueKind.Object &&
+                   parameters.TryGetProperty("pid", out var pid) &&
+                   pid.ValueKind == JsonValueKind.Number &&
+                   pid.TryGetInt32(out var value)
+                       ? value
+                       : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
 
     private void ResetPipeConnection()
     {
