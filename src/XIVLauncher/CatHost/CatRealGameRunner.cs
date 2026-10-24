@@ -94,6 +94,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     private readonly List<Task>                               autoEnterTasks         = [];
     private volatile CatAutoEnter?                            autoEnter;
 
+    /// <summary>接管来的那个游戏的进程号（崩溃重开起的新游戏不算接管来的）; 没接管为 0</summary>
+    private int adoptedPid;
+
     /// <summary>等自动进入角色的后台任务收尾的上限（它们在游戏退出时已被取消, 这里只是不让事件落在 game.exited 后面）</summary>
     private static readonly TimeSpan AutoEnterShutdownTimeout = TimeSpan.FromSeconds(5);
 
@@ -371,6 +374,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         var launched = new FFXIVProcess(process);
         bool closeNow;
 
+        adoptedPid = process.Id;
+
         lock (closeLock)
         {
             currentProcess = launched;
@@ -436,7 +441,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             return launched;
         }
 
-        // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色并读职业等级（编排早就做完了, 不再重做）; 其它游戏只读职业等级
+        // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色并读职业等级（编排早就做完了, 不再重做）; 其它游戏只读职业等级。
+        // 两条路都先确保游戏里有模块（没有就补注入, 受环境变量开关控制）
         if (!process.HasExited)
         {
             if (record.AutoEnter)
@@ -474,8 +480,44 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     }
 
     /// <summary>
-    ///     不自动进入角色的游戏: 后台按只读模式注入游戏内模块（不装标题守卫和选角右键菜单, 游戏的行为与没注入时一样; 带 Minion 的已按完整模式注过就照旧）,
-    ///     之后每隔一段时间看一次当前角色、读一次全部职业等级（不挡崩溃守护, 游戏进程收尾时取消）。
+    ///     后台等游戏窗口出现后注入游戏内模块（已在就不动; 模块文件不在就跳过）; 只注入, 不连管道。没注成只记日志, 游戏不受影响
+    /// </summary>
+    private void StartModuleInjection(FFXIVProcess launched, bool readOnly, bool adopted, string step, CancellationToken token)
+    {
+        if (!MiniModuleInjector.ModulePath.Exists)
+            return;
+
+        var target = new CatProcessModuleTarget(launched.UnderlyingProcess);
+
+        lock (cleanupLock)
+        {
+            autoEnterTasks.Add
+            (
+                Task.Run
+                (async () =>
+                    {
+                        try
+                        {
+                            if (await CatModuleInjection.InjectWhenReadyAsync(target, readOnly, adopted, null, token).ConfigureAwait(false) is { } error)
+                                Log.Warning("[CatHost] {Step}没有注入游戏内模块: {Error}", step, error);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // 游戏退出或收到关闭请求
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, "[CatHost] {Step}注入游戏内模块出错（游戏不受影响）", step);
+                        }
+                    }
+                )
+            );
+        }
+    }
+
+    /// <summary>
+    ///     不自动进入角色的游戏: 后台注入游戏内模块（不挂 Minion 的与接管来的按只读模式: 不装标题守卫和选角右键菜单, 游戏的行为与没注入时一样;
+    ///     模块已经在了就照旧）, 之后每隔一段时间看一次当前角色、读一次全部职业等级（不挡崩溃守护, 游戏进程收尾时取消）。
     ///     adopted = 接管来的游戏: 补注入受环境变量开关控制, 多个游戏错开注
     /// </summary>
     private void StartLevelWatch(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken token, bool adopted = false)
@@ -485,7 +527,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         var game = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea)
         {
             AdoptedGame    = adopted,
-            ReadOnlyModule = true
+            ReadOnlyModule = adopted ? CatModuleInjection.ReadOnlyForAdopt(false) : CatModuleInjection.ReadOnlyForLaunch(false, request.Minion)
         };
         var watch        = new CatLevelWatch(game, reporter);
         var watchToken   = cancellation.Token;
@@ -521,14 +563,18 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     }
 
     /// <summary>
-    ///     只看当前角色、不做编排（接管来的游戏已经进过游戏了）。
+    ///     只看当前角色、不做编排（接管来的游戏已经进过游戏了）。游戏里没有模块（原守护进程没来得及注）时先按完整模式补注入, 受环境变量开关控制。
     ///     minion = 原来那次上号要挂 Minion: 原守护进程在角色进世界之前就没了时还没挂上, 进了世界补挂（已挂着就不动）
     /// </summary>
     private void StartObserve(FFXIVProcess launched, ICatLaunchReporter reporter, bool minion, CancellationToken token)
     {
         var process      = launched.UnderlyingProcess;
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-        var game         = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea);
+        var game = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea)
+        {
+            AdoptedGame    = true,
+            ReadOnlyModule = CatModuleInjection.ReadOnlyForAdopt(true)
+        };
         var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, null));
         var observeToken = cancellation.Token;
 
@@ -544,6 +590,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                     {
                         try
                         {
+                            if (await game.AttachAsync(observeToken).ConfigureAwait(false) is { } attachError)
+                                Log.Warning("[CatHost] 接管来的游戏里没有游戏内模块: {Error}", attachError);
+
                             var observe = flow.ObserveAsync(observeToken);
 
                             if (minion)
@@ -728,6 +777,18 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             if (dalamud)
                 await InjectDalamudIntoRunningAsync(process, reporter, cancellationToken).ConfigureAwait(false);
+
+            // 游戏里没有模块就在后台补注入（已在就不动）; 接管来的游戏按接管的规则, 其它按起游戏时的规则
+            var adopted = process.ProcessID == adoptedPid;
+
+            StartModuleInjection
+            (
+                process,
+                adopted ? CatModuleInjection.ReadOnlyForAdopt(request.AutoEnter) : CatModuleInjection.ReadOnlyForLaunch(request.AutoEnter, request.Minion),
+                adopted,
+                "补注入",
+                closeCts.Token
+            );
 
             if (minion)
             {
@@ -1591,6 +1652,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             // 不自动进入的照旧起游戏后就挂: 人自己点开始游戏, bot 在标题界面加载完之前点不动
             if (request.Minion && !request.AutoEnter)
             {
+                // 挂 Minion 可能排队等很久, 人可能在这期间进了角色: 模块先在后台等窗口注上（完整模式）, 赶在进入角色读配置之前。
+                // 其它游戏的注入本来就不等别的事: 自动进入角色的由编排一开始注入, 其余由读职业等级的后台任务注入
+                StartModuleInjection(launched, CatModuleInjection.ReadOnlyForLaunch(request.AutoEnter, request.Minion), false, "挂 Minion 前", startToken);
+
                 await AttachMinionAsync(launched, dalamudOk, reporter, startToken).ConfigureAwait(false);
 
                 if (MiniModuleInjector.ModulePath.Exists && !IsCloseRequested)

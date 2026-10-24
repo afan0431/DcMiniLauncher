@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using Serilog;
-using XIVLauncher.Common.Util;
 using XIVLauncher.DCTravel;
 using XIVLauncher.InGame;
 using XIVLauncher.Login.Models;
@@ -14,9 +13,6 @@ namespace XIVLauncher.CatHost;
 /// </summary>
 internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
 {
-    /// <summary>等游戏窗口出现的上限（模块要挂在窗口线程上, 窗口出现前注入会装不上主线程通道）</summary>
-    private static readonly TimeSpan WindowTimeout = TimeSpan.FromMinutes(3);
-
     private const int PIPE_CONNECT_TIMEOUT_MS = 10_000;
 
     private readonly Process                   process;
@@ -91,42 +87,8 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
     }
 
     /// <inheritdoc />
-    public async Task<string?> AttachAsync(CancellationToken cancellationToken)
-    {
-        var deadline = clock.Elapsed + WindowTimeout;
-
-        while (true)
-        {
-            if (HasExited)
-                return "游戏进程已经退出";
-
-            process.Refresh();
-
-            if (process.MainWindowHandle != IntPtr.Zero)
-                break;
-
-            if (clock.Elapsed > deadline)
-                return $"等了 {WindowTimeout.TotalSeconds:F0} 秒游戏窗口没有出现";
-
-            await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken).ConfigureAwait(false);
-        }
-
-        if (!AdoptedGame || MiniModuleInjector.IsInjected(process))
-            return await Task.Run(() => MiniModuleInjector.Inject(process, ReadOnlyModule), cancellationToken).ConfigureAwait(false);
-
-        if (!CatModuleInjection.InjectOnAdopt)
-            return $"接管来的游戏里没有游戏内模块, 按环境变量 {CatModuleInjection.ADOPT_INJECT_VARIABLE} 的设置不补注入";
-
-        // 拿不到锁（超时、打不开）时不加锁照常注
-        using var injectGate = await CrossProcessMutex.TryAcquireAsync(CatModuleInjection.ADOPT_INJECT_MUTEX, CatModuleInjection.AdoptInjectWait).ConfigureAwait(false);
-
-        var error = await Task.Run(() => MiniModuleInjector.Inject(process, ReadOnlyModule), cancellationToken).ConfigureAwait(false);
-
-        if (injectGate != null)
-            await Task.Delay(CatModuleInjection.AdoptInjectSpacing, cancellationToken).ConfigureAwait(false);
-
-        return error;
-    }
+    public Task<string?> AttachAsync(CancellationToken cancellationToken) =>
+        CatModuleInjection.InjectWhenReadyAsync(new CatProcessModuleTarget(process), ReadOnlyModule, AdoptedGame, null, cancellationToken);
 
     /// <inheritdoc />
     public async Task<string> SendAsync(string command, CancellationToken cancellationToken)

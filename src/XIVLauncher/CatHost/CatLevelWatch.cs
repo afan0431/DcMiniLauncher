@@ -270,30 +270,6 @@ internal sealed class CatDutyReader
 }
 
 /// <summary>
-///     游戏内模块的注入策略
-/// </summary>
-public static class CatModuleInjection
-{
-    /// <summary>
-    ///     环境变量: 设为 0 / false / off 时, 接管来的游戏里没有模块就不补注入（读不到等级和当前角色, 其它照常）。不设 = 补注入
-    /// </summary>
-    public const string ADOPT_INJECT_VARIABLE = "CAT_DML_ADOPT_INJECT";
-
-    /// <summary>接管时补注入用的跨进程锁: 多个游戏同时被接管时一个一个注</summary>
-    public const string ADOPT_INJECT_MUTEX = @"Local\DcMiniLauncher-AdoptInject";
-
-    /// <summary>接管时补注入完一个游戏后, 至少隔这么久才注下一个</summary>
-    public static readonly TimeSpan AdoptInjectSpacing = TimeSpan.FromSeconds(10);
-
-    /// <summary>等别的进程补注入完的上限</summary>
-    public static readonly TimeSpan AdoptInjectWait = TimeSpan.FromMinutes(10);
-
-    /// <summary>接管来的游戏要不要补注入（每次现读环境变量）</summary>
-    public static bool InjectOnAdopt =>
-        Environment.GetEnvironmentVariable(ADOPT_INJECT_VARIABLE)?.Trim().ToLowerInvariant() is not ("0" or "false" or "off");
-}
-
-/// <summary>
 ///     不自动进入角色的盛趣 / WeGame 游戏（含接管来的）: 等游戏窗口、注入游戏内模块（已在就跳过; 失败隔
 ///     <see cref="CatAutoEnterTimings.AttachRetryInterval" /> 再试, 最多 <see cref="CatAutoEnterTimings.AttachAttempts" /> 次）, 之后每隔
 ///     <see cref="CatAutoEnterTimings.ObserveInterval" /> 先看当前角色（WHOAMI, 角色变了报 game.character）再读全部职业等级与是否在副本中。

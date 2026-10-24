@@ -64,27 +64,47 @@ std::string LogFilePath()
     return g_path;
 }
 
+namespace
+{
+    void WriteLine(bool wait, const char* format, va_list args)
+    {
+        char body[1024];
+        _vsnprintf_s(body, sizeof(body), _TRUNCATE, format, args);
+
+        char line[1280];
+        const int length = _snprintf_s(line, sizeof(line), _TRUNCATE, "[%s][tid=%lu] %s\r\n",
+                                       TimeStamp().c_str(), GetCurrentThreadId(), body);
+        if (length <= 0)
+            return;
+
+        std::unique_lock<std::mutex> lock(g_mutex, std::defer_lock);
+
+        if (wait)
+            lock.lock();
+        else if (!lock.try_lock())
+            return;
+
+        if (g_file == INVALID_HANDLE_VALUE)
+            return;
+
+        DWORD written = 0;
+        WriteFile(g_file, line, static_cast<DWORD>(length), &written, nullptr);
+        FlushFileBuffers(g_file);
+    }
+}
+
 void LogF(const char* format, ...)
 {
-    char body[1024];
-
     va_list args;
     va_start(args, format);
-    _vsnprintf_s(body, sizeof(body), _TRUNCATE, format, args);
+    WriteLine(true, format, args);
     va_end(args);
+}
 
-    char line[1280];
-    const int length = _snprintf_s(line, sizeof(line), _TRUNCATE, "[%s][tid=%lu] %s\r\n",
-                                   TimeStamp().c_str(), GetCurrentThreadId(), body);
-    if (length <= 0)
-        return;
-
-    std::lock_guard<std::mutex> lock(g_mutex);
-
-    if (g_file == INVALID_HANDLE_VALUE)
-        return;
-
-    DWORD written = 0;
-    WriteFile(g_file, line, static_cast<DWORD>(length), &written, nullptr);
-    FlushFileBuffers(g_file);
+void LogFNoWait(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    WriteLine(false, format, args);
+    va_end(args);
 }
