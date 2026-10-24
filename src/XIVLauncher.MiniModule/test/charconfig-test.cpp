@@ -249,6 +249,16 @@ namespace
 
     void SetHeight(Record& record, uint16_t height) { memcpy(record.data() + 0x16, &height, 2); }
 
+    // 随内容伸缩高度的窗口的标记（记录 0x19..0x1B = 03 00 FF）
+    Record AutoHeightRecord(uint32_t keyBigEndian, float x, float y, uint16_t width, uint16_t height)
+    {
+        Record record = MakeRecord(keyBigEndian, x, y, width, height);
+        record[0x19] = 0x03;
+        record[0x1A] = 0x00;
+        record[0x1B] = 0xFF;
+        return record;
+    }
+
     Bytes Filled(size_t size, uint8_t seed)
     {
         Bytes bytes(size);
@@ -562,6 +572,56 @@ namespace
             bool hasKey = false;
             for (const auto& key : keys) hasKey = hasKey || key == "55555555";
             CHECK(hasKey);
+        }
+
+        // 带自动伸缩标记的窗口只变高不算改动, 变宽算
+        {
+            AddonFixture before;
+            before.defaults.push_back(AutoHeightRecord(0x5fe7cb42, 13.0f, 43.0f, 376, 330));
+            const Bytes a = before.Build();
+
+            AddonFixture taller = before;
+            SetHeight(taller.defaults.back(), 320);
+            const Bytes b = taller.Build();
+            CHECK(AddonComparable(a.data(), a.size()) == AddonComparable(b.data(), b.size()));
+
+            AddonFixture wider = before;
+            wider.defaults.back() = AutoHeightRecord(0x5fe7cb42, 13.0f, 43.0f, 380, 330);
+            const Bytes c = wider.Build();
+            CHECK(AddonComparable(a.data(), a.size()) != AddonComparable(c.data(), c.size()));
+        }
+
+        // 写回里窗口被重置到正中默认位置: 不算改动; 挪到别处、少了窗口算改动
+        {
+            AddonFixture before;
+            before.defaults.push_back(MakeRecord(0xe5b1d2b5, 42.0f, 37.0f, 232, 354));
+            const Bytes a = before.Build();
+
+            AddonFixture reset = before;
+            reset.defaults.back() = MakeRecord(0xe5b1d2b5, 50.0f, 50.0f, 144, 152);
+            const Bytes b = reset.Build();
+            CHECK(AddonComparable(a.data(), a.size()) != AddonComparable(b.data(), b.size()));
+            CHECK(AddonSameIgnoringResets(a.data(), a.size(), b.data(), b.size()));
+
+            AddonFixture moved = before;
+            moved.defaults.back() = MakeRecord(0xe5b1d2b5, 50.0f, 40.0f, 144, 152);
+            const Bytes c = moved.Build();
+            CHECK(!AddonSameIgnoringResets(a.data(), a.size(), c.data(), c.size()));
+
+            AddonFixture removed = before;
+            removed.defaults.pop_back();
+            const Bytes d = removed.Build();
+            CHECK(!AddonSameIgnoringResets(a.data(), a.size(), d.data(), d.size()));
+
+            AddonFixture added = before;
+            added.defaults.push_back(MakeRecord(0x66666666, 50.0f, 50.0f, 100, 100));
+            const Bytes e = added.Build();
+            CHECK(!AddonSameIgnoringResets(a.data(), a.size(), e.data(), e.size()));
+
+            // 反过来: 基线在默认位置, 写回摆到了别处（人打开并挪了窗口）
+            CHECK(!AddonSameIgnoringResets(b.data(), b.size(), a.data(), a.size()));
+
+            CHECK(AddonSameIgnoringResets(original.data(), original.size(), original.data(), original.size()));
         }
 
         // 不合法时 AddonComparable 为空, ComparableBytes 退回原字节
@@ -1243,6 +1303,22 @@ namespace
             const bool switchedDiffers = AddonComparable(switched.data(), switched.size()) != comparable;
             printf("  组 6: 改 HUD 当前套号 %u → %u: %s\n", current, other, switchedDiffers ? "可比较字节不同" : "可比较字节相等");
             CHECK(switchedDiffers);
+        }
+
+        // 组 8、9: 开发机实机（10-24 鱼鱼）: 改热键栏那次登录写回的 ADDON（只有伸缩窗口变高）、随后登出写回的
+        // ADDON（两个窗口被重置到正中）
+        Bytes v8, v10, v12;
+        if (LoadSample(base, L"addon-samples\\live-yuyu\\ADDON.v8.DAT", &v8) &&
+            LoadSample(base, L"addon-samples\\live-yuyu\\ADDON.v10.DAT", &v10) &&
+            LoadSample(base, L"addon-samples\\live-yuyu\\ADDON.v12.DAT", &v12))
+        {
+            const bool heightOnly = AddonComparable(v8.data(), v8.size()) == AddonComparable(v10.data(), v10.size());
+            const bool resets     = AddonSameIgnoringResets(v10.data(), v10.size(), v12.data(), v12.size());
+            printf("  组 8: 伸缩窗口变高: %s\n", heightOnly ? "可比较字节相等" : "可比较字节不同");
+            printf("  组 9: 窗口被重置: %s\n", resets ? "算作没改" : "算作改动");
+            CHECK(heightOnly);
+            CHECK(resets);
+            CHECK(!AddonSameIgnoringResets(v12.data(), v12.size(), v10.data(), v10.size()));
         }
 
         // 组 7: GS 681 → 682

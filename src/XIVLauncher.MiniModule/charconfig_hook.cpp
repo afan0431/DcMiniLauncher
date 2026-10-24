@@ -1,9 +1,9 @@
 // 所有角色共用一套游戏配置 · 挂钩与线程
 //
-// 挂 FileInterface::OpenFile(self, widePath, mode)（mode: 0 读、1 写、2 追加; 返回 1 = 成功）:
+// 挂 FileInterface::OpenFile(self, widePath, mode)（mode: 0 读, 非 0 写; 返回 1 = 成功）:
 //   读共用文件之前 → PrepareRead 放入这一套的最新版, 记下这个号这个文件的基线;
-//   写 <NAME>.DAT.new.<hex>.<本进程 pid> 之前 → 记一条待查项, 等游戏把 .new 改名成 <NAME>.DAT 后 HandleWritten,
-//   与基线不同才发布到本机共享目录。
+//   写 <NAME>.DAT 之前（游戏在 OpenFile 里先写 <NAME>.DAT.new.<hex>.<pid>, 关闭时改名成 <NAME>.DAT; 直接打开 .new 的写法也认）
+//   → 记一条待查项, 等改名完成（<NAME>.DAT 的修改时间晚于打开时刻）后 HandleWritten, 与基线不同才发布到本机共享目录。
 // 判断与读写都在 charconfig_core.*; 这里只管挂钩、待查项、日志、心跳。
 //
 // 线程:
@@ -35,8 +35,7 @@ namespace
 
     using OpenFileFn = uint8_t (*)(void* self, wchar_t* path, int mode);
 
-    constexpr int kModeRead  = 0;
-    constexpr int kModeWrite = 1;
+    constexpr int kModeRead = 0; // 其余取值都是写（游戏保存走通用读写函数时把模式原样透传, 不只是 1）
 
     // 主: FFXIVClientStructs-cn FileInterface.OpenFile; 备: Dalamud.CharacterSync。都是调用点, 跟进 call 得到函数本体
     constexpr char kPrimarySignature[] = "E8 ?? ?? ?? ?? 0F B6 C8 3C 01";
@@ -85,7 +84,7 @@ namespace
 
     struct PendingWrite
     {
-        std::wstring newPath;
+        std::wstring newPath; // 打开的是 .new 时的路径; 打开 <NAME>.DAT 本身时为空
         PathMatch    match;
         ULONGLONG    queuedTick = 0;
         ULONGLONG    queuedTime = 0; // FILETIME
@@ -299,10 +298,10 @@ namespace
         it->second.dueTick = GetTickCount64() + kNameRetryMs;
     }
 
-    // 待查项是否已改名完成: .new 不在了, 且见过它或者 <NAME>.DAT 是挂钩之后写的
+    // 待查项是否已改名完成: .new 不在了, 且见过它或者 <NAME>.DAT 是打开之后写的
     bool WriteFinished(PendingWrite& item)
     {
-        if (FileExists(item.newPath))
+        if (!item.newPath.empty() && FileExists(item.newPath))
         {
             item.seen = true;
             return false;
@@ -385,7 +384,8 @@ namespace
         source.gamePid  = g_pid;
 
         const WrittenOutcome outcome =
-            HandleWritten(g_root, config.setId, spec, item.match.characterFile, hasBaseline, baseline.hash, source);
+            HandleWritten(g_root, config.setId, spec, item.match.characterFile, hasBaseline, baseline.hash, source,
+                          &baseline.bytes);
 
         switch (outcome.result)
         {
@@ -562,15 +562,18 @@ namespace
 
     void OnWrite(const wchar_t* path)
     {
-        PathMatch match;
-        if (!MatchWritePath(path, g_pid, &match))
+        PathMatch    match;
+        std::wstring newPath;
+        if (MatchWritePath(path, g_pid, &match))
+            newPath = path;
+        else if (!MatchReadPath(path, &match))
             return;
 
         // 游戏在保存一组文件: 上一个已改名完成的这里就处理掉, 不等工作线程（游戏随后可能直接退出）
         ProcessPending(nullptr);
 
         PendingWrite item;
-        item.newPath    = path;
+        item.newPath    = std::move(newPath);
         item.match      = std::move(match);
         item.queuedTick = GetTickCount64();
         item.queuedTime = SystemTimeValue();
@@ -585,7 +588,7 @@ namespace
         {
             if (mode == kModeRead)
                 OnRead(path);
-            else if (mode == kModeWrite)
+            else
                 OnWrite(path);
         }
         catch (const std::exception& ex)
@@ -616,7 +619,7 @@ namespace
         // 计数包住对原函数的调用: 卸载端等它归零才释放跳板
         g_inside.fetch_add(1);
 
-        if (g_active.load() && path != nullptr && (mode == kModeRead || mode == kModeWrite))
+        if (g_active.load() && path != nullptr)
             BeforeOpenGuarded(path, mode);
 
         const uint8_t result = g_original(self, path, mode);

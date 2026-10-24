@@ -94,7 +94,8 @@ namespace charconfig
     // 读: …\FFXIV_CHR<16 位十六进制>\<NAME>.DAT, NAME 是 9 个共用文件之一
     bool MatchReadPath(const wchar_t* path, PathMatch* out);
 
-    // 写: …\FFXIV_CHR<16 位十六进制>\<NAME>.DAT.new.<十六进制>.<进程号十六进制>, 只认进程号等于 pid 的
+    // 写的临时文件: …\FFXIV_CHR<16 位十六进制>\<NAME>.DAT.new.<十六进制>.<进程号十六进制>, 只认进程号等于 pid 的
+    // （游戏保存时 OpenFile 打开的是 <NAME>.DAT 本身, 这个临时文件在函数内部生成; 写模式下两种都要认）
     bool MatchWritePath(const wchar_t* path, DWORD pid, PathMatch* out);
 
     // ---- 合法性 -----------------------------------------------------------------
@@ -107,7 +108,8 @@ namespace charconfig
     bool AddonValid(const uint8_t* data, size_t length, std::string* reason = nullptr);
 
     // ---- 可比较字节与哈希 -------------------------------------------------------
-    // ADDON: 默认表与每套 HUD 的记录排序, 掩码随角色自动变化的三个窗口; 不合法时返回空
+    // ADDON: 默认表与每套 HUD 的记录排序, 掩码随角色自动变化的窗口（固定的三个, 加上带自动伸缩标记的窗口的高）;
+    // 不合法时返回空
     Bytes AddonComparable(const uint8_t* data, size_t length);
 
     // GS: 去掉末尾的 0
@@ -122,6 +124,11 @@ namespace charconfig
     // 两份合法 ADDON 按可比较字节逐段比较, 列出不同之处:
     //   "header"、"hudHeader"、"tail"、默认表记录 "<键>"、HUD 套 "hud<i>:<键>" / "hud<i>:tail"（键为文件中 4 字节的十六进制）
     std::vector<std::string> AddonDiffKeys(const uint8_t* a, size_t aLength, const uint8_t* b, size_t bLength);
+
+    // 两份合法 ADDON 除去可比较字节已忽略的部分, 不同之处只在写回一侧被重置到正中默认位置（x、y 都是 50.0）的窗口
+    // 时为 true: 游戏会把这个号没打开过的窗口重置, 不是人改的
+    bool AddonSameIgnoringResets(const uint8_t* baseline, size_t baselineLength, const uint8_t* written,
+                                 size_t writtenLength);
 
     // ---- 文件与目录 -------------------------------------------------------------
     std::string  ToUtf8(const std::wstring& text);
@@ -313,10 +320,11 @@ namespace charconfig
         Bytes         content;  // 写回文件的原始内容（读到时）
     };
 
-    // 游戏写完 <NAME>.DAT（.new 已改名）后调。hasBaseline = 这次登录读之前记下过基线
+    // 游戏写完 <NAME>.DAT（.new 已改名）后调。hasBaseline = 这次登录读之前记下过基线;
+    // baselineContent = 基线的原始内容（ADDON 用来认出只是窗口被重置, 可为空）
     WrittenOutcome HandleWritten(const std::wstring& root, const std::string& setId, const FileSpec& spec,
                                  const std::wstring& characterFile, bool hasBaseline, const std::string& baseline,
-                                 const PublishSource& source);
+                                 const PublishSource& source, const Bytes* baselineContent = nullptr);
 
     // ---- 心跳 modules\<pid>.json ------------------------------------------------
     struct ModuleHeartbeat

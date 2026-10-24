@@ -40,6 +40,18 @@ namespace charconfig
         const uint8_t kMaskHeightKeys[][4] = { { 0xd2, 0x00, 0x91, 0xa2 }, { 0xca, 0xea, 0x61, 0x46 } };
         const uint8_t kMaskAllKeys[][4]    = { { 0xbe, 0xb6, 0xd3, 0x06 } };
 
+        // 随内容伸缩高度的窗口: 记录 0x19..0x1B 为 03 00 FF（上面两个只变高的窗口都带这个标记, 实测还有别的）
+        bool AutoHeight(const uint8_t* record) { return record[0x19] == 0x03 && record[0x1A] == 0x00 && record[0x1B] == 0xFF; }
+
+        // 游戏把没摆过或被重置的窗口放在屏幕正中: x、y 都是 50.0
+        bool AtDefaultPosition(const uint8_t* record)
+        {
+            float x, y;
+            memcpy(&x, record + 4, sizeof(x));
+            memcpy(&y, record + 8, sizeof(y));
+            return x == 50.0f && y == 50.0f;
+        }
+
         constexpr size_t kMaxFileSize = 16 * 1024 * 1024;
 
         bool IsSeparator(wchar_t c) { return c == L'\\' || c == L'/'; }
@@ -170,14 +182,14 @@ namespace charconfig
                 }
             }
 
+            bool maskHeight = AutoHeight(record.data());
             for (const auto& key : kMaskHeightKeys)
+                maskHeight = maskHeight || memcmp(record.data(), key, 4) == 0;
+
+            if (maskHeight)
             {
-                if (memcmp(record.data(), key, 4) == 0)
-                {
-                    record[0x16] = 0;
-                    record[0x17] = 0;
-                    return record;
-                }
+                record[0x16] = 0;
+                record[0x17] = 0;
             }
 
             return record;
@@ -1305,6 +1317,62 @@ namespace charconfig
         return Sha256Hex(comparable.data(), comparable.size());
     }
 
+    bool AddonSameIgnoringResets(const uint8_t* baseline, size_t baselineLength, const uint8_t* written,
+                                 size_t writtenLength)
+    {
+        if (!AddonValid(baseline, baselineLength) || !AddonValid(written, writtenLength))
+            return false;
+
+        const AddonParts left  = SplitAddon(baseline, baselineLength);
+        const AddonParts right = SplitAddon(written, writtenLength);
+
+        // 按键分组: 写回一侧与基线不同的组, 只要写回的每条都在正中默认位置就算重置; 多了或少了键都算改动
+        auto sameRecords = [](const std::vector<Record>& a, const std::vector<Record>& b)
+        {
+            std::map<std::string, std::vector<Record>> before;
+            std::map<std::string, std::vector<Record>> after;
+            for (const auto& record : a) before[KeyHex(record)].push_back(record);
+            for (const auto& record : b) after[KeyHex(record)].push_back(record);
+
+            for (const auto& entry : before)
+            {
+                if (after.find(entry.first) == after.end())
+                    return false;
+            }
+
+            for (const auto& entry : after)
+            {
+                const auto other = before.find(entry.first);
+                if (other == before.end())
+                    return false;
+                if (other->second == entry.second)
+                    continue;
+
+                for (const auto& record : entry.second)
+                {
+                    if (!AtDefaultPosition(record.data()))
+                        return false;
+                }
+            }
+
+            return true;
+        };
+
+        if (left.header != right.header || left.hudHeader != right.hudHeader || left.trailer != right.trailer ||
+            left.slots.size() != right.slots.size() || !sameRecords(left.defaults, right.defaults))
+            return false;
+
+        for (size_t s = 0; s < left.slots.size(); ++s)
+        {
+            const AddonSlot& l = left.slots[s];
+            const AddonSlot& r = right.slots[s];
+            if (l.head != r.head || l.tail != r.tail || !sameRecords(l.records, r.records))
+                return false;
+        }
+
+        return true;
+    }
+
     std::vector<std::string> AddonDiffKeys(const uint8_t* a, size_t aLength, const uint8_t* b, size_t bLength)
     {
         std::vector<std::string> out;
@@ -2145,7 +2213,7 @@ namespace charconfig
 
     WrittenOutcome HandleWritten(const std::wstring& root, const std::string& setId, const FileSpec& spec,
                                  const std::wstring& characterFile, bool hasBaseline, const std::string& baseline,
-                                 const PublishSource& source)
+                                 const PublishSource& source, const Bytes* baselineContent)
     {
         WrittenOutcome outcome;
         std::string    stepError;
@@ -2174,7 +2242,10 @@ namespace charconfig
             return outcome;
         }
 
-        if (outcome.hash == baseline)
+        if (outcome.hash == baseline ||
+            (spec.category == Category::Hud && baselineContent != nullptr && !baselineContent->empty() &&
+             AddonSameIgnoringResets(baselineContent->data(), baselineContent->size(), outcome.content.data(),
+                                     outcome.content.size())))
         {
             outcome.result = WrittenResult::Unchanged;
             return outcome;
