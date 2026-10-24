@@ -31,8 +31,8 @@ public sealed record CatDutyEvent
 
 /// <summary>
 ///     Cat 上号自动开工的任务单通道（约定 cat-job/1）: 工作台经管道方法 setJob 交来任务单, 游戏内 Afan 经本机接口
-///     <c>GET /cat/job?pid=</c> 取、<c>POST /cat/progress</c> 报进度; 回报原样转成 game.jobProgress, 小模块读到的职业等级转成 game.levels,
-///     读到的"是否在副本中"转成 game.duty。
+///     <c>GET /cat/job?pid=</c> 取、<c>POST /cat/progress</c> 报进度、<c>POST /cat/snapshot</c> 报角色快照; 回报原样转成 game.jobProgress,
+///     快照原样包进 game.snapshot, 小模块读到的职业等级转成 game.levels, 读到的"是否在副本中"转成 game.duty。
 ///     一个无界面进程一份, 只认它守着的那个游戏的 pid。
 ///     工作台按这个类型（<c>XIVLauncher.CatHost.CatJobChannel</c>）在不在程序集里判断登录器支不支持 setJob, 改名要同步改工作台外壳的探测。
 /// </summary>
@@ -56,6 +56,15 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     /// <summary>是否在副本中的事件</summary>
     public const string DUTY_EVENT = "game.duty";
 
+    /// <summary>角色快照格式</summary>
+    public const string SNAPSHOT_SCHEMA = "cat-snapshot/1";
+
+    /// <summary>角色快照事件</summary>
+    public const string SNAPSHOT_EVENT = "game.snapshot";
+
+    /// <summary>角色快照原文上限（与本机接口的请求体上限相同）</summary>
+    public const int MAX_SNAPSHOT_BYTES = 64 * 1024;
+
     /// <summary>任务单原文上限</summary>
     public const int MAX_JOB_BYTES = 256 * 1024;
 
@@ -74,12 +83,18 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     /// </summary>
     public static readonly IReadOnlyList<string> ShotKinds = ["start", "completion", "progress"];
 
+    /// <summary>快照 kind 的取值: start = 进世界后第一份, update = 内容有变化, final = 收尾</summary>
+    public static readonly IReadOnlyList<string> SnapshotKinds = ["start", "update", "final"];
+
     private readonly Func<string?>          operationId;
     private readonly Action<string, object> publish;
     private readonly object                 stateLock = new();
 
     /// <summary>每个游戏进程收到过的最大 seq（约定: 同一进程内严格递增, Afan 重载也不回退）</summary>
     private readonly Dictionary<int, long> lastSeqs = [];
+
+    /// <summary>每个游戏进程收到过的最大快照 seq（与回报的 seq 各自递增）</summary>
+    private readonly Dictionary<int, long> lastSnapshotSeqs = [];
 
     /// <summary>每个游戏进程上次发的等级读数（角色 + 数组）</summary>
     private readonly Dictionary<int, (string ContentId, int[] Levels)> lastLevels = [];
@@ -263,6 +278,9 @@ public sealed class CatJobChannel : ICatLocalEndpoints
             foreach (var other in lastSeqs.Keys.Where(x => x != pid).ToArray())
                 lastSeqs.Remove(other);
 
+            foreach (var other in lastSnapshotSeqs.Keys.Where(x => x != pid).ToArray())
+                lastSnapshotSeqs.Remove(other);
+
             foreach (var other in lastLevels.Keys.Where(x => x != pid).ToArray())
                 lastLevels.Remove(other);
 
@@ -337,6 +355,51 @@ public sealed class CatJobChannel : ICatLocalEndpoints
         }
 
         return new CatLocalResponse(200, JsonSerializer.Serialize(new Dictionary<string, long> { ["revision"] = currentRevision }));
+    }
+
+    /// <summary>
+    ///     收一份角色快照: 校验 schema、pid、seq、kind、snapshotId 与大小, 其余字段不解释; 通过后原样包进 game.snapshot
+    ///     （<c>{ operationId, pid, snapshot }</c>）。seq 不大于这个游戏已收最大值的是重发, 回 200 不再发。
+    ///     不限频率: Afan 同时只有一份在途, 上一份确认前不发下一份
+    /// </summary>
+    public CatLocalResponse PostSnapshot(string body)
+    {
+        if (ParseSnapshot(body, out var snapshot, out var pid, out var seq) is { } error)
+        {
+            Log.Warning("[CatHost] 角色快照没有收下: {Error}", error);
+            return new CatLocalResponse(400, CatLocalJson.Error(error));
+        }
+
+        // 先取 operationId 再进锁: 取它要拿外壳的锁, 两把锁不嵌套
+        var operation = operationId();
+
+        lock (stateLock)
+        {
+            if (gamePid != pid)
+            {
+                Log.Warning("[CatHost] 角色快照没有收下: pid {Pid} 不是本启动器守护的游戏", pid);
+                return new CatLocalResponse(404, CatLocalJson.Error($"pid {pid} 不是本启动器守护的游戏"));
+            }
+
+            // seq 在同一游戏进程内严格递增: 不大于已收最大值的就是重发或乱序, 不再发
+            if (!lastSnapshotSeqs.TryGetValue(pid, out var last) || seq > last)
+            {
+                lastSnapshotSeqs[pid] = seq;
+                Log.Information
+                (
+                    "[CatHost] 角色快照 pid={Pid} seq={Seq} kind={Kind} snapshotId={SnapshotId} {Bytes} 字节",
+                    pid,
+                    seq,
+                    StringOf(snapshot!, "kind"),
+                    StringOf(snapshot!, "snapshotId"),
+                    Encoding.UTF8.GetByteCount(body)
+                );
+
+                publish(SNAPSHOT_EVENT, new { operationId = operation, pid, snapshot });
+            }
+        }
+
+        return new CatLocalResponse(200, JsonSerializer.Serialize(new Dictionary<string, long> { ["seq"] = seq }));
     }
 
     /// <summary>
@@ -514,6 +577,61 @@ public sealed class CatJobChannel : ICatLocalEndpoints
         }
 
         progress = value;
+        pid      = (int)pidValue;
+        return null;
+    }
+
+    /// <summary>
+    ///     解析并校验一份角色快照; 通过返回 null, 否则返回 400 的原因。只看 schema、pid、seq（按 long）、kind、snapshotId 与大小,
+    ///     其余字段（分区、角色等）不解释, 由 Afan 与 Cat 两端约定
+    /// </summary>
+    internal static string? ParseSnapshot(string body, out JsonObject? snapshot, out int pid, out long seq)
+    {
+        snapshot = null;
+        pid      = 0;
+        seq      = 0;
+
+        if (string.IsNullOrWhiteSpace(body))
+            return "请求体为空";
+
+        if (Encoding.UTF8.GetByteCount(body) > MAX_SNAPSHOT_BYTES)
+            return $"快照超过 {MAX_SNAPSHOT_BYTES} 字节";
+
+        JsonNode? node;
+
+        try
+        {
+            node = JsonNode.Parse(body);
+            Materialize(node);
+        }
+        catch (JsonException ex)
+        {
+            return $"不是有效的 JSON: {ex.Message}";
+        }
+        catch (ArgumentException)
+        {
+            return "JSON 对象里有重复的键";
+        }
+
+        if (node is not JsonObject value)
+            return "快照必须是 JSON 对象";
+
+        if (!string.Equals(StringOf(value, "schema"), SNAPSHOT_SCHEMA, StringComparison.Ordinal))
+            return $"schema 必须是 {SNAPSHOT_SCHEMA}";
+
+        if (!TryGetInteger(value, "pid", out var pidValue) || pidValue is <= 0 or > int.MaxValue)
+            return "pid 必须是正整数";
+
+        if (!TryGetInteger(value, "seq", out seq) || seq < 1)
+            return "seq 必须是从 1 开始的整数";
+
+        if (StringOf(value, "kind") is not { } kind || !SnapshotKinds.Contains(kind))
+            return $"kind 只能是 {string.Join(" / ", SnapshotKinds)}";
+
+        if (string.IsNullOrWhiteSpace(StringOf(value, "snapshotId")))
+            return "snapshotId 必须是非空字符串";
+
+        snapshot = value;
         pid      = (int)pidValue;
         return null;
     }

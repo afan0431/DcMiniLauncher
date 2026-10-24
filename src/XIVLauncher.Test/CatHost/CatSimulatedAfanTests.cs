@@ -64,6 +64,35 @@ public sealed class CatSimulatedAfanTests : IDisposable
     }
 
     [Fact]
+    public void Snapshot_IsSentOnceAfterEnteringTheWorld_WithLevelsGearAndStory()
+    {
+        channel.SetJob(CatJobChannelTests.Job(3));
+        var afan = NewAfan();
+
+        Run(afan, new DateTime(2026, 10, 25, 6, 0, 0, DateTimeKind.Utc), 6);
+
+        var published = Assert.Single(events, x => x.Method == CatJobChannel.SNAPSHOT_EVENT).Params.AsObject();
+        Assert.Equal(["operationId", "pid", "snapshot"], published.Select(x => x.Key));
+        Assert.Equal("op-1", published["operationId"]!.GetValue<string>());
+        Assert.Equal(PID, published["pid"]!.GetValue<int>());
+
+        var snapshot = published["snapshot"]!.AsObject();
+        Assert.Equal(CatJobChannel.SNAPSHOT_SCHEMA, snapshot["schema"]!.GetValue<string>());
+        Assert.Equal("start", snapshot["kind"]!.GetValue<string>());
+        Assert.Equal(PID, snapshot["pid"]!.GetValue<int>());
+        Assert.Equal($"{PID}-{Entered.ContentId}-{snapshot["seq"]!.GetValue<long>()}", snapshot["snapshotId"]!.GetValue<string>());
+        Assert.Equal(1, snapshot["schemaVersion"]!.GetValue<int>());
+        Assert.Equal("七色花", snapshot["character"]!["name"]!.GetValue<string>());
+        Assert.Equal(1167, snapshot["character"]!["homeWorldId"]!.GetValue<int>());
+
+        var sections = snapshot["sections"]!.AsObject();
+        Assert.Equal(["levels", "gear", "story"], sections.Select(x => x.Key));
+        Assert.Equal(Levels()[0], sections["levels"]!.AsArray().Select(x => x!.GetValue<int>()));
+        Assert.Equal("mainHand", sections["gear"]!["slots"]![0]!["slot"]!.GetValue<string>());
+        Assert.Equal("7.0", sections["story"]!["msqExpansion"]!.GetValue<string>());
+    }
+
+    [Fact]
     public void Normal_RunsTheAutoItemsInOrder_WithCompletionShots_ThenDone()
     {
         channel.SetJob(CatJobChannelTests.Job(3));
