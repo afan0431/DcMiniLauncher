@@ -430,6 +430,17 @@ public sealed record CatCharacterInfo
     bool    Loginable
 );
 
+public sealed record CatRemoteHookParams
+(
+    string DllPath,
+    string PipeName,
+    string Token
+)
+{
+    /// <summary>不把管道认证令牌写入日志</summary>
+    public override string ToString() => $"CatRemoteHookParams {{ DllPath = {DllPath}, PipeName = {PipeName}, Token = *** }}";
+}
+
 /// <summary>
 ///     launch 参数; areaName = 资料里的大区名（如 豆豆柴）, 账号库没记这个号的大区时用它;
 ///     platform = 渠道, 见 <see cref="CatPlatforms" />, 不带按盛趣;
@@ -457,7 +468,8 @@ public sealed record CatLaunchParams
     bool?            AutoEnter                 = null,
     string?          WeGameToken               = null,
     string?          WeGameAccountId           = null,
-    bool?            AuthOnly                  = null
+    bool?            AuthOnly                  = null,
+    CatRemoteHookParams? RemoteHook            = null
 )
 {
     /// <summary>
@@ -467,7 +479,8 @@ public sealed record CatLaunchParams
         $"CatLaunchParams {{ OperationId = {OperationId}, AccountName = {AccountName}, Dalamud = {Dalamud}, Minion = {Minion}, " +
         $"CrashDialogTimeoutSeconds = {CrashDialogTimeoutSeconds}, AreaName = {AreaName}, Platform = {Platform}, Password = {(Password == null ? "(无)" : "***")}, " +
         $"WeGameLogin = {WeGameLogin}, WeGameScan = {WeGameScan}, Character = {Character}, AutoEnter = {AutoEnter}, " +
-        $"WeGameToken = {(WeGameToken == null ? "(无)" : "***")}, WeGameAccountId = {WeGameAccountId}, AuthOnly = {AuthOnly} }}";
+        $"WeGameToken = {(WeGameToken == null ? "(无)" : "***")}, WeGameAccountId = {WeGameAccountId}, AuthOnly = {AuthOnly}, " +
+        $"RemoteHook = {(RemoteHook == null ? "(无)" : "***")} }}";
 }
 
 /// <summary>
