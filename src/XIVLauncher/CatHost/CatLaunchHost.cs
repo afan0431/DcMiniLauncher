@@ -25,7 +25,8 @@ public sealed record CatLaunchRequest
     CatWeGameScan? WeGameScan                = null,
     bool           AutoEnter                 = false,
     string?        CharacterName             = null,
-    string?        CharacterHomeWorld        = null
+    string?        CharacterHomeWorld        = null,
+    CatRemoteHookParams? RemoteHook           = null
 )
 {
     /// <summary>是否为 WeGame 版国服的号</summary>
@@ -436,7 +437,11 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 weGameScan,
                 autoEnter,
                 characterName,
-                homeWorld
+                homeWorld,
+                parameters.RemoteHook == null ? null : new CatRemoteHookParams(
+                    parameters.RemoteHook.DllPath,
+                    parameters.RemoteHook.PipeName,
+                    parameters.RemoteHook.Token)
             );
             selected = runnerFactory(accepted);
             runner   = selected;
