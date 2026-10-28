@@ -166,6 +166,9 @@ public static class CatAutoEnterStopCodes
 
     /// <summary>收到关闭请求, 没有做完</summary>
     public const string CANCELLED = "cancelled";
+
+    /// <summary>选角列表里定不了要登录的角色。只在不等人选的编排（游戏内跨区后进世界）里出现, 不发给工作台</summary>
+    public const string CHARACTER_NOT_FOUND = "characterNotFound";
 }
 
 /// <summary>失败码</summary>

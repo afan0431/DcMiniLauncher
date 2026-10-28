@@ -139,6 +139,21 @@ public sealed class CatAutoEnterTests
     }
 
     [Fact]
+    public async Task StopWhenChoiceNeeded_CharacterNotInList_StopsInsteadOfWaiting()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"), Chara("12", "小黑", "HongYuHai"));
+
+        var flow    = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("不存在", null)) { StopWhenChoiceNeeded = true };
+        var outcome = await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Equal(["stage:enteringLobby", $"stopped:{CatAutoEnterStopCodes.CHARACTER_NOT_FOUND}", "stage:running"], Entries(reporter));
+        Assert.Contains("不存在", Assert.Single(reporter.Messages));
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("ENTERCHARA", StringComparison.Ordinal));
+        Assert.Equal(CatCodes.NOT_RUNNING, flow.SelectCharacter("11").Code);
+    }
+
+    [Fact]
     public async Task WhileWaitingForChoice_SomeoneEntersInGame_StillReportsTheCharacter()
     {
         var (game, reporter) = Setup(Chara("11", "小白"), Chara("12", "小黑", "HongYuHai"));
@@ -966,9 +981,9 @@ public sealed class CatAutoEnterTests
     }
 
     /// <summary>
-    ///     假的游戏一侧: 按模块约定的格式应答, 界面状态由测试改; 等待不真等, 只把假时钟往前拨
+    ///     假的游戏一侧: 按模块约定的格式应答, 界面状态由测试改; 等待不真等, 只把假时钟往前拨。游戏内跨区收尾的测试也用它
     /// </summary>
-    private sealed class FakeAutoEnterGame : ICatAutoEnterGame
+    internal sealed class FakeAutoEnterGame : ICatAutoEnterGame
     {
         private readonly object sync = new();
         private TimeSpan elapsed;
@@ -1031,7 +1046,7 @@ public sealed class CatAutoEnterTests
 
         public bool HasExited { get; set; }
 
-        public string CurrentAreaName { get; private set; } = AREA_HOME;
+        public string CurrentAreaName { get; set; } = AREA_HOME;
 
         public IReadOnlyList<string> AreaNames => [AREA_HOME, AREA_OTHER, AREA_THIRD];
 

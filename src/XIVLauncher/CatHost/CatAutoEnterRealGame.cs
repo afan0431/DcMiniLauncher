@@ -15,6 +15,9 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
 {
     private const int PIPE_CONNECT_TIMEOUT_MS = 10_000;
 
+    /// <summary>跨区收尾时管道闸被别的短操作占着, 最多等这么久</summary>
+    private static readonly TimeSpan GATE_WAIT = TimeSpan.FromSeconds(10);
+
     private readonly Process                   process;
     private readonly DCTravelClient            travelClient;
     private readonly IReadOnlyList<LoginArea>  areas;
@@ -60,6 +63,12 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
     /// </summary>
     public bool ReadOnlyModule { get; init; }
 
+    /// <summary>
+    ///     这次自动进入角色是游戏内跨区那一单的收尾（请求带 enter）: 那一单在进世界前一直算进行中, 它就是自己, 所以不看 <see cref="InGameTravelJobs" />, 只看管道闸;
+    ///     闸被别的短操作（读选角列表等）占着时等一会儿再占, 不立刻当成模块失效
+    /// </summary>
+    public bool OwnedByTravelJob { get; init; }
+
     /// <inheritdoc />
     public IReadOnlyList<string> AreaNames => areas.Select(x => x.AreaName).ToArray();
 
@@ -68,7 +77,7 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
 
     /// <inheritdoc />
     public bool ModuleBusy =>
-        InGameTravelJobs.IsRunning(process.Id) || (gate == null && InGameTravelService.IsGateHeld(process.Id));
+        (!OwnedByTravelJob && InGameTravelJobs.IsRunning(process.Id)) || (gate == null && InGameTravelService.IsGateHeld(process.Id));
 
     /// <inheritdoc />
     public bool HasExited
@@ -95,10 +104,10 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
     {
         if (module == null)
         {
-            if (InGameTravelJobs.IsRunning(process.Id))
+            if (!OwnedByTravelJob && InGameTravelJobs.IsRunning(process.Id))
                 throw new InvalidOperationException("这个客户端正在换大区, 游戏内模块被占用");
 
-            gate ??= InGameTravelService.TryEnterGate(process.Id) ?? throw new InvalidOperationException("游戏内模块正被别的操作占用");
+            gate ??= await EnterGateAsync(cancellationToken).ConfigureAwait(false) ?? throw new InvalidOperationException("游戏内模块正被别的操作占用");
 
             var client = new MiniModuleClient(process.Id);
 
@@ -124,6 +133,23 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
         {
             Release();
             throw;
+        }
+    }
+
+    /// <summary>占管道闸: 平常占不到就算了; 跨区收尾时最多等 <see cref="GATE_WAIT" /></summary>
+    private async Task<IDisposable?> EnterGateAsync(CancellationToken cancellationToken)
+    {
+        var deadline = clock.Elapsed + GATE_WAIT;
+
+        while (true)
+        {
+            if (InGameTravelService.TryEnterGate(process.Id) is { } lease)
+                return lease;
+
+            if (!OwnedByTravelJob || clock.Elapsed > deadline)
+                return null;
+
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
         }
     }
 

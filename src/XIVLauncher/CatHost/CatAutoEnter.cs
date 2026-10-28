@@ -182,6 +182,11 @@ public sealed class CatAutoEnter
         this.timings  = timings ?? new CatAutoEnterTimings();
     }
 
+    /// <summary>
+    ///     定不了登录哪个角色时直接停手（<see cref="CatAutoEnterStopCodes.CHARACTER_NOT_FOUND" />）, 不等人选: 游戏内跨区后进世界用, 那条路上没有人回答 selectCharacter
+    /// </summary>
+    public bool StopWhenChoiceNeeded { get; init; }
+
     /// <summary>编排最后报的阶段; 还没开始时为 null。补注入、挂 Minion 改过阶段后用它恢复</summary>
     public string? CurrentStage
     {
@@ -674,6 +679,17 @@ public sealed class CatAutoEnter
     /// </summary>
     private async Task<CharaSelectReader.Entry?> WaitForChoiceAsync(IReadOnlyList<CharaSelectReader.Entry> entries, CancellationToken cancellationToken)
     {
+        if (StopWhenChoiceNeeded)
+        {
+            throw new StopException
+            (
+                CatAutoEnterStopCodes.CHARACTER_NOT_FOUND,
+                string.IsNullOrWhiteSpace(target.Name)
+                    ? $"{game.CurrentAreaName} 的选角列表里定不了要登录哪个角色"
+                    : $"{game.CurrentAreaName} 的选角列表里没有角色 {target.Name}"
+            );
+        }
+
         var choice = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         lock (stateLock)
