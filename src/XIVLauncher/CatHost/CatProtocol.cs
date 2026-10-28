@@ -251,6 +251,12 @@ public static class CatCodes
 
     /// <summary>setJob: 任务单不是给本实例的（schema 不认识、sessionId 与 operationId 不一致, 或还没有 launch / adopt）</summary>
     public const string JOB_MISMATCH = "jobMismatch";
+
+    /// <summary>game.remoteHook: 截取模块没有注入或初始化成功（找不到模块、加载失败、管道建不起来、钩子没装上等）</summary>
+    public const string REMOTE_HOOK_FAILED = "remoteHookFailed";
+
+    /// <summary>game.remoteHook: 打不开游戏进程注入截取模块, 游戏可能以更高权限运行</summary>
+    public const string REMOTE_TARGET_ELEVATED = "remoteTargetElevated";
 }
 
 /// <summary>game.exited 的 reason（不带 reason = 游戏自己退出或被外部结束）</summary>
@@ -430,6 +436,9 @@ public sealed record CatCharacterInfo
     bool    Loginable
 );
 
+/// <summary>
+///     launch 的 remoteHook: DllPath = 截取模块完整路径; PipeName = 不带进程号的管道名（<c>\\.\pipe\cat-remote-&lt;32 位十六进制&gt;</c>）; Token = 管道认证令牌
+/// </summary>
 public sealed record CatRemoteHookParams
 (
     string DllPath,
@@ -450,7 +459,8 @@ public sealed record CatRemoteHookParams
 ///     character = 要登录的角色（可不带）; autoEnter = 游戏起来后自动经标题、选角进入游戏（不带按 false, 国际服忽略）;
 ///     weGameToken / weGameAccountId = 工作台下发的这个号的 WeGame 登录信息与 WeGame 用户号（只能用于 weGame 渠道, 两个要么都带要么都不带, 用户号全为数字）,
 ///     本机账号库没有这个号或存的不同时先写进账号库再登录, 见 <see cref="CatWeGameTokenHandoff" />;
-///     authOnly = 只登录: 登录成功即发 launch.authorized 结束, 不取票据、不起游戏（只能用于 weGame 渠道, 不带按 false）, 见 <see cref="CatWeGameAuthOnly" />
+///     authOnly = 只登录: 登录成功即发 launch.authorized 结束, 不取票据、不起游戏（只能用于 weGame 渠道, 不带按 false）, 见 <see cref="CatWeGameAuthOnly" />;
+///     remoteHook = 远程截取模块的路径、不带进程号的管道名与令牌, 游戏进程一创建就注入, 见 <see cref="CatRemoteHook" />（不带 = 不注入）
 /// </summary>
 public sealed record CatLaunchParams
 (
