@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Text.Json;
 using Serilog;
+using XIVLauncher.CatHost;
 using XIVLauncher.DCTravel;
 using XIVLauncher.Login.Models;
 
@@ -38,15 +39,13 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             if (game == null)
                 return Failed(resolveError ?? "找不到目标客户端");
 
-            // 「都注」也走这条路: 用户要的是两个平台共存时 mini 这套照样可用。
+            // 挂没挂 Minion 都走这条路（负责人 2026-10-28: 卫月端 Afan 也要跨大区）: 模块不在时换服服务自己注,
+            // 只读模式的模块少的只是标题守卫, 换服第 2 步 KEEPALIVE ON 会把它起起来。
             // 注了 Dalamud 时 DcTraveler 插件也能换服, 两者别同时用就行（这里不去替用户拦）。
-            if (!game.Agents.HasFlag(InGameAgents.Minion))
-                return Failed("该客户端没有挂 Minion, 游戏内模块不会被注入");
-
             if (InGameTravelJobs.IsRunning(game.Process.Id))
                 return Failed("这个客户端已经有一次换大区在进行中");
 
-            var (legs, planError) = await PlanAsync(request, cancellationToken).ConfigureAwait(false);
+            var (legs, state, planError) = await PlanAsync(request, cancellationToken).ConfigureAwait(false);
 
             if (planError != null)
                 return Failed(planError);
@@ -55,15 +54,19 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             var last   = legs[^1].Context;
             var target = $"{last.TargetArea!.AreaName}/{last.TargetGroup!.GroupName}";
 
-            if (InGameTravelJobs.TryBegin(pid, target) == null)
+            if (InGameTravelJobs.TryBegin(pid, target, request.Enter) == null)
                 return Failed(BUSY_MESSAGE);
 
-            var run = RunLegsAsync(game.Process, legs);
+            var enter = request.Enter ? EnterPlan(game.Process, last.TargetArea!.AreaName, state!, request.ContentId) : null;
+            var run   = InGameTravelEnter.RunAsync(pid, () => RunLegsAsync(game.Process, legs), enter);
 
             // 默认不等: 一段就要几十秒到几分钟(含排队与 60 秒冷却), 两段更久,
             // 游戏内 UI 靠 /ingame-travel/status 轮询进度。想同步等结果就传 "wait": true
             if (!request.Wait)
-                return new DCTravelListener.InGameTravelResponse { Ok = true, Message = $"已开始: {target}（用 /dctravel/ingame-travel/status 查进度）" };
+            {
+                var then = request.Enter ? ", 跨完进入游戏" : string.Empty;
+                return new DCTravelListener.InGameTravelResponse { Ok = true, Message = $"已开始: {target}{then}（用 /dctravel/ingame-travel/status 查进度）" };
+            }
 
             var result = await run.ConfigureAwait(false);
             return new DCTravelListener.InGameTravelResponse { Ok = result.Ok, Message = result.Message };
@@ -192,9 +195,7 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             if (game == null)
                 return Failed(resolveError ?? "找不到目标客户端");
 
-            if (!game.Agents.HasFlag(InGameAgents.Minion))
-                return Failed("该客户端没有挂 Minion, 游戏内模块不会被注入");
-
+            // 与超域旅行一样, 挂没挂 Minion 都放行
             if (InGameTravelJobs.IsRunning(game.Process.Id))
                 return Failed("这个客户端已经有一次换大区在进行中");
 
@@ -304,51 +305,51 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     private sealed record TravelLeg(bool IsBack, TravelContext Context, string Describe);
 
     /// <summary>
-    ///     按顺序跑完所有段, 每一步的进度写进 <see cref="InGameTravelJobs" /> 供 UI 轮询。
+    ///     按顺序跑完所有段, 每一步的进度写进 <see cref="InGameTravelJobs" /> 供 UI 轮询; 这一单由 <see cref="InGameTravelEnter" /> 结束。
     ///     任何一段失败就整体停在那里 —— 不假装成功, 也不继续往下跑。
     /// </summary>
     private async Task<InGameTravelResult> RunLegsAsync(Process gameProcess, IReadOnlyList<TravelLeg> legs)
     {
-        var pid = gameProcess.Id;
+        var pid     = gameProcess.Id;
+        var service = new InGameTravelService(client);
+        var result  = InGameTravelResult.Failed("没有任何行程");
 
-        try
+        for (var i = 0; i < legs.Count; ++i)
         {
-            var service = new InGameTravelService(client);
-            var result  = InGameTravelResult.Failed("没有任何行程");
+            var leg = legs[i];
 
-            for (var i = 0; i < legs.Count; ++i)
-            {
-                var leg = legs[i];
+            // 多段时把「第几段」缀在每条进度前面, 单段就不啰嗦
+            var prefix   = legs.Count > 1 ? $"[{i + 1}/{legs.Count} {leg.Describe}] " : string.Empty;
+            var progress = new Progress<string>(text => InGameTravelJobs.Report(pid, prefix + text));
+            var context  = leg.Context;
 
-                // 多段时把「第几段」缀在每条进度前面, 单段就不啰嗦
-                var prefix   = legs.Count > 1 ? $"[{i + 1}/{legs.Count} {leg.Describe}] " : string.Empty;
-                var progress = new Progress<string>(text => InGameTravelJobs.Report(pid, prefix + text));
-                var context  = leg.Context;
+            result = leg.IsBack
+                         ? await service.TravelBackAsync(gameProcess, context.SourceGroup!, context.ReturnOrderId!,
+                                                         context.TargetArea!, context.CharacterName, progress, CancellationToken.None).ConfigureAwait(false)
+                         : await service.TravelAsync(gameProcess, context.SourceGroup!, context.TargetGroup!,
+                                                     context.Character!, context.TargetArea!, progress, CancellationToken.None).ConfigureAwait(false);
 
-                result = leg.IsBack
-                             ? await service.TravelBackAsync(gameProcess, context.SourceGroup!, context.ReturnOrderId!,
-                                                             context.TargetArea!, context.CharacterName, progress, CancellationToken.None).ConfigureAwait(false)
-                             : await service.TravelAsync(gameProcess, context.SourceGroup!, context.TargetGroup!,
-                                                         context.Character!, context.TargetArea!, progress, CancellationToken.None).ConfigureAwait(false);
-
-                if (!result.Ok)
-                {
-                    var message = legs.Count > 1 ? $"{prefix}{result.Message}" : result.Message;
-                    InGameTravelJobs.End(pid, false, message);
-                    return InGameTravelResult.Failed(message);
-                }
-            }
-
-            InGameTravelJobs.End(pid, true, result.Message);
-            return result;
+            if (!result.Ok)
+                return InGameTravelResult.Failed(legs.Count > 1 ? $"{prefix}{result.Message}" : result.Message);
         }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "[InGameTravel] 换大区任务异常");
-            InGameTravelJobs.End(pid, false, ex.Message);
-            return InGameTravelResult.Failed(ex.Message);
-        }
+
+        return result;
     }
+
+    /// <summary>
+    ///     请求带 enter 时跨完区那一步: 在落点大区的选角界面登录这个角色（名字 + 原始服务器代号, 请求带了 contentId 也带上）。
+    ///     游戏一侧用自动进入角色的真实实现; 它是这一单自己的收尾, 所以不被「正在换大区」挡住
+    /// </summary>
+    private InGameTravelEnterPlan EnterPlan(Process gameProcess, string landingArea, CharacterState state, string? contentId) =>
+        new
+        (
+            async () =>
+            {
+                var areas = await LoginArea.Get().ConfigureAwait(false);
+                return new CatAutoEnterRealGame(gameProcess, client, areas, landingArea, _ => { }) { OwnedByTravelJob = true };
+            },
+            new CatAutoEnterTarget(state.Name, state.HomeGroup.GroupCode, string.IsNullOrWhiteSpace(contentId) ? null : contentId)
+        );
 
     /// <summary>
     ///     把一次请求拆成要跑的几段。
@@ -362,7 +363,7 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     ///     <c>queryRoleList4Migration</c> 按原始服务器列角色 —— 角色人还在做客地时,
     ///     它的 roleId 照样查得到。所以不必等第一段跑完再解析第二段。
     /// </summary>
-    private async Task<(IReadOnlyList<TravelLeg> Legs, string? Error)> PlanAsync
+    private async Task<(IReadOnlyList<TravelLeg> Legs, CharacterState? State, string? Error)> PlanAsync
     (
         DCTravelListener.InGameTravelRequest request,
         CancellationToken                    cancellationToken
@@ -371,12 +372,12 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         var (state, stateError) = await ResolveCharacterStateAsync(request.Identity, cancellationToken).ConfigureAwait(false);
 
         if (state == null)
-            return ([], stateError);
+            return ([], null, stateError);
 
         // 跨界传送中: 人在同大区的别的世界。SDO 不接受从做客世界发起超域,
         // 必须先在游戏内(主城大水晶)返回原始世界 —— 那一步这里做不了。
         if (state.Visiting)
-            return ([], $"角色 {state.Name} 正跨界传送在 {state.CurrentGroup.GroupName}, "
+            return ([], state, $"角色 {state.Name} 正跨界传送在 {state.CurrentGroup.GroupName}, "
                         + $"要超域得先在游戏内返回原始世界 {state.HomeGroup.GroupName}（主城大水晶）");
 
         var legs = new List<TravelLeg>();
@@ -386,26 +387,26 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             var back = await ResolveReturnContextAsync(state, cancellationToken).ConfigureAwait(false);
 
             if (back.Error != null)
-                return ([], back.Error);
+                return ([], state, back.Error);
 
             legs.Add(new TravelLeg(true, back, "超域返回"));
 
             // 只想返回就到此为止
             if (request.Back)
-                return (legs, null);
+                return (legs, state, null);
         }
         else if (request.Back)
         {
-            return ([], $"角色 {state.Name} 没在超域 —— 它本来就在原始大区");
+            return ([], state, $"角色 {state.Name} 没在超域 —— 它本来就在原始大区");
         }
 
         var forward = await ResolveForwardContextAsync(request, state, cancellationToken).ConfigureAwait(false);
 
         if (forward.Error != null)
-            return ([], forward.Error);
+            return ([], state, forward.Error);
 
         legs.Add(new TravelLeg(false, forward, "超域旅行"));
-        return (legs, null);
+        return (legs, state, null);
     }
 
     /// <summary>
