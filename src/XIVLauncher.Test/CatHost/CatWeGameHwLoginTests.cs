@@ -9,7 +9,7 @@ namespace XIVLauncher.Test.CatHost;
 
 /// <summary>
 ///     WeGame QQ 账号密码的硬件自动登录编排: 全用假的硬件键鼠 / 屏幕 / 前台, 不接硬件、不拉起 WeGame。
-///     覆盖: 没接硬件、非法字符、前台被打断即停与重试上限、密码错不重试、等手机确认的交回与续跑、超时、导航、成功点「启动」。
+///     覆盖: 没接硬件、非法字符、前台被打断即停与重试上限、密码错不重试、客户做验证期间不超时、超时、导航、成功点「启动」。
 /// </summary>
 public sealed class CatWeGameHwLoginTests
 {
@@ -118,21 +118,39 @@ public sealed class CatWeGameHwLoginTests
     }
 
     [Fact]
-    public async Task PhoneConfirm_ReturnedFirst_ThenResumeSucceeds()
+    public async Task CustomerVerifying_ExtendsTheDeadline_UntilSignedIn()
     {
-        screen.PhoneConfirmProbe = () => true;
+        // 点了登录后弹出验证码 / 手机确认, 客户做了 1 秒才完成: 远超过 200ms 的等结果上限, 也不退回手动
+        var popupUntil = DateTime.UtcNow + TimeSpan.FromSeconds(1);
+        screen.CaptureProbe = () =>
+        {
+            if (DateTime.UtcNow < popupUntil)
+                return new CatWeGameLoginWindow(1210, 680, Popup: new CatWeGamePopup(CatWeGamePopupKind.QqConfirm));
 
-        var flow   = Flow();
-        var result = await flow.RunAsync(ACCOUNT, Secret(PASSWORD), CancellationToken.None).WaitAsync(Timeout);
+            foreground.SignedIn = true;
+            return null;
+        };
 
-        Assert.Equal(CatWeGameHwLoginOutcome.NeedsPhoneConfirm, result.Outcome);
+        var result = await ShortTimeoutFlow().RunAsync(ACCOUNT, Secret(PASSWORD), CancellationToken.None).WaitAsync(Timeout);
 
-        // 客户在手机上确认后主窗口出现, 续跑点「启动」
-        foreground.SignedIn = true;
-        var resumed = await flow.ResumeAfterPhoneConfirmAsync(CancellationToken.None).WaitAsync(Timeout);
-
-        Assert.Equal(CatWeGameHwLoginOutcome.Success, resumed.Outcome);
+        Assert.Equal(CatWeGameHwLoginOutcome.Success, result.Outcome);
         Assert.Contains((1480, 835), keyboard.Clicks);
+    }
+
+    [Fact]
+    public async Task CustomerVerifying_ThenNothing_TimesOutCountingFromTheLastPopup()
+    {
+        var started    = DateTime.UtcNow;
+        var popupUntil = started + TimeSpan.FromMilliseconds(800);
+        screen.CaptureProbe = () => DateTime.UtcNow < popupUntil
+                                        ? new CatWeGameLoginWindow(1210, 680, Popup: new CatWeGamePopup(CatWeGamePopupKind.CaptchaReady))
+                                        : new CatWeGameLoginWindow(1210, 680);
+
+        var result = await ShortTimeoutFlow().RunAsync(ACCOUNT, Secret(PASSWORD), CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatWeGameHwLoginOutcome.FallBackToManual, result.Outcome);
+        Assert.Contains("超时", result.Reason);
+        Assert.True(DateTime.UtcNow - started >= TimeSpan.FromMilliseconds(800));
     }
 
     [Fact]
@@ -173,6 +191,54 @@ public sealed class CatWeGameHwLoginTests
         Assert.Contains((125, 277), screen.Clicks);   // QQ 页签
         Assert.Contains((150, 633), screen.Clicks);   // 「QQ 账号密码登录」
     }
+
+    [Fact]
+    public async Task Clicker_WithHardware_FocusesChecksForegroundAndClicksOnScreen()
+    {
+        foreground.Login = new CatWeGameWindowRect(100, 50, 1210, 680);
+        var clicker = new CatWeGameClicker(screen, keyboard, foreground);
+
+        Assert.True(await clicker.ClickAsync(620, 449, CancellationToken.None));
+        Assert.True(await clicker.ClickAsync(382, 450, CancellationToken.None));
+
+        Assert.Equal([(720, 499), (482, 500)], keyboard.Clicks);
+        Assert.Equal(2, foreground.FocusCount);
+        Assert.Equal(1, keyboard.TryOpenCount);   // 有没有硬件只探测一次
+        Assert.Empty(screen.Clicks);
+    }
+
+    [Fact]
+    public async Task Clicker_WithHardware_ForegroundNotLoginWindow_DoesNotClick()
+    {
+        foreground.InterruptUntilCheck = 1;
+        var clicker = new CatWeGameClicker(screen, keyboard, foreground);
+
+        Assert.False(await clicker.ClickAsync(620, 449, CancellationToken.None));
+        Assert.Empty(keyboard.Clicks);
+        Assert.Empty(screen.Clicks);
+    }
+
+    [Fact]
+    public async Task Clicker_WithoutHardware_SendsWindowMessages()
+    {
+        keyboard.OpenResult = false;
+
+        Assert.True(await new CatWeGameClicker(screen, keyboard, foreground).ClickAsync(620, 449, CancellationToken.None));
+        Assert.True(await new CatWeGameClicker(screen, null, null).ClickAsync(382, 450, CancellationToken.None));
+
+        Assert.Equal([(620, 449), (382, 450)], screen.Clicks);
+        Assert.Empty(keyboard.Clicks);
+        Assert.Equal(0, foreground.FocusCount);
+    }
+
+    private CatWeGameHwLoginFlow ShortTimeoutFlow() =>
+        new(keyboard, screen, foreground)
+        {
+            ActionPause        = TimeSpan.Zero,
+            NavPause           = TimeSpan.Zero,
+            LoginResultPoll    = TimeSpan.FromMilliseconds(5),
+            LoginResultTimeout = TimeSpan.FromMilliseconds(200)
+        };
 
     private CatWeGameHwLoginFlow Flow() =>
         new(keyboard, screen, foreground)

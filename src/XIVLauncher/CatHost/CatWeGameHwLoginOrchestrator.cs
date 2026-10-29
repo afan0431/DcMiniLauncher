@@ -12,10 +12,7 @@ public enum CatWeGameHwLoginOutcome
     FallBackToManual,
 
     /// <summary>WeGame 提示密码错误: 不反复重试（避免锁号）, 退回请员工联系客户核对</summary>
-    PasswordRejected,
-
-    /// <summary>停在等客户在手机 QQ 上确认: 本机点不了, 要提醒客户</summary>
-    NeedsPhoneConfirm
+    PasswordRejected
 }
 
 /// <summary>硬件自动登录的结果</summary>
@@ -31,16 +28,14 @@ public sealed record CatWeGameHwLoginResult(CatWeGameHwLoginOutcome Outcome, str
 
     /// <summary>密码错误</summary>
     public static readonly CatWeGameHwLoginResult PasswordRejected = new(CatWeGameHwLoginOutcome.PasswordRejected);
-
-    /// <summary>要客户在手机 QQ 上确认</summary>
-    public static readonly CatWeGameHwLoginResult NeedsPhoneConfirm = new(CatWeGameHwLoginOutcome.NeedsPhoneConfirm);
 }
 
 /// <summary>
 ///     用本机的硬件键鼠（CH9329）在 WeGame 登录窗口里自动输入 QQ 账号密码、点登录, 登录成功后点「启动」。
 ///     <para>
 ///         硬件按键只落到前台窗口, 所以每次输入前都把登录窗口切到前台、并核对前台仍是它, 不是就立刻中止本次、整段重来（最多 <see cref="MaxAttempts" /> 次）;
-///         仍不成功、本机没接硬件、密码含硬件键盘打不出的字符时, 都退回员工手动（不判上号失败）。密码错误不重试。停在等手机确认时交回由上层提醒客户。
+///         仍不成功、本机没接硬件、密码含硬件键盘打不出的字符时, 都退回员工手动（不判上号失败）。密码错误不重试。
+///         点了登录之后的图片验证码与手机 QQ 确认由 <see cref="CatWeGameChallengeWatcher" /> 报给客户; 客户在做验证期间不按 <see cref="LoginResultTimeout" /> 超时。
 ///     </para>
 ///     <para>坐标按 StartFor 拉起的 1210×680 登录窗口量（见 window-geometry.md）, 按实际客户区尺寸线性换算; 页面校验与「启动」坐标的图像阈值留实机核对。</para>
 /// </summary>
@@ -79,15 +74,14 @@ public sealed class CatWeGameHwLoginFlow(ICatHidKeyboard keyboard, ICatWeGameScr
     /// <summary>导航到账号密码页最多试几轮</summary>
     public int NavRounds { get; init; } = 3;
 
-    /// <summary>点了登录后等登录结果的上限</summary>
+    /// <summary>点了登录后等登录结果的上限; 登录窗里有弹窗（客户在做验证）时从最后一次看到弹窗起重新算</summary>
     public TimeSpan LoginResultTimeout { get; init; } = TimeSpan.FromMinutes(5);
 
     /// <summary>等登录结果时多久看一次</summary>
     public TimeSpan LoginResultPoll { get; init; } = TimeSpan.FromMilliseconds(500);
 
     /// <summary>
-    ///     跑一遍自动登录: 找硬件 → 导航到 QQ 账号密码页 → 填账号密码、点登录 → 等登录结果。
-    ///     停在等手机确认时返回 <see cref="CatWeGameHwLoginOutcome.NeedsPhoneConfirm" />, 由上层提醒客户后再调 <see cref="ResumeAfterPhoneConfirmAsync" />。
+    ///     跑一遍自动登录: 找硬件 → 导航到 QQ 账号密码页 → 填账号密码、点登录 → 等登录结果
     /// </summary>
     public async Task<CatWeGameHwLoginResult> RunAsync(string account, CatSecret password, CancellationToken cancellationToken)
     {
@@ -107,7 +101,7 @@ public sealed class CatWeGameHwLoginFlow(ICatHidKeyboard keyboard, ICatWeGameScr
             switch (await TryTypeAndLoginAsync(account, password, cancellationToken).ConfigureAwait(false))
             {
                 case AttemptResult.Ok:
-                    return await AwaitLoginResultAsync(false, cancellationToken).ConfigureAwait(false);
+                    return await AwaitLoginResultAsync(cancellationToken).ConfigureAwait(false);
 
                 case AttemptResult.Unmappable:
                     return CatWeGameHwLoginResult.Fallback("账号或密码里有硬件键盘打不出的字符, 请在这台电脑手动登录");
@@ -124,12 +118,6 @@ public sealed class CatWeGameHwLoginFlow(ICatHidKeyboard keyboard, ICatWeGameScr
 
         return CatWeGameHwLoginResult.Fallback("自动输入多次被打断, 请在这台电脑手动登录");
     }
-
-    /// <summary>
-    ///     客户在手机 QQ 上确认后接着等: 继续等主窗口出现、点「启动」; 这一段不再把「等确认」当新情况报出去
-    /// </summary>
-    public Task<CatWeGameHwLoginResult> ResumeAfterPhoneConfirmAsync(CancellationToken cancellationToken) =>
-        AwaitLoginResultAsync(true, cancellationToken);
 
     /// <summary>一次输入尝试的结果</summary>
     private enum AttemptResult
@@ -220,9 +208,10 @@ public sealed class CatWeGameHwLoginFlow(ICatHidKeyboard keyboard, ICatWeGameScr
     }
 
     /// <summary>
-    ///     等登录结果: 登录窗没了 + 主窗口出现 = 成功（点「启动」）; 密码错 = 不重试; 停在等手机确认 = 交回提醒客户; 超时 = 退回手动
+    ///     等登录结果: 登录窗没了 + 主窗口出现 = 成功（点「启动」）; 密码错 = 不重试; 超时 = 退回手动。
+    ///     登录窗里有弹窗（图片验证码、手机 QQ 确认, 客户正在做）时把截止时间往后顺延, 外层等登录的总时限照旧兜底
     /// </summary>
-    private async Task<CatWeGameHwLoginResult> AwaitLoginResultAsync(bool phoneConfirmReported, CancellationToken cancellationToken)
+    private async Task<CatWeGameHwLoginResult> AwaitLoginResultAsync(CancellationToken cancellationToken)
     {
         var deadline = Environment.TickCount64 + (long)LoginResultTimeout.TotalMilliseconds;
 
@@ -243,11 +232,8 @@ public sealed class CatWeGameHwLoginFlow(ICatHidKeyboard keyboard, ICatWeGameScr
                 return CatWeGameHwLoginResult.PasswordRejected;
             }
 
-            if (!phoneConfirmReported && screen.AwaitingPhoneConfirm())
-            {
-                Log.Information("[CatHost] WeGame 停在等手机 QQ 确认, 提醒客户");
-                return CatWeGameHwLoginResult.NeedsPhoneConfirm;
-            }
+            if (screen.CaptureLoginWindow()?.Popup != null)
+                deadline = Environment.TickCount64 + (long)LoginResultTimeout.TotalMilliseconds;
 
             await DelayAsync(LoginResultPoll, cancellationToken).ConfigureAwait(false);
         }
