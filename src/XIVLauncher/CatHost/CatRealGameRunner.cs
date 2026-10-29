@@ -1614,6 +1614,11 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         var startedAt = SafeProcessStartedAt(process);
 
+        // 截取模块要赶在卫月装 Present 钩子之前注入: 进程一记下就在后台注, 不挡守护记录和 started; 结果排在 started 之后报
+        var remoteHookInjection = closeNow || request.RemoteHook is not { } remoteHook
+                                      ? null
+                                      : Task.Run(() => CatRemoteHook.Inject(new CatProcessRemoteHookTarget(process), remoteHook), CancellationToken.None);
+
         // 先写守护记录再报 started: 外壳一拿到进程号, 这个游戏就必须是接管得了的
         await WriteGameRecordAsync(process, startedAt, options, dalamudOk).ConfigureAwait(false);
 
@@ -1621,6 +1626,14 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             reporter.Restarted(oldPid, launched.ProcessID, startedAt);
         else
             reporter.Started(launched.ProcessID, startedAt);
+
+        var remoteHookReport = remoteHookInjection?.ContinueWith
+        (
+            injection => reporter.RemoteHook(launched.ProcessID, startedAt, injection.Result),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        );
 
         RunningGameRegistry.Register(process, context.InGameAgents, context.DcTravelPort);
 
@@ -1679,6 +1692,10 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             Log.Information("[CatHost] 收到关闭请求, 不再等注入");
         }
+
+        // 截取模块的结果先于 running 报出（注入在游戏一起来就开始, 等卫月、挂 Minion 时通常已做完）
+        if (remoteHookReport != null)
+            await remoteHookReport.ConfigureAwait(false);
 
         if (!process.HasExited && !IsCloseRequested)
         {

@@ -11,7 +11,8 @@ namespace XIVLauncher.CatHost;
 ///     WeGameLogin = WeGame 号在本机没有可用的登录信息时拉起 WeGame 等员工登录, 为 false 时直接报 authorizationRequired;
 ///     AutoEnter = 游戏起来后自动经标题、选角进入游戏; CharacterName / CharacterHomeWorld = 要登录的角色（可为空）;
 ///     WeGameToken / WeGameAccountId = 工作台下发的 WeGame 登录信息与 WeGame 用户号（只有 WeGame 号会带, 两个同时有或同时为 null）;
-///     AuthOnly = 只登录: 登录成功即报 <see cref="ICatLaunchReporter.Authorized" /> 结束, 不起游戏（只有 WeGame 号会带, 此时 MinionCard 为 null、AutoEnter 为 false）
+///     AuthOnly = 只登录: 登录成功即报 <see cref="ICatLaunchReporter.Authorized" /> 结束, 不起游戏（只有 WeGame 号会带, 此时 MinionCard 为 null、AutoEnter 为 false）;
+///     RemoteHook = 要注入的远程截取模块, 不注入为 null（AuthOnly 时为 null）
 /// </summary>
 public sealed record CatLaunchRequest
 (
@@ -137,6 +138,11 @@ public interface ICatLaunchReporter
 
     /// <summary>Dalamud / Minion 注入结果</summary>
     void Agent(string kind, bool ok, string? code = null, string? message = null);
+
+    /// <summary>远程截取模块注入结果（launch 带 remoteHook 时, 每个起来的游戏进程一次, 含崩溃重启）</summary>
+    void RemoteHook(int pid, DateTimeOffset processStartedAt, CatRemoteHookResult result)
+    {
+    }
 
     /// <summary>游戏已退出（不再重启）; reason 见 <see cref="CatExitReasons" />, 重启失败时带 code / message</summary>
     void Exited(int pid, int? exitCode, string? reason = null, string? code = null, string? message = null);
@@ -539,6 +545,15 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (homeWorld is { Length: > MAX_HOME_WORLD_LENGTH } || homeWorld?.Any(char.IsControl) == true)
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"character.homeWorld 不能超过 {MAX_HOME_WORLD_LENGTH} 个字符, 也不能有控制字符");
 
+        // 截取模块的令牌不管接受与否都先登记脱敏
+        redactor.RegisterSecret(parameters.RemoteHook?.Token);
+
+        if (parameters.RemoteHook != null && CatRemoteHook.Validate(parameters.RemoteHook) is { } remoteHookRejected)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, remoteHookRejected);
+
+        // 只登录不起游戏, 不注入截取模块
+        var remoteHook = authOnly ? null : parameters.RemoteHook;
+
         // 游戏内模块是按国服客户端写的, 国际服带了 autoEnter 也不做; 只登录不起游戏, 也不做
         var autoEnter = parameters.AutoEnter == true && !isInternational && !authOnly;
 
@@ -579,10 +594,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 hasWeGameToken ? new CatSecret(parameters.WeGameToken!) : null,
                 weGameAccountId,
                 authOnly,
-                parameters.RemoteHook == null ? null : new CatRemoteHookParams(
-                    parameters.RemoteHook.DllPath,
-                    parameters.RemoteHook.PipeName,
-                    parameters.RemoteHook.Token)
+                remoteHook
             );
             selected = runnerFactory(accepted);
             runner   = selected;
@@ -1148,6 +1160,30 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         }
 
         Publish("game.agent", new { operationId = OperationId, kind, ok, code, message = Redact(message) });
+    }
+
+    /// <inheritdoc />
+    public void RemoteHook(int hookPid, DateTimeOffset startedAt, CatRemoteHookResult result)
+    {
+        if (result.Ok)
+            Serilog.Log.Information("[CatHost] 截取模块已就绪: PID={Pid}", hookPid);
+        else
+            Serilog.Log.Warning("[CatHost] 截取模块没有就绪: PID={Pid} {Code} {Message}", hookPid, result.Code, result.Message);
+
+        Publish
+        (
+            CatRemoteHook.EVENT,
+            new
+            {
+                operationId      = OperationId,
+                pid              = hookPid,
+                processStartedAt = CatProtocol.FormatTimestamp(startedAt),
+                ok               = result.Ok,
+                pipeName         = result.PipeName,
+                code             = result.Code,
+                message          = Redact(result.Message)
+            }
+        );
     }
 
     /// <inheritdoc />

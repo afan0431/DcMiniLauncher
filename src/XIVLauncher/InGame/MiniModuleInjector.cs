@@ -88,50 +88,138 @@ public static class MiniModuleInjector
         if (WriteModeFile(gameProcess.Id, readOnly) is { } modeError)
             return modeError;
 
+        if (LoadLibrary(gameProcess, modulePath.FullName) is { } failure)
+            return failure.Message;
+
+        Log.Information("[MiniModule] 已注入 {Module} → PID={Pid}", MODULE_FILE_NAME, gameProcess.Id);
+        return null;
+    }
+
+    /// <summary>目标进程里按完整路径找已加载的模块, 返回基址; 没有或读不到模块列表返回 null</summary>
+    public static IntPtr? FindModuleBase(Process gameProcess, string dllPath)
+    {
+        try
+        {
+            gameProcess.Refresh();
+
+            foreach (ProcessModule module in gameProcess.Modules)
+            {
+                if (string.Equals(module.FileName, dllPath, StringComparison.OrdinalIgnoreCase))
+                    return module.BaseAddress;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[MiniModule] 读取目标进程模块列表失败");
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    ///     在目标进程里 <c>LoadLibraryW(dllPath)</c>（dllPath 须是完整路径）。返回 null 表示模块已在目标进程的模块列表里, 否则是失败原因。
+    ///     模块已经在了也会再调一次 LoadLibraryW, 只加引用计数, DllMain 不再跑
+    /// </summary>
+    public static InjectFailure? LoadLibrary(Process gameProcess, string dllPath)
+    {
+        // kernel32 在所有进程里都映射在同一地址（同一次开机内), 所以本进程解析出来的地址可以直接用
+        var kernel32    = NativeMethods.GetModuleHandle("kernel32.dll");
+        var loadLibrary = NativeMethods.GetProcAddress(kernel32, "LoadLibraryW");
+
+        if (loadLibrary == IntPtr.Zero)
+            return new InjectFailure($"取 LoadLibraryW 地址失败 (err={Marshal.GetLastWin32Error()})");
+
+        // LoadLibraryW 要读的是目标进程里的宽字符串, 所以先把路径搬过去; 远程线程的退出码是被截断的 HMODULE, 不足为凭 —— 只认模块列表
+        if (RunRemoteThread(gameProcess, loadLibrary, dllPath, out _) is { } failure)
+            return failure;
+
+        return FindModuleBase(gameProcess, dllPath) == null
+                   ? new InjectFailure("远程线程跑完了, 但目标进程模块列表里没有这个 DLL（LoadLibraryW 失败）")
+                   : null;
+    }
+
+    /// <summary>
+    ///     在目标进程里调用已加载模块 dllPath 的导出函数 <c>DWORD WINAPI exportName(LPCWSTR argument)</c>, 等它返回并取返回值。
+    ///     导出地址按 DLL 文件的导出表算（不在本进程加载模块）。返回 null 表示调用完成, exitCode 是函数的返回值
+    /// </summary>
+    public static InjectFailure? CallExport(Process gameProcess, string dllPath, string exportName, string argument, out uint exitCode)
+    {
+        exitCode = 0;
+
+        if (FindModuleBase(gameProcess, dllPath) is not { } moduleBase)
+            return new InjectFailure($"目标进程里没有加载 {Path.GetFileName(dllPath)}");
+
+        uint? rva;
+
+        try
+        {
+            rva = PeExports.FindRva(dllPath, exportName);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
+        {
+            return new InjectFailure($"读 {Path.GetFileName(dllPath)} 的导出表失败: {ex.Message}");
+        }
+
+        if (rva == null)
+            return new InjectFailure($"{Path.GetFileName(dllPath)} 没有导出 {exportName}");
+
+        return RunRemoteThread(gameProcess, moduleBase + (nint)rva.Value, argument, out exitCode);
+    }
+
+    /// <summary>把 argument 按 UTF-16（带结尾 0）写进目标进程, 在那里以它为参数从 startAddress 起一个线程, 等它结束并取退出码</summary>
+    private static InjectFailure? RunRemoteThread(Process gameProcess, IntPtr startAddress, string argument, out uint exitCode)
+    {
+        exitCode = 0;
+
+        if (gameProcess.HasExited)
+            return new InjectFailure("游戏进程已经退出");
+
         var access = ProcessAccess.CREATE_THREAD | ProcessAccess.QUERY_INFORMATION | ProcessAccess.VM_OPERATION |
                      ProcessAccess.VM_WRITE     | ProcessAccess.VM_READ;
 
         var process = NativeMethods.OpenProcess(access, false, gameProcess.Id);
 
         if (process == IntPtr.Zero)
-            return $"OpenProcess 失败 (err={Marshal.GetLastWin32Error()})";
+        {
+            var error = Marshal.GetLastWin32Error();
+            return new InjectFailure($"OpenProcess 失败 (err={error})", error == NativeMethods.ERROR_ACCESS_DENIED);
+        }
 
-        var remotePath = IntPtr.Zero;
+        var remoteArgument = IntPtr.Zero;
 
         try
         {
-            // LoadLibraryW 要读的是目标进程里的宽字符串, 所以先把路径搬过去
-            var pathBytes = Encoding.Unicode.GetBytes(modulePath.FullName + '\0');
+            var argumentBytes = Encoding.Unicode.GetBytes(argument + '\0');
 
-            remotePath = NativeMethods.VirtualAllocEx(process, IntPtr.Zero, (UIntPtr)pathBytes.Length,
-                                                      NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE,
-                                                      NativeMethods.PAGE_READWRITE);
+            remoteArgument = NativeMethods.VirtualAllocEx(process, IntPtr.Zero, (UIntPtr)argumentBytes.Length,
+                                                          NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE,
+                                                          NativeMethods.PAGE_READWRITE);
 
-            if (remotePath == IntPtr.Zero)
-                return $"VirtualAllocEx 失败 (err={Marshal.GetLastWin32Error()})";
+            if (remoteArgument == IntPtr.Zero)
+                return new InjectFailure($"VirtualAllocEx 失败 (err={Marshal.GetLastWin32Error()})");
 
-            if (!NativeMethods.WriteProcessMemory(process, remotePath, pathBytes, (UIntPtr)pathBytes.Length, out _))
-                return $"WriteProcessMemory 失败 (err={Marshal.GetLastWin32Error()})";
+            if (!NativeMethods.WriteProcessMemory(process, remoteArgument, argumentBytes, (UIntPtr)argumentBytes.Length, out _))
+                return new InjectFailure($"WriteProcessMemory 失败 (err={Marshal.GetLastWin32Error()})");
 
-            // kernel32 在所有进程里都映射在同一地址（同一次开机内), 所以本进程解析出来的地址可以直接用
-            var kernel32 = NativeMethods.GetModuleHandle("kernel32.dll");
-            var loadLibrary = NativeMethods.GetProcAddress(kernel32, "LoadLibraryW");
-
-            if (loadLibrary == IntPtr.Zero)
-                return $"取 LoadLibraryW 地址失败 (err={Marshal.GetLastWin32Error()})";
-
-            var thread = NativeMethods.CreateRemoteThread(process, IntPtr.Zero, UIntPtr.Zero, loadLibrary,
-                                                          remotePath, 0, out _);
+            var thread = NativeMethods.CreateRemoteThread(process, IntPtr.Zero, UIntPtr.Zero, startAddress,
+                                                          remoteArgument, 0, out _);
 
             if (thread == IntPtr.Zero)
-                return $"CreateRemoteThread 失败 (err={Marshal.GetLastWin32Error()})";
+                return new InjectFailure($"CreateRemoteThread 失败 (err={Marshal.GetLastWin32Error()})");
 
             try
             {
                 var wait = NativeMethods.WaitForSingleObject(thread, REMOTE_THREAD_TIMEOUT_MS);
 
+                // 超时时远程线程可能还在读参数, 不能释放那块内存
                 if (wait != NativeMethods.WAIT_OBJECT_0)
-                    return $"等待远程线程超时/失败 (wait=0x{wait:X})";
+                {
+                    remoteArgument = IntPtr.Zero;
+                    return new InjectFailure($"等待远程线程超时/失败 (wait=0x{wait:X})");
+                }
+
+                if (!NativeMethods.GetExitCodeThread(thread, out exitCode))
+                    return new InjectFailure($"GetExitCodeThread 失败 (err={Marshal.GetLastWin32Error()})");
             }
             finally
             {
@@ -140,17 +228,12 @@ public static class MiniModuleInjector
         }
         finally
         {
-            if (remotePath != IntPtr.Zero)
-                NativeMethods.VirtualFreeEx(process, remotePath, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+            if (remoteArgument != IntPtr.Zero)
+                NativeMethods.VirtualFreeEx(process, remoteArgument, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
 
             NativeMethods.CloseHandle(process);
         }
 
-        // 远程线程的退出码是被截断的 HMODULE, 不足为凭 —— 只认模块列表
-        if (!IsInjected(gameProcess))
-            return "远程线程跑完了, 但目标进程模块列表里没有这个 DLL（LoadLibraryW 失败）";
-
-        Log.Information("[MiniModule] 已注入 {Module} → PID={Pid}", MODULE_FILE_NAME, gameProcess.Id);
         return null;
     }
 
@@ -211,6 +294,7 @@ public static class MiniModuleInjector
         public const uint MEM_RELEASE   = 0x8000;
         public const uint PAGE_READWRITE = 0x04;
         public const uint WAIT_OBJECT_0  = 0x0;
+        public const int  ERROR_ACCESS_DENIED = 5;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern IntPtr OpenProcess(ProcessAccess desiredAccess, bool inheritHandle, int processId);
@@ -238,6 +322,14 @@ public static class MiniModuleInjector
         public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetExitCodeThread(IntPtr thread, out uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CloseHandle(IntPtr handle);
     }
 }
+
+/// <summary>
+///     注入失败的原因; AccessDenied = 打不开游戏进程（权限不足, 游戏多半以更高权限运行）
+/// </summary>
+public sealed record InjectFailure(string Message, bool AccessDenied = false);

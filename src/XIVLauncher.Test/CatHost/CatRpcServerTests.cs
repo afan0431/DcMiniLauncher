@@ -1635,6 +1635,102 @@ public sealed class CatRpcServerTests : IDisposable
         Assert.True(inject["result"]!["accepted"]!.GetValue<bool>());
     }
 
+    private const string REMOTE_HOOK_PIPE  = @"\\.\pipe\cat-remote-0123456789abcdef0123456789abcdef";
+    private const string REMOTE_HOOK_TOKEN = "remote-hook-token-0123456789abcdef";
+
+    [Fact]
+    public async Task Launch_WithRemoteHook_PassesIt_AndNeverPrintsTheToken()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new { operationId = "op1", accountName = "acc", dalamud = false, remoteHook = new { dllPath = @"C:\Cat\cat_remote_hook.dll", pipeName = REMOTE_HOOK_PIPE, token = REMOTE_HOOK_TOKEN } }
+        );
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        var request = runner.Request!;
+        Assert.Equal(new CatRemoteHookParams(@"C:\Cat\cat_remote_hook.dll", REMOTE_HOOK_PIPE, REMOTE_HOOK_TOKEN), request.RemoteHook);
+        Assert.DoesNotContain(REMOTE_HOOK_TOKEN, request.ToString());
+
+        // 已登记脱敏: 启动器不小心把令牌写进发给外壳的文字也会被遮住
+        runner.Reporter!.Log("error", $"管道认证失败 {REMOTE_HOOK_TOKEN}");
+        runner.Reporter.RemoteHook(4242, DateTimeOffset.UtcNow, new CatRemoteHookResult(false, null, CatCodes.REMOTE_HOOK_FAILED, $"参数 {REMOTE_HOOK_TOKEN}"));
+
+        var seen = new List<(string Method, JsonNode? Params)>();
+        var hook = client.WaitForEvent(CatRemoteHook.EVENT, Timeout, seen).Params!;
+
+        Assert.Equal("op1", hook["operationId"]!.GetValue<string>());
+        Assert.Equal(4242, hook["pid"]!.GetValue<int>());
+        Assert.False(hook["ok"]!.GetValue<bool>());
+        Assert.Equal(CatCodes.REMOTE_HOOK_FAILED, hook["code"]!.GetValue<string>());
+        Assert.All(seen, x => Assert.DoesNotContain(REMOTE_HOOK_TOKEN, x.Params?.ToJsonString(CatProtocol.JsonOptions) ?? string.Empty));
+    }
+
+    [Fact]
+    public async Task RemoteHookReady_IsPublishedWithThePipeName()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false });
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+
+        var pipe = CatRemoteHook.PipeNameFor(REMOTE_HOOK_PIPE, 4242);
+        runner.Reporter!.RemoteHook(4242, DateTimeOffset.UtcNow, CatRemoteHookResult.Ready(pipe));
+
+        var hook = client.WaitForEvent(CatRemoteHook.EVENT, Timeout).Params!;
+
+        Assert.True(hook["ok"]!.GetValue<bool>());
+        Assert.Equal(pipe, hook["pipeName"]!.GetValue<string>());
+        Assert.NotNull(hook["processStartedAt"]);
+    }
+
+    [Theory]
+    [InlineData(@"cat_remote_hook.dll", REMOTE_HOOK_PIPE, REMOTE_HOOK_TOKEN)]                                             // 不是完整路径
+    [InlineData(@"C:\Cat\cat_remote_hook.exe", REMOTE_HOOK_PIPE, REMOTE_HOOK_TOKEN)]                                   // 不是 .dll
+    [InlineData(@"C:\Cat\cat_remote_hook.dll", @"\\.\pipe\cat-remote-42-0123456789abcdef0123456789abcdef", REMOTE_HOOK_TOKEN)] // 自带进程号
+    [InlineData(@"C:\Cat\cat_remote_hook.dll", @"\\.\pipe\cat-remote-0123", REMOTE_HOOK_TOKEN)]                        // 后缀不足 32 位
+    [InlineData(@"C:\Cat\cat_remote_hook.dll", REMOTE_HOOK_PIPE, "short")]                                             // 令牌太短
+    [InlineData(@"C:\Cat\cat_remote_hook.dll", REMOTE_HOOK_PIPE, "remote hook token 0123456789abcdef")]                 // 令牌有空白
+    public async Task Launch_WithInvalidRemoteHook_IsRejected(string dllPath, string remotePipe, string remoteToken)
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new { operationId = "op1", accountName = "acc", dalamud = false, remoteHook = new { dllPath, pipeName = remotePipe, token = remoteToken } }
+        );
+
+        Assert.False(response["result"]!["accepted"]!.GetValue<bool>());
+        Assert.Equal("invalidParams", response["result"]!["code"]!.GetValue<string>());
+        Assert.False(host.HasLaunch);
+    }
+
+    [Fact]
+    public async Task Launch_AuthOnly_DropsRemoteHook()
+    {
+        await using var client = await ConnectAndHelloAsync();
+
+        var response = await client.RequestAsync
+        (
+            "launch",
+            new
+            {
+                operationId = "op1", accountName = "123456", dalamud = false, platform = "weGame", weGameLogin = true, authOnly = true,
+                remoteHook  = new { dllPath = @"C:\Cat\cat_remote_hook.dll", pipeName = REMOTE_HOOK_PIPE, token = REMOTE_HOOK_TOKEN }
+            }
+        );
+
+        Assert.True(response["result"]!["accepted"]!.GetValue<bool>());
+        await runner.Started.Task.WaitAsync(Timeout);
+        Assert.Null(runner.Request!.RemoteHook);
+    }
+
     private async Task<CatTestClient> ConnectAndHelloAsync()
     {
         var client   = await CatTestClient.ConnectAsync(pipeName, Timeout);
