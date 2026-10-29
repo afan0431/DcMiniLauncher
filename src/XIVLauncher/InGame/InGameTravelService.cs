@@ -117,7 +117,9 @@ public sealed class InGameTravelService(DCTravelClient client)
                        (
                            gameProcess,
                            targetArea,
-                           ct => SubmitWithRetryAsync(sourceGroup, targetGroup, character, progress, ct),
+                           (module, ct) => SubmitWithRetryAsync(sourceGroup, targetGroup, character,
+                                                                visitCt => VisitTargetLobbyAsync(module, targetArea, sourceGroup.AreaName, progress, visitCt),
+                                                                progress, ct),
                            character.Name,
                            progress,
                            cancellationToken
@@ -162,7 +164,7 @@ public sealed class InGameTravelService(DCTravelClient client)
                        (
                            gameProcess,
                            homeArea,
-                           ct => SubmitReturnAsync(currentGroup, returnOrderId, progress, ct),
+                           (_, ct) => SubmitReturnAsync(currentGroup, returnOrderId, progress, ct),
                            characterName,
                            progress,
                            cancellationToken
@@ -209,7 +211,7 @@ public sealed class InGameTravelService(DCTravelClient client)
                            gameProcess,
                            targetArea,
                            // 在线那半空跑 —— 换登录大区不下单
-                           _ => Task.FromResult<string?>(null),
+                           (_, _) => Task.FromResult<string?>(null),
                            null, // 换登录大区不针对哪个角色
                            progress,
                            cancellationToken
@@ -241,7 +243,7 @@ public sealed class InGameTravelService(DCTravelClient client)
             return InGameTravelResult.Failed($"大区 {targetArea.AreaName} 缺少主机名信息");
 
         // 编排只在选角界面换大厅; 角色已经在游戏里说明有人自己进去了, 这时不替他登出
-        return await TravelOnModuleAsync(module, gameProcessId, targetArea, _ => Task.FromResult<string?>(null), null, progress, cancellationToken, false)
+        return await TravelOnModuleAsync(module, gameProcessId, targetArea, (_, _) => Task.FromResult<string?>(null), null, progress, cancellationToken, false)
                    .ConfigureAwait(false);
     }
 
@@ -285,7 +287,7 @@ public sealed class InGameTravelService(DCTravelClient client)
     (
         Process                                            gameProcess,
         LoginArea                                          targetArea,
-        Func<CancellationToken, Task<string?>>             submitAsync,
+        Func<IMiniModuleChannel, CancellationToken, Task<string?>> submitAsync,
         string?                                            focusCharacter,
         IProgress<string>?                                 progress,
         CancellationToken                                  cancellationToken
@@ -318,7 +320,7 @@ public sealed class InGameTravelService(DCTravelClient client)
         IMiniModuleChannel                     module,
         int                                    gameProcessId,
         LoginArea                              targetArea,
-        Func<CancellationToken, Task<string?>> submitAsync,
+        Func<IMiniModuleChannel, CancellationToken, Task<string?>> submitAsync,
         string?                                focusCharacter,
         IProgress<string>?                     progress,
         CancellationToken                      cancellationToken,
@@ -374,7 +376,7 @@ public sealed class InGameTravelService(DCTravelClient client)
             try
             {
                 // 3. 在线那半: 下新单 / 提交返回单, 然后轮询到「完成」
-                var ordered = await submitAsync(cancellationToken).ConfigureAwait(false);
+                var ordered = await submitAsync(module, cancellationToken).ConfigureAwait(false);
 
                 if (ordered != null)
                     return InGameTravelResult.Failed(ordered);
@@ -439,11 +441,13 @@ public sealed class InGameTravelService(DCTravelClient client)
         DCTravelGroup      sourceGroup,
         DCTravelGroup      requestedTargetGroup,
         DCTravelCharacter  character,
+        Func<CancellationToken, Task<string?>> visitTargetLobbyAsync,
         IProgress<string>? progress,
         CancellationToken  cancellationToken
     )
     {
-        string? lastFailure = null;
+        string? lastFailure  = null;
+        var     lobbyVisited = false;
 
         for (var attempt = 0; attempt <= MaxRetryCount; ++attempt)
         {
@@ -480,6 +484,21 @@ public sealed class InGameTravelService(DCTravelClient client)
 
             if (lastFailure == null)
                 return null; // 成功
+
+            // 账号没进过目标大区: 干等重试永远过不去, 先进一次它的选角界面再重下（一次跨区只做一次）
+            if (NeedsTargetLobbyVisit(lastFailure))
+            {
+                if (lobbyVisited || attempt == MaxRetryCount)
+                    return lastFailure;
+
+                lobbyVisited = true;
+                var visitError = await visitTargetLobbyAsync(cancellationToken).ConfigureAwait(false);
+
+                if (visitError != null)
+                    return $"{lastFailure}（自动进目标大区选角界面没成功: {visitError}）";
+
+                continue;
+            }
 
             if (!IsRetryable(lastFailure) || attempt == MaxRetryCount)
                 return lastFailure;
@@ -534,6 +553,110 @@ public sealed class InGameTravelService(DCTravelClient client)
             Log.Warning(ex, "[InGameTravel] 刷新目标服务器状态失败, 按原目标下单");
             return requestedTargetGroup;
         }
+    }
+
+    /// <summary>
+    ///     SDO 拒单「目标大区角色空位无法确认，请登录目标大区确认」= 这个账号从没进过目标大区的选角界面（10-29 用户告知）。
+    ///     原文里也带「传送失败」, 不先认它就会被当成服务侧忙白重试 20 次。
+    /// </summary>
+    private static bool NeedsTargetLobbyVisit(string message) =>
+        message.Contains("空位无法确认", StringComparison.Ordinal) ||
+        message.Contains("请登录目标大区确认", StringComparison.Ordinal);
+
+    /// <summary>
+    ///     在标题界面替账号进一次目标大区的选角界面（让 SDO 认下空位）, 再回标题、把登录大区换回原来那个。
+    ///     调用时已在标题界面且 KEEPALIVE ON; 返回时同样如此。返回 null = 进过了, 否则是失败原因。
+    ///     换回原大区只为跨区最终没成时游戏不停在一个没有角色的大区; 跨区成功后第 5 步照样改到目标大区。
+    /// </summary>
+    private async Task<string?> VisitTargetLobbyAsync
+    (
+        IMiniModuleChannel module,
+        LoginArea          targetArea,
+        string             sourceAreaName,
+        IProgress<string>? progress,
+        CancellationToken  cancellationToken
+    )
+    {
+        Report(progress, $"账号没进过 {targetArea.AreaName}, 先进一次它的选角界面确认空位…");
+
+        try
+        {
+            if (!await LoginLobbyAsync(module, targetArea, cancellationToken).ConfigureAwait(false))
+                return "取不到登录票据";
+
+            var arrived  = false;
+            var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(90);
+
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                var where = await module.SendAsync("WHERE", cancellationToken).ConfigureAwait(false);
+
+                if (where.Contains("where=charaselect", StringComparison.Ordinal))
+                {
+                    arrived = true;
+                    break;
+                }
+
+                await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!arrived)
+                return $"90 秒内没进 {targetArea.AreaName} 的选角界面";
+
+            Log.Information("[InGameTravel] 已进 {Area} 选角界面, 回标题后重新下单", targetArea.AreaName);
+            await CommandAsync(module, "RETURNTITLE", cancellationToken).ConfigureAwait(false);
+
+            if (!await WaitForTitleAsync(module, progress, cancellationToken).ConfigureAwait(false))
+                return "进过选角界面后等不到标题界面";
+
+            var sourceArea = (await LoginArea.Get().ConfigureAwait(false))
+                .FirstOrDefault(x => string.Equals(x.AreaName, sourceAreaName, StringComparison.Ordinal));
+
+            if (sourceArea == null)
+            {
+                Log.Warning("[InGameTravel] 拿不到原大区 {Area} 的登录主机名, 登录大区留在 {Target}", sourceAreaName, targetArea.AreaName);
+                return null;
+            }
+
+            var sid = await client.RefreshGameSessionId().ConfigureAwait(false);
+
+            if (string.IsNullOrWhiteSpace(sid))
+                return "换回原大区时取不到登录票据";
+
+            await CommandAsync(module, $"SETHOSTS {sourceArea.AreaLobby} {sourceArea.AreaConfigUpload} {sourceArea.AreaGM}", cancellationToken).ConfigureAwait(false);
+            await CommandAsync(module, "RELEASE", cancellationToken).ConfigureAwait(false);
+            await CommandAsync(module, $"SETSID {sid}", cancellationToken).ConfigureAwait(false);
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[InGameTravel] 进目标大区选角界面时出错");
+            return ex.Message;
+        }
+        finally
+        {
+            await TryCommandAsync(module, "KEEPALIVE ON", cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>现取票据 → 改主机名 → 作废大厅上下文 → 写票据 → 关保活 → 点「开始游戏」。票据取不到返回 false。</summary>
+    private async Task<bool> LoginLobbyAsync(IMiniModuleChannel module, LoginArea area, CancellationToken cancellationToken)
+    {
+        var sid = await client.RefreshGameSessionId().ConfigureAwait(false);
+
+        if (string.IsNullOrWhiteSpace(sid))
+            return false;
+
+        await CommandAsync(module, $"SETHOSTS {area.AreaLobby} {area.AreaConfigUpload} {area.AreaGM}", cancellationToken).ConfigureAwait(false);
+        await CommandAsync(module, "RELEASE", cancellationToken).ConfigureAwait(false);
+        await CommandAsync(module, $"SETSID {sid}", cancellationToken).ConfigureAwait(false);
+        await TryCommandAsync(module, "KEEPALIVE OFF", cancellationToken).ConfigureAwait(false);
+        await CommandAsync(module, "LOGIN", cancellationToken).ConfigureAwait(false);
+        return true;
     }
 
     /// <summary>DcTraveler 的重试判据: 只有这几类「服务侧忙」的错误才值得再试。</summary>
