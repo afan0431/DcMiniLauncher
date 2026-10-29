@@ -355,7 +355,7 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     ///     把一次请求拆成要跑的几段。
     ///     <list type="bullet">
     ///       <item>在原始大区 → 1 段: 超域旅行</item>
-    ///       <item>超域中 + 请求返回 → 1 段: 超域返回</item>
+    ///       <item>超域中 + 请求返回, 或要去的就是原始大区 → 1 段: 超域返回</item>
     ///       <item>超域中 + 要去别的大区 → 2 段: 超域返回 → （冷却 60 秒）→ 超域旅行</item>
     ///       <item>跨界传送中 → 拒绝: SDO 不接受从做客世界发起超域, 得先在游戏内返回原始世界</item>
     ///     </list>
@@ -391,8 +391,9 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
 
             legs.Add(new TravelLeg(true, back, "超域返回"));
 
-            // 只想返回就到此为止
-            if (request.Back)
+            // 只想返回、或要去的就是原始大区, 到此为止 —— 返回就落在原始大区, 再排一段「原始大区 → 原始大区」的超域旅行是错的
+            //   （10-29 实机: 鱼鱼无敌啦 超域在 猫小胖/紫水栈桥, 组队集合在原始大区 豆豆柴, 多排的第二段在原服查不到角色, 整单被拒）
+            if (request.Back || string.Equals(request.Area, state.HomeGroup.AreaName, StringComparison.Ordinal))
                 return (legs, state, null);
         }
         else if (request.Back)
