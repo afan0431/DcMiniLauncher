@@ -12,7 +12,7 @@ using Xunit;
 namespace XIVLauncher.Test.DCTravel;
 
 /// <summary>
-///     本机接口 <c>/cat/job</c>、<c>/cat/progress</c> 走真 HTTP: 返回码、体、拒绝带 Origin 的请求; 跨区监听与模拟模式的独立监听都挂得上
+///     本机接口 <c>/cat/job</c>、<c>/cat/progress</c>、<c>/cat/snapshot</c> 走真 HTTP: 返回码、体、拒绝带 Origin 的请求; 跨区监听与模拟模式的独立监听都挂得上
 /// </summary>
 public sealed class CatLocalApiTests
 {
@@ -74,6 +74,33 @@ public sealed class CatLocalApiTests
 
         lock (published)
             Assert.Equal([CatJobChannel.PROGRESS_EVENT], published);
+    }
+
+    [Fact]
+    public async Task StandaloneListener_ServesSnapshot()
+    {
+        var published = new List<string>();
+        var channel   = NewChannel(published);
+        var port      = FreePort();
+        channel.GameStarted(1234);
+
+        using var listener = new CatLocalListener(port, channel);
+        Assert.True(await listener.StartAsync(Timeout));
+
+        var url = $"http://127.0.0.1:{port}/cat/snapshot";
+
+        var accepted = await Http.PostAsync(url, new StringContent(CatJobChannelTests.Snapshot(1234, 3), Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+        Assert.Equal(3, JsonNode.Parse(await accepted.Content.ReadAsStringAsync())!["seq"]!.GetValue<long>());
+
+        Assert.Equal(HttpStatusCode.NotFound, (await Http.PostAsync(url, new StringContent(CatJobChannelTests.Snapshot(999, 4), Encoding.UTF8, "application/json"))).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await Http.PostAsync(url, new StringContent("{}", Encoding.UTF8, "application/json"))).StatusCode);
+
+        var oversized = new string(' ', 70 * 1024) + CatJobChannelTests.Snapshot(1234, 5);
+        Assert.Equal(HttpStatusCode.BadRequest, (await Http.PostAsync(url, new StringContent(oversized, Encoding.UTF8, "application/json"))).StatusCode);
+
+        lock (published)
+            Assert.Equal([CatJobChannel.SNAPSHOT_EVENT], published);
     }
 
     [Fact]
@@ -182,12 +209,17 @@ public sealed class CatLocalApiTests
         using var client   = new DCTravelClient(string.Empty);
         using var listener = new DCTravelListener(client, port, false);
 
-        // 没装处理方时两条路由回 404
+        // 没装处理方时 /cat 下的路由都回 404
         _ = listener.StartAsync();
         Assert.True(await listener.WaitListeningAsync(Timeout));
         Assert.Equal(HttpStatusCode.NotFound, (await Http.GetAsync($"http://127.0.0.1:{port}/cat/job?pid=1234")).StatusCode);
 
+        var snapshotUrl = $"http://127.0.0.1:{port}/cat/snapshot";
+        Assert.Equal(HttpStatusCode.NotFound, (await Http.PostAsync(snapshotUrl, new StringContent(CatJobChannelTests.Snapshot(1234, 1), Encoding.UTF8, "application/json"))).StatusCode);
+
         listener.CatEndpoints = channel;
+
+        Assert.Equal(HttpStatusCode.OK, (await Http.PostAsync(snapshotUrl, new StringContent(CatJobChannelTests.Snapshot(1234, 1), Encoding.UTF8, "application/json"))).StatusCode);
 
         var job = await Http.GetAsync($"http://127.0.0.1:{port}/cat/job?pid=1234");
         Assert.Equal(HttpStatusCode.OK, job.StatusCode);

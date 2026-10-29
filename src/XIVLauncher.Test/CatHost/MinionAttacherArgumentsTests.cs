@@ -87,6 +87,28 @@ public sealed class MinionAttacherArgumentsTests
         );
     }
 
+    /// <summary>挂客户端目录时参数集合不变, 只有 -datpath / -botpath 换成客户端目录下的路径</summary>
+    [Fact]
+    public void Cn_ClientDir_UsesClientPaths_SameOptions()
+    {
+        const string CLIENT   = @"D:\MINI-clients\4321-op-1";
+        const string GAME_EXE = @"G:\最终幻想XIV\sdo\sdologin\Launcher.exe";
+
+        var botPath = MinionAttacher.BotPathOf(CLIENT);
+        var datPath = MinionAttacher.DatPathOf(CLIENT, MinionCards.VARIANT_CN);
+
+        Assert.Equal(@"D:\MINI-clients\4321-op-1\Bots\FFXIVMinion64", botPath);
+        Assert.Equal(BOT_PATH, MinionAttacher.BotPathOf(@"D:\MINI"));
+
+        var main   = MinionAttacher.BuildArguments(Card(MinionCards.VARIANT_CN), BOT_PATH, MinionAttacher.DatPathOf(@"D:\MINI", MinionCards.VARIANT_CN), GAME_EXE, 4321)!;
+        var client = MinionAttacher.BuildArguments(Card(MinionCards.VARIANT_CN), botPath, datPath, GAME_EXE, 4321)!;
+
+        Assert.Equal(main.Select(x => x.Replace(@"=D:\MINI\", @"=D:\MINI-clients\4321-op-1\")), client);
+        Assert.Contains(@"-datpath=D:\MINI-clients\4321-op-1\Bots\FFXIVMinion64\MinionFiles\FFXIVMinionCN_64.dat", client);
+        Assert.Contains(@"-botpath=D:\MINI-clients\4321-op-1\Bots\FFXIVMinion64", client);
+        Assert.Contains(@"-path=G:\最终幻想XIV\sdo\sdologin\Launcher.exe", client);
+    }
+
     [Theory]
     [InlineData("", UID, FORUM_ID, FORUM_PASSWORD)]
     [InlineData(KEYCODE, " ", FORUM_ID, FORUM_PASSWORD)]

@@ -24,6 +24,7 @@
     </ItemGroup>
 
     <ItemGroup>
+        <None Include="CatHost\Fixtures\**" CopyToOutputDirectory="PreserveNewest" />
         <None Update="CatHost\WeGameShots\*.png" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 

@@ -7,6 +7,7 @@
 //   PING        → OK PONG
 //   VERSION     → OK version=… pid=… log=…
 //   MAINTHREAD  → OK tid=… window=… main=… same=0|1   （在主线程上取到的线程 id）
+//   CHARCONFIG  → OK hooked=0|1 rva=… enabled=0|1 pending=… baselines=… set=…, 后面几行是配置套名、错误与最近动作
 //   UNLOAD      → OK BYE, 随后模块自我卸载
 //
 // ⚠ 管道必须是重叠 I/O（FILE_FLAG_OVERLAPPED）, 别改回同步:
@@ -137,6 +138,10 @@ namespace
 
         if (command == "MENUSTATUS")
             return ContextMenuStatus();
+
+        // 共用游戏配置: 挂钩状态、当前配置套、最近几次放入/发布/丢弃
+        if (command == "CHARCONFIG")
+            return CharConfigStatus();
 
         if (command == "SKIPMOVIE")
             return GameSkipMovie();

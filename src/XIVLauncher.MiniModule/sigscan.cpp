@@ -240,3 +240,50 @@ uintptr_t ScanStaticAddressUnique(const char* signature, int offset)
     const int32_t relative = *reinterpret_cast<int32_t*>(hit + offset);
     return reinterpret_cast<uintptr_t>(hit + offset + 4 + relative);
 }
+
+// 同 ScanText, 但扫完整个 .text 节: count 带回命中个数, 返回第一个命中（E8/E9 跟进后）的地址; 没命中返回 0
+uintptr_t ScanTextCount(const char* signature, size_t* count)
+{
+    if (count != nullptr)
+        *count = 0;
+
+    Pattern pattern;
+    if (!ParsePattern(signature, pattern))
+    {
+        LogF("[sigscan] 特征码语法错误: %s", signature);
+        return 0;
+    }
+
+    size_t   hits = 0;
+    uint8_t* hit  = ScanRaw(pattern, SIZE_MAX, hits);
+
+    if (count != nullptr)
+        *count = hits;
+
+    if (hit == nullptr)
+    {
+        LogF("[sigscan] 未命中: %s", signature);
+        return 0;
+    }
+
+    if (hit[0] == 0xE8 || hit[0] == 0xE9)
+    {
+        const int32_t relative = *reinterpret_cast<int32_t*>(hit + 1);
+        return reinterpret_cast<uintptr_t>(hit + 5 + relative);
+    }
+
+    return reinterpret_cast<uintptr_t>(hit);
+}
+
+// 地址是否落在主模块的 .text 节里
+bool TextSectionContains(uintptr_t address)
+{
+    uint8_t* begin = nullptr;
+    size_t   size  = 0;
+
+    if (!TextSection(begin, size))
+        return false;
+
+    const auto start = reinterpret_cast<uintptr_t>(begin);
+    return address >= start && address < start + size;
+}

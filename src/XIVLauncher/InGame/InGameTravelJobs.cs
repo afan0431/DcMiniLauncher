@@ -16,6 +16,25 @@ public sealed class InGameTravelStatus
     public string Message   { get; set; } = "";
     public string StartedAt { get; set; } = "";
     public string EndedAt   { get; set; } = "";
+
+    /// <summary>这一单带了 enter: 跨区落定后接着登录角色进世界, 进了世界才算成功</summary>
+    public bool Enter { get; set; }
+
+    /// <summary>正在（或最后停在）哪一步: <see cref="InGameTravelSteps" /></summary>
+    public string Step { get; set; } = InGameTravelSteps.TRAVEL;
+
+    /// <summary>自动进入角色没成时的原因码（<c>CatAutoEnterStopCodes</c> 的值或 <c>gameExited</c>）; 跨区本身失败、或成功时为空</summary>
+    public string StopCode { get; set; } = "";
+}
+
+/// <summary><see cref="InGameTravelStatus.Step" /> 的取值</summary>
+public static class InGameTravelSteps
+{
+    /// <summary>跨区（含不带 enter 的整单）</summary>
+    public const string TRAVEL = "travel";
+
+    /// <summary>跨区已落定, 正在自动进入角色</summary>
+    public const string ENTER = "enter";
 }
 
 /// <summary>按 PID 存每个客户端最近一次换大区的状态。多开时各是各的。</summary>
@@ -54,18 +73,19 @@ public static class InGameTravelJobs
     /// <summary>
     ///     开始一次换大区; 已有一次在进行、或守护进程正在交接停止时返回 null
     /// </summary>
-    public static InGameTravelStatus? TryBegin(int pid, string target)
+    public static InGameTravelStatus? TryBegin(int pid, string target, bool enter = false)
     {
         lock (Gate)
-            return HELD.Contains(pid) || IsRunning(pid) ? null : Begin(pid, target);
+            return HELD.Contains(pid) || IsRunning(pid) ? null : Begin(pid, target, enter);
     }
 
-    public static InGameTravelStatus Begin(int pid, string target)
+    public static InGameTravelStatus Begin(int pid, string target, bool enter = false)
     {
         var status = new InGameTravelStatus
         {
             Pid       = pid,
             Running   = true,
+            Enter     = enter,
             Target    = target,
             Phase     = "准备中",
             Message   = "准备中",
@@ -85,15 +105,27 @@ public static class InGameTravelJobs
         status.Message = message;
     }
 
-    public static void End(int pid, bool ok, string message)
+    /// <summary>跨区已落定, 转入自动进入角色: 这一单仍在进行中</summary>
+    public static void EnterStep(int pid, string message)
     {
         if (!JOBS.TryGetValue(pid, out var status))
             return;
 
-        status.Running = false;
-        status.Ok      = ok;
-        status.Phase   = ok ? "已完成" : "已失败";
+        status.Step    = InGameTravelSteps.ENTER;
+        status.Phase   = message;
         status.Message = message;
+    }
+
+    public static void End(int pid, bool ok, string message, string stopCode = "")
+    {
+        if (!JOBS.TryGetValue(pid, out var status))
+            return;
+
+        status.Running  = false;
+        status.Ok       = ok;
+        status.Phase    = ok ? "已完成" : "已失败";
+        status.Message  = message;
+        status.StopCode = stopCode;
         status.EndedAt = DateTimeOffset.Now.ToString("HH:mm:ss");
     }
 

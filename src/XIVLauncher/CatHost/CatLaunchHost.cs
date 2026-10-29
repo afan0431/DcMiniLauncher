@@ -31,7 +31,8 @@ public sealed record CatLaunchRequest
     string?        CharacterHomeWorld        = null,
     CatSecret?     WeGameToken               = null,
     string?        WeGameAccountId           = null,
-    bool           AuthOnly                  = false
+    bool           AuthOnly                  = false,
+    CatRemoteHookParams? RemoteHook           = null
 )
 {
     /// <summary>是否为 WeGame 版国服的号</summary>
@@ -381,9 +382,16 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             _        => throw new CatRpcException(CatRpcException.METHOD_NOT_FOUND, $"未知方法: {method}")
         };
 
+    /// <summary>minion.profile 与 minion.ensureMods 里每个插件名的长度上限</summary>
+    internal const int MAX_MINION_PROFILE_LENGTH = 64;
+
+    /// <summary>minion.ensureMods 的个数上限</summary>
+    internal const int MAX_MINION_ENSURE_MODS = 16;
+
     /// <summary>
     ///     校验 launch 的 minion: 指纹、variant、编号格式不对报 invalidParams; 卡号、论坛账号、论坛密码缺任一项报 minionNotConfigured
-    ///     （缺值说明后台没有配置这张卡或论坛账号）。通过时返回 null 并给出要挂的卡。
+    ///     （缺值说明后台没有配置这张卡或论坛账号）; profile 去空白后超长、ensureMods 超过个数或插件名不合法报 invalidParams（空白的 profile 与插件名当作没给）。
+    ///     通过时返回 null 并给出要挂的卡。
     /// </summary>
     internal static CatAcceptResult? ValidateMinion(CatMinionParams minion, out CatMinionLaunch? card)
     {
@@ -412,6 +420,35 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         if (!MinionCards.IsValidUid(uid))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "minion.uid 必须是 32 位十六进制");
 
+        var profile = string.IsNullOrWhiteSpace(minion.Profile) ? null : minion.Profile.Trim();
+
+        if (profile is { Length: > MAX_MINION_PROFILE_LENGTH })
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"minion.profile 不能超过 {MAX_MINION_PROFILE_LENGTH} 个字符");
+
+        List<string>? ensureMods = null;
+
+        if (minion.EnsureMods != null)
+        {
+            if (minion.EnsureMods.Length > MAX_MINION_ENSURE_MODS)
+                return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"minion.ensureMods 最多 {MAX_MINION_ENSURE_MODS} 个");
+
+            foreach (var raw in minion.EnsureMods)
+            {
+                var mod = raw?.Trim();
+
+                if (string.IsNullOrEmpty(mod))
+                    continue;
+
+                if (mod.Length > MAX_MINION_PROFILE_LENGTH || mod.IndexOfAny(System.IO.Path.GetInvalidFileNameChars()) >= 0 || mod is "." or "..")
+                    return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "minion.ensureMods 里的插件名不合法");
+
+                ensureMods ??= [];
+
+                if (!ensureMods.Contains(mod, StringComparer.OrdinalIgnoreCase))
+                    ensureMods.Add(mod);
+            }
+        }
+
         card = new CatMinionLaunch
         (
             minion.CardFingerprint!,
@@ -419,7 +456,9 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             new CatSecret(minion.Keycode!),
             uid!,
             minion.ForumId!.Trim(),
-            new CatSecret(minion.ForumPassword!)
+            new CatSecret(minion.ForumPassword!),
+            profile,
+            ensureMods
         );
 
         return null;
@@ -539,7 +578,11 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 homeWorld,
                 hasWeGameToken ? new CatSecret(parameters.WeGameToken!) : null,
                 weGameAccountId,
-                authOnly
+                authOnly,
+                parameters.RemoteHook == null ? null : new CatRemoteHookParams(
+                    parameters.RemoteHook.DllPath,
+                    parameters.RemoteHook.PipeName,
+                    parameters.RemoteHook.Token)
             );
             selected = runnerFactory(accepted);
             runner   = selected;

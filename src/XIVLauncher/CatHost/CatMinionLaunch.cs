@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using Serilog;
 using XIVLauncher.Common.Util;
 using XIVLauncher.Minion;
@@ -14,24 +15,35 @@ public static class CatMinionDirect
 }
 
 /// <summary>
+///     能力标记: 这个版本给每个游戏组装自己的 Minion 客户端目录, 照 launch 的 minion.profile 摆插件开关、按 minion.ensureMods 强制打开插件。
+///     工作台按程序集里有没有这个类型判断能不能发这两个字段。
+/// </summary>
+public static class CatMinionProfiles
+{
+}
+
+/// <summary>
 ///     一次上号要挂的 Minion 卡（已校验）: Fingerprint = 卡指纹; Variant = cn / global; Keycode = 卡号;
-///     Uid = 这张卡在这个 variant 下的 Minion 编号（-uid）; ForumId / ForumPassword = Minion 论坛账号与密码
+///     Uid = 这张卡在这个 variant 下的 Minion 编号（-uid）; ForumId / ForumPassword = Minion 论坛账号与密码;
+///     Profile = 进世界时用的 Profiler 配置名（null = 照主目录当前开关）; EnsureMods = 无论配置如何都要打开的插件（null = 没有）
 /// </summary>
 public sealed record CatMinionLaunch
 (
-    string    Fingerprint,
-    string    Variant,
-    CatSecret Keycode,
-    string    Uid,
-    string    ForumId,
-    CatSecret ForumPassword
+    string                 Fingerprint,
+    string                 Variant,
+    CatSecret              Keycode,
+    string                 Uid,
+    string                 ForumId,
+    CatSecret              ForumPassword,
+    string?                Profile    = null,
+    IReadOnlyList<string>? EnsureMods = null
 )
 {
     /// <summary>
-    ///     只打印指纹和 variant
+    ///     只打印指纹、variant 与配置
     /// </summary>
     public override string ToString() =>
-        $"CatMinionLaunch {{ Fingerprint = {Fingerprint}, Variant = {Variant} }}";
+        $"CatMinionLaunch {{ Fingerprint = {Fingerprint}, Variant = {Variant}, Profile = {Profile}, EnsureMods = {(EnsureMods == null ? "" : string.Join(",", EnsureMods))} }}";
 }
 
 /// <summary>
@@ -45,7 +57,7 @@ public static class CatMinionReservations
     private static readonly TimeSpan MutexTimeout = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    ///     起游戏前检查本机能不能挂这张卡: launch 带了卡、本机找得到 MinionLauncher_64.exe。能挂返回 null
+    ///     起游戏前检查本机能不能挂这张卡: launch 带了卡、本机找得到 MinionLauncher_64.exe、指定的配置在本机 Profiler 里有。能挂返回 null
     /// </summary>
     public static (string Code, string Message)? Check(CatMinionLaunch? minion)
     {
@@ -57,7 +69,32 @@ public static class CatMinionReservations
         if (!MinionInstall.IsLauncherPresent(installPath))
             return (CatCodes.MINION_NOT_CONFIGURED, $"找不到 {MinionInstall.GetLauncherExePath(installPath)}, 请在 DcMiniLauncher「设置 → Minion」里指定安装目录");
 
+        // 指定了配置: 本机 Profiler 里没有这个配置就不起游戏（与找不到 Minion 一样在启动前报）; 关掉客户端目录时配置不生效, 不查
+        if (App.Settings?.MinionClientDirEnabled != false && ProfileError(installPath, minion.Profile) is { } profileError)
+            return profileError;
+
         return null;
+    }
+
+    /// <summary>
+    ///     主目录 Profiler 里没有 <paramref name="profile" /> 或配置文件读不出时给出失败码与文案, 否则 null
+    /// </summary>
+    internal static (string Code, string Message)? ProfileError(string installPath, string? profile)
+    {
+        try
+        {
+            if (MinionClientDir.CheckProfile(installPath, profile) is not { } error)
+                return null;
+
+            var failure = CatMinionClientDirs.FailureOf(error);
+            return (failure.ErrorCode!, failure.ErrorMessage!);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 读不了文件时不在这里拦, 挂载时组装客户端目录会再报
+            Log.Warning(ex, "[CatHost] 启动前检查 Minion 配置 {Profile} 时读不了配置文件", profile);
+            return null;
+        }
     }
 
     /// <summary>

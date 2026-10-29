@@ -8,7 +8,7 @@ using Xunit;
 namespace XIVLauncher.Test.CatHost;
 
 /// <summary>
-///     任务单通道（cat-job/1）: setJob 的校验与 stale、Afan 两条本机接口的返回码、回报原样转发与 seq 去重、等级有变化才发
+///     任务单通道（cat-job/1）: setJob 的校验与 stale、Afan 本机接口的返回码、回报与快照原样转发与 seq 去重、等级有变化才发
 /// </summary>
 public sealed class CatJobChannelTests
 {
@@ -84,6 +84,19 @@ public sealed class CatJobChannelTests
           {"schema":"cat-progress/1","pid":{{pid}},"revision":{{revision}},"seq":{{seq}},"state":"{{state}}","reason":{{reason ?? "null"}},"activeItemId":"a",
            "items":[{"itemId":"a","current":19,"done":false}],"character":{"name":"七色花","homeWorldId":1167},"afan":"0.4.11","at":"2026-10-16T14:02:11Z"}
           """;
+
+    /// <summary>一份角色快照: 除登录器校验的字段外还带分区、角色、null 值与登录器不认识的字段（都应原样转发）</summary>
+    internal static string Snapshot(int pid, long seq, string kind = "update", string? snapshotId = null)
+    {
+        var id = JsonSerializer.Serialize(snapshotId ?? $"{pid}-40000000000000017-{seq}");
+
+        return $$$"""
+                 {"schema":"cat-snapshot/1","snapshotId":{{{id}}},"pid":{{{pid}}},"seq":{{{seq}}},"kind":"{{{kind}}}","capturedAt":"2026-10-25T14:02:11Z",
+                  "afan":"0.4.16","schemaVersion":1,"character":{"name":"七色花","contentId":"40000000000000017","homeWorldId":1167},
+                  "sections":{"levels":[0,100,0,0,0,0,90],"gear":{"itemLevel":710,"classJobId":19,"slots":[{"slot":"mainHand","itemId":44000,"itemLevel":710}]},
+                  "story":{"msqExpansion":"7.0","msqCaughtUp":false,"buddyRank":null}},"future":{"anything":[1,"a",true,1.5]}}
+                 """;
+    }
 
     [Fact]
     public void SetJob_AcceptsNewer_StaleForSameOrOlder()
@@ -357,6 +370,25 @@ public sealed class CatJobChannelTests
         Assert.Equal(job.GetRawText(), adopted.GetJob(1234).Json);
     }
 
+    [Theory]
+    [InlineData("true")]
+    [InlineData("false")]
+    [InlineData(null)]
+    public void Job_ItemSelected_IsAccepted_AndComesBackAsIs(string? selected)
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        var job = JsonNode.Parse(Job(3).GetRawText())!.AsObject();
+
+        if (selected != null)
+            job["items"]![0]!["selected"] = JsonNode.Parse(selected);
+
+        var element = JsonDocument.Parse(job.ToJsonString()).RootElement.Clone();
+        Assert.Equal(CatSetJobResult.Ok(), channel.SetJob(element));
+        Assert.Equal(element.GetRawText(), channel.GetJob(1234).Json);
+    }
+
     [Fact]
     public void PostProgress_TooFrequentFromTheLocalApi_Is429()
     {
@@ -497,6 +529,136 @@ public sealed class CatJobChannelTests
         channel.GameStarted(1234);
 
         var response = channel.PostProgress(body);
+
+        Assert.Equal(400, response.StatusCode);
+        Assert.NotNull(JsonNode.Parse(response.Json!)!["error"]);
+        Assert.Empty(events);
+    }
+
+    [Fact]
+    public void PostSnapshot_PublishesOperationIdPidAndTheSnapshotAsIs_OncePerSeq()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        var body  = Snapshot(1234, 1, "start");
+        var first = channel.PostSnapshot(body);
+        Assert.Equal(200, first.StatusCode);
+        Assert.Equal(1, JsonNode.Parse(first.Json!)!["seq"]!.GetValue<long>());
+
+        // 重发同一份: 照样 200, 不再发事件
+        var again = channel.PostSnapshot(body);
+        Assert.Equal(200, again.StatusCode);
+        Assert.Equal(1, JsonNode.Parse(again.Json!)!["seq"]!.GetValue<long>());
+
+        Assert.Equal(200, channel.PostSnapshot(Snapshot(1234, 2, "final")).StatusCode);
+
+        var published = events.Where(x => x.Method == CatJobChannel.SNAPSHOT_EVENT).Select(x => JsonNode.Parse(x.Json)!.AsObject()).ToArray();
+        Assert.Equal(2, published.Length);
+        Assert.All(events, x => Assert.Equal(CatJobChannel.SNAPSHOT_EVENT, x.Method));
+
+        var parameters = published[0];
+        Assert.Equal(["operationId", "pid", "snapshot"], parameters.Select(x => x.Key));
+        Assert.Equal(OPERATION, parameters["operationId"]!.GetValue<string>());
+        Assert.Equal(1234, parameters["pid"]!.GetValue<int>());
+        Assert.True(JsonNode.DeepEquals(JsonNode.Parse(body), parameters["snapshot"]));
+
+        Assert.Equal("final", published[1]["snapshot"]!["kind"]!.GetValue<string>());
+        Assert.Equal("1234-40000000000000017-2", published[1]["snapshot"]!["snapshotId"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void PostSnapshot_OtherPidIs404_AndANewGameStartsSeqAgain()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        var otherPid = channel.PostSnapshot(Snapshot(999, 1));
+        Assert.Equal(404, otherPid.StatusCode);
+        Assert.Equal("pid 999 不是本启动器守护的游戏", JsonNode.Parse(otherPid.Json!)!["error"]!.GetValue<string>());
+        Assert.Equal(200, channel.PostSnapshot(Snapshot(1234, 5)).StatusCode);
+
+        // 崩溃重开: 新进程的 Afan 从头数起
+        channel.GameStarted(5678);
+        Assert.Equal(404, channel.PostSnapshot(Snapshot(1234, 6)).StatusCode);
+        Assert.Equal(200, channel.PostSnapshot(Snapshot(5678, 1)).StatusCode);
+
+        Assert.Equal([1234, 5678], events.Select(x => JsonNode.Parse(x.Json)!["pid"]!.GetValue<int>()));
+    }
+
+    [Fact]
+    public void PostSnapshot_SeqNotAboveTheLargestSeen_IsNotPublishedAgain_AndIsIndependentOfProgressSeq()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        Assert.Equal(200, channel.PostProgress(Progress(1234, 1760600000005)).StatusCode);
+
+        Assert.Equal(200, channel.PostSnapshot(Snapshot(1234, 1760600000000)).StatusCode);
+        Assert.Equal(200, channel.PostSnapshot(Snapshot(1234, 1760600000002)).StatusCode);
+        Assert.Equal(200, channel.PostSnapshot(Snapshot(1234, 1760600000001)).StatusCode);
+        Assert.Equal(200, channel.PostSnapshot(Snapshot(1234, 1760600000002)).StatusCode);
+        Assert.Equal(200, channel.PostSnapshot(Snapshot(1234, 1760600000003)).StatusCode);
+
+        Assert.Equal
+        (
+            [1760600000000L, 1760600000002L, 1760600000003L],
+            events.Where(x => x.Method == CatJobChannel.SNAPSHOT_EVENT).Select(x => JsonNode.Parse(x.Json)!["snapshot"]!["seq"]!.GetValue<long>())
+        );
+    }
+
+    [Fact]
+    public void PostSnapshot_AfterTheGameEnded_IsNotPublished()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+        Assert.Equal(200, channel.PostSnapshot(Snapshot(1234, 1)).StatusCode);
+
+        channel.GameEnded(1234);
+
+        Assert.Equal(404, channel.PostSnapshot(Snapshot(1234, 2, "final")).StatusCode);
+        Assert.Single(events);
+    }
+
+    [Fact]
+    public void PostSnapshot_OverTheSizeLimitIs400()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        var body     = Snapshot(1234, 1).TrimEnd()[..^1] + $$""","padding":"{{new string('x', CatJobChannel.MAX_SNAPSHOT_BYTES)}}"}""";
+        var response = channel.PostSnapshot(body);
+
+        Assert.Equal(400, response.StatusCode);
+        Assert.Contains("65536", JsonNode.Parse(response.Json!)!["error"]!.GetValue<string>());
+        Assert.Empty(events);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("not json")]
+    [InlineData("[]")]
+    [InlineData("""{"schema":"cat-snapshot/2","snapshotId":"s","pid":1234,"seq":1,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-progress/1","snapshotId":"s","pid":1234,"seq":1,"kind":"start"}""")]
+    [InlineData("""{"snapshotId":"s","pid":1234,"seq":1,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":"s","seq":1,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":"s","pid":"1234","seq":1,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":"s","pid":0,"seq":1,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":"s","pid":1234,"seq":0,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":"s","pid":1234,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":"s","pid":1234,"seq":1}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":"s","pid":1234,"seq":1,"kind":"partial"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","pid":1234,"seq":1,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":"","pid":1234,"seq":1,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":7,"pid":1234,"seq":1,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":"s","pid":1234,"pid":1234,"seq":1,"kind":"start"}""")]
+    [InlineData("""{"schema":"cat-snapshot/1","snapshotId":"s","pid":1234,"seq":1,"kind":"start","sections":{"gear":{"slots":[{"slot":"head","slot":"body"}]}}}""")]
+    public void PostSnapshot_MalformedIs400(string body)
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+
+        var response = channel.PostSnapshot(body);
 
         Assert.Equal(400, response.StatusCode);
         Assert.NotNull(JsonNode.Parse(response.Json!)!["error"]);

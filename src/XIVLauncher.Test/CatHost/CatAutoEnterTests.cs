@@ -58,6 +58,7 @@ public sealed class CatAutoEnterTests
         );
         Assert.Equal("12", flow.EnteredContentId);
         Assert.Equal(CatStages.IN_WORLD, flow.CurrentStage);
+        Assert.True(flow.EnteredWorld.IsCompletedSuccessfully);
         Assert.Equal([AREA_HOME], game.EnteredAreas);
         Assert.Empty(game.Switched);
 
@@ -134,6 +135,21 @@ public sealed class CatAutoEnterTests
             ["stage:enteringLobby", "stage:awaitingCharacterChoice", "characters:choose:2", "stage:enteringWorld", "character:小黑@HongYuHai", "stage:inWorld"],
             Entries(reporter)
         );
+        Assert.Equal(CatCodes.NOT_RUNNING, flow.SelectCharacter("11").Code);
+    }
+
+    [Fact]
+    public async Task StopWhenChoiceNeeded_CharacterNotInList_StopsInsteadOfWaiting()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"), Chara("12", "小黑", "HongYuHai"));
+
+        var flow    = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("不存在", null)) { StopWhenChoiceNeeded = true };
+        var outcome = await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Equal(["stage:enteringLobby", $"stopped:{CatAutoEnterStopCodes.CHARACTER_NOT_FOUND}", "stage:running"], Entries(reporter));
+        Assert.Contains("不存在", Assert.Single(reporter.Messages));
+        Assert.DoesNotContain(game.Commands, x => x.StartsWith("ENTERCHARA", StringComparison.Ordinal));
         Assert.Equal(CatCodes.NOT_RUNNING, flow.SelectCharacter("11").Code);
     }
 
@@ -559,6 +575,9 @@ public sealed class CatAutoEnterTests
         Assert.Contains(reporter.Messages, x => x.Contains("与服务器的连接已断开", StringComparison.Ordinal));
         Assert.Equal(CatStages.RUNNING, flow.CurrentStage);
 
+        // 没进世界: 等着挂 Minion 的一方不会被放行
+        Assert.False(flow.EnteredWorld.IsCompleted);
+
         // 错误框不替人点, 也没有重新登录
         Assert.DoesNotContain("DIALOG OK", game.Commands);
         Assert.Equal(1, game.Commands.Count(x => x == "LOGIN"));
@@ -823,6 +842,7 @@ public sealed class CatAutoEnterTests
 
         var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null));
         Assert.Equal(CatAutoEnterOutcome.Stopped, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+        Assert.False(flow.EnteredWorld.IsCompleted);
 
         var ticks = 0;
         game.OnDelay = g =>
@@ -837,6 +857,9 @@ public sealed class CatAutoEnterTests
         await flow.ObserveAsync(CancellationToken.None).WaitAsync(Timeout);
 
         Assert.Equal(["stopped:timeout", "stage:running", "character:小白@LaNuoXiYa", "stage:inWorld"], Entries(reporter)[^4..]);
+
+        // 人手动进的世界也放行挂 Minion
+        Assert.True(flow.EnteredWorld.IsCompletedSuccessfully);
     }
 
     [Theory]
@@ -958,9 +981,9 @@ public sealed class CatAutoEnterTests
     }
 
     /// <summary>
-    ///     假的游戏一侧: 按模块约定的格式应答, 界面状态由测试改; 等待不真等, 只把假时钟往前拨
+    ///     假的游戏一侧: 按模块约定的格式应答, 界面状态由测试改; 等待不真等, 只把假时钟往前拨。游戏内跨区收尾的测试也用它
     /// </summary>
-    private sealed class FakeAutoEnterGame : ICatAutoEnterGame
+    internal sealed class FakeAutoEnterGame : ICatAutoEnterGame
     {
         private readonly object sync = new();
         private TimeSpan elapsed;
@@ -1023,7 +1046,7 @@ public sealed class CatAutoEnterTests
 
         public bool HasExited { get; set; }
 
-        public string CurrentAreaName { get; private set; } = AREA_HOME;
+        public string CurrentAreaName { get; set; } = AREA_HOME;
 
         public IReadOnlyList<string> AreaNames => [AREA_HOME, AREA_OTHER, AREA_THIRD];
 

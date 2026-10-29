@@ -1390,6 +1390,51 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Fact]
+    public async Task Buffer_KeepsOnlyTheLatestSnapshotPerGame()
+    {
+        await server.NotifyAsync("game.started", new { pid = 1 });
+        await server.NotifyAsync(CatJobChannel.SNAPSHOT_EVENT, new { operationId = "op1", pid = 1, snapshot = new { seq = 1, kind = "start" } });
+        await server.NotifyAsync(CatJobChannel.LEVELS_EVENT, new { pid = 1, levels = new[] { 1 } });
+        await server.NotifyAsync(CatJobChannel.SNAPSHOT_EVENT, new { operationId = "op1", pid = 1, snapshot = new { seq = 2, kind = "update" } });
+
+        // 崩溃重开后的新游戏: 旧游戏最后一份留着
+        await server.NotifyAsync(CatJobChannel.SNAPSHOT_EVENT, new { operationId = "op1", pid = 2, snapshot = new { seq = 1, kind = "start" } });
+        await server.NotifyAsync(CatJobChannel.SNAPSHOT_EVENT, new { operationId = "op1", pid = 2, snapshot = new { seq = 2, kind = "final" } });
+        await server.NotifyAsync("game.exited", new { pid = 2 });
+
+        Assert.Equal(5, server.BufferedEventCount);
+
+        await using var client = await ConnectAndHelloAsync();
+        var seen = new List<(string Method, JsonNode? Params)>();
+        client.WaitForEvent("game.exited", Timeout, seen);
+
+        Assert.Equal(["game.started", CatJobChannel.LEVELS_EVENT, CatJobChannel.SNAPSHOT_EVENT, CatJobChannel.SNAPSHOT_EVENT, "game.exited"], seen.Select(x => x.Method));
+        Assert.Equal(1, seen[2].Params!["pid"]!.GetValue<int>());
+        Assert.Equal(2, seen[2].Params!["snapshot"]!["seq"]!.GetValue<int>());
+        Assert.Equal(2, seen[3].Params!["pid"]!.GetValue<int>());
+        Assert.Equal("final", seen[3].Params!["snapshot"]!["kind"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task BufferOverflow_DropsSnapshotsBeforeProgressWithShotsAndLifecycleEvents()
+    {
+        await server.NotifyAsync("game.started", new { pid = 1 });
+        await server.NotifyAsync(CatJobChannel.SNAPSHOT_EVENT, new { pid = 1, snapshot = new { seq = 1 } });
+
+        for (var i = 0; i < CatRpcServer.MAX_BUFFERED_EVENTS; i++)
+            await server.NotifyAsync(CatJobChannel.PROGRESS_EVENT, new { pid = 1, seq = 1797000000001L + i, state = "running", shots = new[] { new { itemId = "a", kind = "progress" } } });
+
+        await server.NotifyAsync("game.exited", new { pid = 1 });
+
+        await using var client = await ConnectAndHelloAsync();
+        var seen = new List<(string Method, JsonNode? Params)>();
+        client.WaitForEvent("game.exited", Timeout, seen);
+
+        Assert.Equal("game.started", seen[0].Method);
+        Assert.DoesNotContain(seen, x => x.Method == CatJobChannel.SNAPSHOT_EVENT);
+    }
+
+    [Fact]
     public async Task Host_DoesNotBlockReporter_WhenPublishingHangs()
     {
         var never = new TaskCompletionSource();

@@ -91,17 +91,19 @@ public static class MinionAttacher
     /// <param name="dalamudInjected">本次是否真的注了 Dalamud —— 是的话要等它先落地再挂 Minion</param>
     /// <param name="accountName">游戏账号名, 只写进占用记录</param>
     /// <param name="cancellationToken">取消</param>
+    /// <param name="options">挂载用的目录、TensorCore 是否开着、排队回调; null 时用主目录、不报排队</param>
     public static async Task<MinionAttachResult> AttachAsync
     (
-        CatMinionLaunch   minion,
-        Process           gameProcess,
-        DirectoryInfo?    gamePath,
-        bool              dalamudInjected,
-        string?           accountName,
-        CancellationToken cancellationToken = default
+        CatMinionLaunch      minion,
+        Process              gameProcess,
+        DirectoryInfo?       gamePath,
+        bool                 dalamudInjected,
+        string?              accountName,
+        CancellationToken    cancellationToken = default,
+        MinionAttachOptions? options           = null
     )
     {
-        var installPath = MinionInstall.InstallPath;
+        var installPath = options?.InstallPath ?? MinionInstall.InstallPath;
 
         await WaitForGameWindowAsync(gameProcess, cancellationToken).ConfigureAwait(false);
 
@@ -127,10 +129,44 @@ public static class MinionAttacher
         if (gameProcess.HasExited)
             return MinionAttachResult.Failed("游戏进程已退出, 没有可挂载的目标");
 
-        var result = await SpawnLauncherAsync(minion, installPath, gamePath, gameProcess, cancellationToken).ConfigureAwait(false);
+        // 本机同一时间只放一个游戏挂载（含 TensorCore 自己的第二次注入）, 见 MinionAttachQueue
+        var lease = await MinionAttachQueue.EnterAsync(gameProcess, options?.Queued, cancellationToken).ConfigureAwait(false);
+
+        if (lease == null)
+            return cancellationToken.IsCancellationRequested
+                       ? MinionAttachResult.Failed("挂载 Minion 已取消")
+                       : MinionAttachResult.Failed("游戏进程已退出, 没有可挂载的目标");
+
+        MinionAttachResult result;
+        var                launcherPids = new List<int>();
+
+        try
+        {
+            if (lease.Waited)
+                options?.Dequeued?.Invoke();
+
+            if (HasExited(gameProcess))
+            {
+                lease.Dispose();
+                return MinionAttachResult.Failed("游戏进程已退出, 没有可挂载的目标");
+            }
+
+            result = await SpawnLauncherAsync(minion, installPath, gamePath, gameProcess, launcherPids, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            lease.Dispose();
+            throw;
+        }
 
         if (!result.Ok)
+        {
+            lease.Dispose();
             return result;
+        }
+
+        // 锁要占到这次注入真正做完（TensorCore 会在 Lua 起来后自己再拉一次 MinionLauncher）, 在后台判断, 不拖慢挂载结果
+        _ = lease.ReleaseAfterAttachAsync(installPath, options?.TensorCoreEnabled, launcherPids);
 
         // 先落占用记录（带编号与卡号 MD5, 本进程不在时别人也能据此补报停机）, 再报结果
         var keycodeMd5 = MinionAppStatusReporter.KeycodeMd5Hex(minion.Keycode.Reveal());
@@ -151,6 +187,18 @@ public static class MinionAttacher
     }
 
     /// <summary>
+    ///     挂载用的目录（主目录或客户端目录）下的 <c>-botpath</c>
+    /// </summary>
+    internal static string BotPathOf(string installPath) =>
+        Path.Combine(installPath, BOT_DIR_NAME);
+
+    /// <summary>
+    ///     挂载用的目录下的 <c>-datpath</c>
+    /// </summary>
+    internal static string DatPathOf(string installPath, string variant) =>
+        Path.Combine(BotPathOf(installPath), MINION_FILES_DIR_NAME, DatNameOf(variant));
+
+    /// <summary>
     ///     自己拉 MinionLauncher（probe-P1 验证过的路径）
     /// </summary>
     private static async Task<MinionAttachResult> SpawnLauncherAsync
@@ -159,6 +207,7 @@ public static class MinionAttacher
         string            installPath,
         DirectoryInfo?    gamePath,
         Process           gameProcess,
+        List<int>         launcherPids,
         CancellationToken cancellationToken
     )
     {
@@ -170,8 +219,8 @@ public static class MinionAttacher
         if (ResolveGameExePath(gamePath, gameProcess, minion.Variant) is not { } gameExePath)
             return MinionAttachResult.Failed($"找不到可用的游戏 exe 给 -path 用（游戏目录 {gamePath?.FullName ?? "(未配置)"} 下没找到, 也读不到游戏进程的 exe）");
 
-        var botPath = Path.Combine(installPath, BOT_DIR_NAME);
-        var datPath = Path.Combine(botPath, MINION_FILES_DIR_NAME, DatNameOf(minion.Variant));
+        var botPath = BotPathOf(installPath);
+        var datPath = DatPathOf(installPath, minion.Variant);
 
         if (!File.Exists(datPath))
             return MinionAttachResult.Failed($"找不到 bot 文件 {datPath}");
@@ -189,7 +238,7 @@ public static class MinionAttacher
         );
 
         var redactor = RedactorFor(minion);
-        var result   = await RunLauncherAsync(launcherExe, installPath, arguments, redactor, cancellationToken).ConfigureAwait(false);
+        var result   = await RunLauncherAsync(launcherExe, installPath, arguments, redactor, launcherPids, cancellationToken).ConfigureAwait(false);
 
         // MinionLauncher 挂载前给每个游戏进程的句柄取名, 遇到旧版游戏内模块的同步管道会卡住并以访问冲突崩溃（时机相关）;
         // 游戏还在就隔几秒再挂, 最多再试 CRASH_RETRIES 次
@@ -197,7 +246,7 @@ public static class MinionAttacher
         {
             Log.Warning("[Minion] MinionLauncher 崩溃, {Delay}s 后第 {Retry} 次重试挂载 PID={GamePid}", CRASH_RETRY_DELAY.TotalSeconds, retry, gameProcess.Id);
             await Task.Delay(CRASH_RETRY_DELAY, cancellationToken).ConfigureAwait(false);
-            result = await RunLauncherAsync(launcherExe, installPath, arguments, redactor, cancellationToken).ConfigureAwait(false);
+            result = await RunLauncherAsync(launcherExe, installPath, arguments, redactor, launcherPids, cancellationToken).ConfigureAwait(false);
         }
 
         return result;
@@ -338,6 +387,7 @@ public static class MinionAttacher
         string            workingDirectory,
         IEnumerable<string> arguments,
         CatLogRedactor    redactor,
+        List<int>         launcherPids,
         CancellationToken cancellationToken
     )
     {
@@ -377,6 +427,8 @@ public static class MinionAttacher
         {
             if (!launcher.Start())
                 return MinionAttachResult.Failed($"无法启动 {launcherExe}");
+
+            launcherPids.Add(launcher.Id);
         }
         catch (Exception ex)
         {

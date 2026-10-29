@@ -12,7 +12,7 @@ namespace XIVLauncher.DCTravel;
 public sealed record CatLocalResponse(int StatusCode, string? Json = null);
 
 /// <summary>
-///     本机接口 <c>/cat/job</c>、<c>/cat/progress</c> 的处理方（Cat 上号自动开工, 约定 cat-job/1）。
+///     本机接口 <c>/cat/job</c>、<c>/cat/progress</c>、<c>/cat/snapshot</c> 的处理方（Cat 上号自动开工, 约定 cat-job/1; 角色快照 cat-snapshot/1）。
 ///     监听器只负责收发和拒绝跨域请求, 判断全在实现里（无界面启动器的任务单通道）
 /// </summary>
 public interface ICatLocalEndpoints
@@ -26,15 +26,20 @@ public interface ICatLocalEndpoints
     ///     <c>POST /cat/progress</c>: body = 请求体原文（cat-progress/1）
     /// </summary>
     CatLocalResponse PostProgress(string body);
+
+    /// <summary>
+    ///     <c>POST /cat/snapshot</c>: body = 请求体原文（cat-snapshot/1）
+    /// </summary>
+    CatLocalResponse PostSnapshot(string body);
 }
 
 /// <summary>
-///     <c>/cat</c> 下的两条路由。与 <c>/dctravel/ingame-travel</c> 同一信任级别: 只绑 127.0.0.1, 带 <c>Origin</c> 头的请求一律 403;
+///     <c>/cat</c> 下的路由。与 <c>/dctravel/ingame-travel</c> 同一信任级别: 只绑 127.0.0.1, 带 <c>Origin</c> 头的请求一律 403;
 ///     另外 <c>Host</c> 头只认 <c>127.0.0.1:&lt;端口&gt;</c>（挡住借 DNS 重绑定从网页打进来的请求）
 /// </summary>
 internal sealed class CatLocalController(Func<ICatLocalEndpoints?> endpoints, int port) : WebApiController
 {
-    /// <summary>回报请求体上限</summary>
+    /// <summary>回报与快照请求体上限</summary>
     public const int MAX_BODY_BYTES = 64 * 1024;
 
     [Route(HttpVerbs.Get, "/job")]
@@ -56,7 +61,15 @@ internal sealed class CatLocalController(Func<ICatLocalEndpoints?> endpoints, in
     }
 
     [Route(HttpVerbs.Post, "/progress")]
-    public async Task PostProgress()
+    public Task PostProgress() =>
+        PostBodyAsync((handler, body) => handler.PostProgress(body));
+
+    [Route(HttpVerbs.Post, "/snapshot")]
+    public Task PostSnapshot() =>
+        PostBodyAsync((handler, body) => handler.PostSnapshot(body));
+
+    /// <summary>POST 路由共用: 拒绝跨域、没有处理方回 404、读体（超上限回 400）后交给处理方</summary>
+    private async Task PostBodyAsync(Func<ICatLocalEndpoints, string, CatLocalResponse> handle)
     {
         if (await RejectCrossOriginAsync().ConfigureAwait(false))
             return;
@@ -77,7 +90,7 @@ internal sealed class CatLocalController(Func<ICatLocalEndpoints?> endpoints, in
             return;
         }
 
-        await WriteAsync(Handle(() => handler.PostProgress(body))).ConfigureAwait(false);
+        await WriteAsync(Handle(() => handle(handler, body))).ConfigureAwait(false);
     }
 
     private static CatLocalResponse Handle(Func<CatLocalResponse> handle)
@@ -148,7 +161,7 @@ public static class CatLocalJson
 }
 
 /// <summary>
-///     只提供 <c>/cat/…</c> 的独立本机监听（模拟模式用; 真实启动时这两条路由挂在 <see cref="DCTravelListener" /> 上）
+///     只提供 <c>/cat/…</c> 的独立本机监听（模拟模式用; 真实启动时这些路由挂在 <see cref="DCTravelListener" /> 上）
 /// </summary>
 public sealed class CatLocalListener : IDisposable
 {

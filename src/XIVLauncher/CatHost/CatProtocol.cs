@@ -94,6 +94,9 @@ public static class CatStages
     /// <summary>挂 Minion</summary>
     public const string ATTACHING_MINION = "attachingMinion";
 
+    /// <summary>挂 Minion 前排队: 本机另有游戏正在挂载 Minion（含 TensorCore 的第二次注入）, 排到后回到 <see cref="ATTACHING_MINION" /></summary>
+    public const string MINION_QUEUED = "minionQueued";
+
     /// <summary>游戏运行中</summary>
     public const string RUNNING = "running";
 
@@ -163,6 +166,9 @@ public static class CatAutoEnterStopCodes
 
     /// <summary>收到关闭请求, 没有做完</summary>
     public const string CANCELLED = "cancelled";
+
+    /// <summary>选角列表里定不了要登录的角色。只在不等人选的编排（游戏内跨区后进世界）里出现, 不发给工作台</summary>
+    public const string CHARACTER_NOT_FOUND = "characterNotFound";
 }
 
 /// <summary>失败码</summary>
@@ -194,6 +200,12 @@ public static class CatCodes
 
     /// <summary>Minion 挂载失败（游戏已在运行）</summary>
     public const string ATTACH_FAILED = "attachFailed";
+
+    /// <summary>本机 Minion 的 Profiler 配置文件（LuaMods\Profiler\Settings.lua）读不出, 没有挂（只在 Minion 结果里报）</summary>
+    public const string MINION_SETTINGS_UNREADABLE = "minionSettingsUnreadable";
+
+    /// <summary>launch 指定的 Minion 配置在本机 Profiler 里没有, 没有挂（只在 Minion 结果里报）</summary>
+    public const string MINION_PROFILE_NOT_FOUND = "minionProfileNotFound";
 
     /// <summary>参数无效</summary>
     public const string INVALID_PARAMS = "invalidParams";
@@ -373,23 +385,27 @@ public sealed record CatHelloResult(string ProtocolVersion, string LauncherVersi
 
 /// <summary>
 ///     launch 里的 Minion 参数: cardFingerprint = 卡指纹; variant = cn / global; keycode = 卡号;
-///     uid = 这张卡在这个 variant 下的 Minion 编号（-uid, 32 位十六进制）; forumId / forumPassword = Minion 论坛账号与密码
+///     uid = 这张卡在这个 variant 下的 Minion 编号（-uid, 32 位十六进制）; forumId / forumPassword = Minion 论坛账号与密码;
+///     profile = 进世界时用的 Profiler 配置名（null = 照本机主目录当前开关）; ensureMods = 无论配置如何都要打开的插件（如 Afan）。
+///     profile / ensureMods 只有带 <see cref="CatMinionProfiles" /> 的版本才照做
 /// </summary>
 public sealed record CatMinionParams
 (
-    string? CardFingerprint,
-    string? Variant,
-    string? Keycode       = null,
-    string? Uid           = null,
-    string? ForumId       = null,
-    string? ForumPassword = null
+    string?   CardFingerprint,
+    string?   Variant,
+    string?   Keycode       = null,
+    string?   Uid           = null,
+    string?   ForumId       = null,
+    string?   ForumPassword = null,
+    string?   Profile       = null,
+    string[]? EnsureMods    = null
 )
 {
     /// <summary>
-    ///     record 自动生成的 ToString 会打印所有成员, 这里只打印指纹和 variant, 卡号、编号、论坛账号和密码都不打印
+    ///     record 自动生成的 ToString 会打印所有成员, 这里只打印指纹、variant 与配置, 卡号、编号、论坛账号和密码都不打印
     /// </summary>
     public override string ToString() =>
-        $"CatMinionParams {{ CardFingerprint = {CardFingerprint}, Variant = {Variant}, Keycode = ***, Uid = ***, ForumId = ***, ForumPassword = *** }}";
+        $"CatMinionParams {{ CardFingerprint = {CardFingerprint}, Variant = {Variant}, Keycode = ***, Uid = ***, ForumId = ***, ForumPassword = ***, Profile = {Profile}, EnsureMods = {(EnsureMods == null ? "" : string.Join(",", EnsureMods))} }}";
 }
 
 /// <summary>
@@ -416,6 +432,17 @@ public sealed record CatCharacterInfo
     bool    Travelling,
     bool    Loginable
 );
+
+public sealed record CatRemoteHookParams
+(
+    string DllPath,
+    string PipeName,
+    string Token
+)
+{
+    /// <summary>不把管道认证令牌写入日志</summary>
+    public override string ToString() => $"CatRemoteHookParams {{ DllPath = {DllPath}, PipeName = {PipeName}, Token = *** }}";
+}
 
 /// <summary>
 ///     launch 参数; areaName = 资料里的大区名（如 豆豆柴）, 账号库没记这个号的大区时用它;
@@ -444,7 +471,8 @@ public sealed record CatLaunchParams
     bool?            AutoEnter                 = null,
     string?          WeGameToken               = null,
     string?          WeGameAccountId           = null,
-    bool?            AuthOnly                  = null
+    bool?            AuthOnly                  = null,
+    CatRemoteHookParams? RemoteHook            = null
 )
 {
     /// <summary>
@@ -454,7 +482,8 @@ public sealed record CatLaunchParams
         $"CatLaunchParams {{ OperationId = {OperationId}, AccountName = {AccountName}, Dalamud = {Dalamud}, Minion = {Minion}, " +
         $"CrashDialogTimeoutSeconds = {CrashDialogTimeoutSeconds}, AreaName = {AreaName}, Platform = {Platform}, Password = {(Password == null ? "(无)" : "***")}, " +
         $"WeGameLogin = {WeGameLogin}, WeGameScan = {WeGameScan}, Character = {Character}, AutoEnter = {AutoEnter}, " +
-        $"WeGameToken = {(WeGameToken == null ? "(无)" : "***")}, WeGameAccountId = {WeGameAccountId}, AuthOnly = {AuthOnly} }}";
+        $"WeGameToken = {(WeGameToken == null ? "(无)" : "***")}, WeGameAccountId = {WeGameAccountId}, AuthOnly = {AuthOnly}, " +
+        $"RemoteHook = {(RemoteHook == null ? "(无)" : "***")} }}";
 }
 
 /// <summary>

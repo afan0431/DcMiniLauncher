@@ -94,11 +94,17 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     private readonly List<Task>                               autoEnterTasks         = [];
     private volatile CatAutoEnter?                            autoEnter;
 
+    /// <summary>接管来的那个游戏的进程号（崩溃重开起的新游戏不算接管来的）; 没接管为 0</summary>
+    private int adoptedPid;
+
     /// <summary>等自动进入角色的后台任务收尾的上限（它们在游戏退出时已被取消, 这里只是不让事件落在 game.exited 后面）</summary>
     private static readonly TimeSpan AutoEnterShutdownTimeout = TimeSpan.FromSeconds(5);
 
     /// <summary>本进程守着的游戏的守护记录与守护锁</summary>
     private readonly GameRecordWriter records = new();
+
+    /// <summary>这次上号挂 Minion 用的客户端目录: 首次挂载前组装, 崩溃重开与补挂复用, 游戏最终退出后收尾</summary>
+    private readonly CatMinionClientDirs clientDirs = new();
 
     /// <summary>任务单通道（Cat 上号自动开工）: 挂到本机监听上给 Afan 用; 外壳不支持时为 null</summary>
     private CatJobChannel? jobs;
@@ -151,6 +157,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             // 交接途中游戏退出、交接又没成: 当时被挡下的收尾补上（已做过的不会重做）
             CleanupProcess(final, null);
             await WaitAutoEnterEndAsync().ConfigureAwait(false);
+            await RetireClientDirAsync().ConfigureAwait(false);
 
             if (IsCloseRequested)
                 reporter.Exited(lastPid, lastExitCode, CatExitReasons.CLOSED);
@@ -175,6 +182,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
         finally
         {
+            // 兜底: 上面各条退出路径没收尾到的客户端目录（游戏已退出、没交接时才删）
+            await RetireClientDirAsync().ConfigureAwait(false);
             dcTravel?.Dispose();
         }
     }
@@ -219,6 +228,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             // 交接途中游戏退出、交接又没成: 当时被挡下的收尾补上（已做过的不会重做）
             CleanupProcess(final, null);
             await WaitAutoEnterEndAsync().ConfigureAwait(false);
+            await RetireClientDirAsync().ConfigureAwait(false);
 
             if (IsCloseRequested)
                 reporter.Exited(lastPid, lastExitCode, CatExitReasons.CLOSED);
@@ -260,6 +270,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         }
         finally
         {
+            // 兜底: 上面各条退出路径没收尾到的客户端目录（游戏已退出、没交接时才删）
+            await RetireClientDirAsync().ConfigureAwait(false);
             dcTravel?.Dispose();
         }
     }
@@ -362,6 +374,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         var launched = new FFXIVProcess(process);
         bool closeNow;
 
+        adoptedPid = process.Id;
+
         lock (closeLock)
         {
             currentProcess = launched;
@@ -389,6 +403,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         // 受理 adopt 时认领的守护锁: 这个游戏一退出（含崩溃重开换了新进程）就放掉, 不等整个接管流程结束
         records.Hold(process.Id, adoptRequest.GuardClaim);
+
+        // 原守护进程组装的 Minion 客户端目录: 改由本进程负责, 崩溃重开时复用, 游戏最终退出后由本进程收尾
+        clientDirs.Adopt(record.MinionClientDir, process.Id, record.ProcessStartedAt);
 
         context.InGameAgents = (record.Dalamud ? InGameAgents.Dalamud : InGameAgents.None) | (record.MinionFingerprint != null ? InGameAgents.Minion : InGameAgents.None);
         RunningGameRegistry.Register(process, context.InGameAgents, context.DcTravelPort);
@@ -424,11 +441,12 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             return launched;
         }
 
-        // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色并读职业等级（编排早就做完了, 不再重做）; 其它游戏只读职业等级
+        // 自动进入角色的游戏: 接着每隔一段时间看一次当前角色并读职业等级（编排早就做完了, 不再重做）; 其它游戏只读职业等级。
+        // 两条路都先确保游戏里有模块（没有就补注入, 受环境变量开关控制）
         if (!process.HasExited)
         {
             if (record.AutoEnter)
-                StartObserve(launched, reporter, cancellationToken);
+                StartObserve(launched, reporter, record.MinionFingerprint != null && request.Minion, cancellationToken);
             else
                 StartLevelWatch(launched, reporter, cancellationToken, true);
         }
@@ -462,8 +480,44 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     }
 
     /// <summary>
-    ///     不自动进入角色的游戏: 后台按只读模式注入游戏内模块（不装标题守卫和选角右键菜单, 游戏的行为与没注入时一样; 带 Minion 的已按完整模式注过就照旧）,
-    ///     之后每隔一段时间看一次当前角色、读一次全部职业等级（不挡崩溃守护, 游戏进程收尾时取消）。
+    ///     后台等游戏窗口出现后注入游戏内模块（已在就不动; 模块文件不在就跳过）; 只注入, 不连管道。没注成只记日志, 游戏不受影响
+    /// </summary>
+    private void StartModuleInjection(FFXIVProcess launched, bool readOnly, bool adopted, string step, CancellationToken token)
+    {
+        if (!MiniModuleInjector.ModulePath.Exists)
+            return;
+
+        var target = new CatProcessModuleTarget(launched.UnderlyingProcess);
+
+        lock (cleanupLock)
+        {
+            autoEnterTasks.Add
+            (
+                Task.Run
+                (async () =>
+                    {
+                        try
+                        {
+                            if (await CatModuleInjection.InjectWhenReadyAsync(target, readOnly, adopted, null, token).ConfigureAwait(false) is { } error)
+                                Log.Warning("[CatHost] {Step}没有注入游戏内模块: {Error}", step, error);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // 游戏退出或收到关闭请求
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, "[CatHost] {Step}注入游戏内模块出错（游戏不受影响）", step);
+                        }
+                    }
+                )
+            );
+        }
+    }
+
+    /// <summary>
+    ///     不自动进入角色的游戏: 后台注入游戏内模块（不挂 Minion 的与接管来的按只读模式: 不装标题守卫和选角右键菜单, 游戏的行为与没注入时一样;
+    ///     模块已经在了就照旧）, 之后每隔一段时间看一次当前角色、读一次全部职业等级（不挡崩溃守护, 游戏进程收尾时取消）。
     ///     adopted = 接管来的游戏: 补注入受环境变量开关控制, 多个游戏错开注
     /// </summary>
     private void StartLevelWatch(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken token, bool adopted = false)
@@ -473,7 +527,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         var game = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea)
         {
             AdoptedGame    = adopted,
-            ReadOnlyModule = true
+            ReadOnlyModule = adopted ? CatModuleInjection.ReadOnlyForAdopt(false) : CatModuleInjection.ReadOnlyForLaunch(false, request.Minion)
         };
         var watch        = new CatLevelWatch(game, reporter);
         var watchToken   = cancellation.Token;
@@ -509,13 +563,18 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     }
 
     /// <summary>
-    ///     只看当前角色、不做编排（接管来的游戏已经进过游戏了）
+    ///     只看当前角色、不做编排（接管来的游戏已经进过游戏了）。游戏里没有模块（原守护进程没来得及注）时先按完整模式补注入, 受环境变量开关控制。
+    ///     minion = 原来那次上号要挂 Minion: 原守护进程在角色进世界之前就没了时还没挂上, 进了世界补挂（已挂着就不动）
     /// </summary>
-    private void StartObserve(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken token)
+    private void StartObserve(FFXIVProcess launched, ICatLaunchReporter reporter, bool minion, CancellationToken token)
     {
         var process      = launched.UnderlyingProcess;
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-        var game         = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea);
+        var game = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea)
+        {
+            AdoptedGame    = true,
+            ReadOnlyModule = CatModuleInjection.ReadOnlyForAdopt(true)
+        };
         var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, null));
         var observeToken = cancellation.Token;
 
@@ -531,7 +590,15 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                     {
                         try
                         {
-                            await flow.ObserveAsync(observeToken).ConfigureAwait(false);
+                            if (await game.AttachAsync(observeToken).ConfigureAwait(false) is { } attachError)
+                                Log.Warning("[CatHost] 接管来的游戏里没有游戏内模块: {Error}", attachError);
+
+                            var observe = flow.ObserveAsync(observeToken);
+
+                            if (minion)
+                                await AttachMinionInWorldAsync(flow, launched, reporter, observeToken).ConfigureAwait(false);
+
+                            await observe.ConfigureAwait(false);
                         }
                         catch (OperationCanceledException)
                         {
@@ -633,6 +700,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                                   Tgt = await EncryptOrNullAsync(oauth?.TGT).ConfigureAwait(false) ?? record.Tgt,
                                   Guid = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false) ?? record.Guid,
                                   DcTravelSession = await EncryptOrNullAsync(session).ConfigureAwait(false),
+                                  MinionClientDir = clientDirs.CurrentPath ?? record.MinionClientDir,
                                   CatJob = jobRecords.CurrentOr(record.CatJob),
                                   UpdatedAt = DateTimeOffset.UtcNow
                               };
@@ -688,6 +756,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         CleanupProcess(process, null);
         await WaitAutoEnterEndAsync().ConfigureAwait(false);
+        await RetireClientDirAsync().ConfigureAwait(false);
 
         var closed = IsCloseRequested;
         reporter.Exited(process.ProcessID, TryGetExitCode(process), closed ? CatExitReasons.CLOSED : CatExitReasons.GUARD_ERROR, null, closed ? null : detail);
@@ -712,6 +781,18 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             if (dalamud)
                 await InjectDalamudIntoRunningAsync(process, reporter, cancellationToken).ConfigureAwait(false);
+
+            // 游戏里没有模块就在后台补注入（已在就不动）; 接管来的游戏按接管的规则, 其它按起游戏时的规则
+            var adopted = process.ProcessID == adoptedPid;
+
+            StartModuleInjection
+            (
+                process,
+                adopted ? CatModuleInjection.ReadOnlyForAdopt(request.AutoEnter) : CatModuleInjection.ReadOnlyForLaunch(request.AutoEnter, request.Minion),
+                adopted,
+                "补注入",
+                closeCts.Token
+            );
 
             if (minion)
             {
@@ -1570,9 +1651,15 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 reporter.Agent(CatAgentKinds.DALAMUD, loaded, loaded ? null : CatCodes.DALAMUD_UNAVAILABLE, loaded ? null : "游戏进程里没有等到 Dalamud 加载");
             }
 
-            // Minion 在自动进入角色的编排开始之前挂好, 带不带 autoEnter 时机都一样
-            if (request.Minion)
+            // 自动进入角色的, Minion 等角色进了世界再挂（StartAutoEnter）: bot 一到标题界面就在游戏主线程上同步加载插件,
+            // 主线程停 40 秒上下, 这时编排点了「开始游戏」, 连大厅超时报 2002（2026-10-21 实机 4/4, 卫月上号 0 次）。
+            // 不自动进入的照旧起游戏后就挂: 人自己点开始游戏, bot 在标题界面加载完之前点不动
+            if (request.Minion && !request.AutoEnter)
             {
+                // 挂 Minion 可能排队等很久, 人可能在这期间进了角色: 模块先在后台等窗口注上（完整模式）, 赶在进入角色读配置之前。
+                // 其它游戏的注入本来就不等别的事: 自动进入角色的由编排一开始注入, 其余由读职业等级的后台任务注入
+                StartModuleInjection(launched, CatModuleInjection.ReadOnlyForLaunch(request.AutoEnter, request.Minion), false, "挂 Minion 前", startToken);
+
                 await AttachMinionAsync(launched, dalamudOk, reporter, startToken).ConfigureAwait(false);
 
                 if (MiniModuleInjector.ModulePath.Exists && !IsCloseRequested)
@@ -1609,7 +1696,8 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     }
 
     /// <summary>
-    ///     在后台自动进入角色（不挡崩溃守护）: 编排 → 之后隔一段时间看一次当前角色。带 Minion 的在调用之前已经挂好。
+    ///     在后台自动进入角色（不挡崩溃守护）: 编排 → 之后隔一段时间看一次当前角色。
+    ///     带 Minion 的在角色第一次进世界后挂（编排停手后人手动进去的也算）; 没进世界游戏就退了则不挂。
     ///     等人选角色、排队都可能很久, 所以不在启动流程里等; 游戏进程收尾时取消。
     ///     崩溃重启后的新进程接着登录上一次实际进的那个角色。
     /// </summary>
@@ -1633,8 +1721,13 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                     {
                         try
                         {
-                            await flow.RunAsync(token).ConfigureAwait(false);
-                            await flow.ObserveAsync(token).ConfigureAwait(false);
+                            var outcome = await flow.RunAsync(token).ConfigureAwait(false);
+                            var observe = flow.ObserveAsync(token);
+
+                            if (request.Minion && outcome != CatAutoEnterOutcome.Cancelled)
+                                await AttachMinionInWorldAsync(flow, launched, reporter, token).ConfigureAwait(false);
+
+                            await observe.ConfigureAwait(false);
                         }
                         catch (OperationCanceledException)
                         {
@@ -1652,6 +1745,41 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 )
             );
         }
+    }
+
+    /// <summary>
+    ///     自动进入角色的游戏: 等角色第一次进了世界再挂 Minion（原因见 StartOnceAsync）, 挂完把阶段恢复成编排当前的阶段。
+    ///     已经挂着（进世界前 inject 补挂过、接管来的游戏原本就挂好了）就不再挂。挂载出错只记日志, 不打断看当前角色
+    /// </summary>
+    private async Task AttachMinionInWorldAsync(CatAutoEnter flow, FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken token)
+    {
+        var process = launched.UnderlyingProcess;
+
+        await flow.EnteredWorld.WaitAsync(token).ConfigureAwait(false);
+
+        if (CatMinionReservations.IsAttached(process))
+        {
+            Log.Information("[CatHost] 角色已进入游戏, 这个游戏已经挂着 Minion, 不再挂");
+            return;
+        }
+
+        Log.Information("[CatHost] 角色已进入游戏, 挂 Minion");
+
+        try
+        {
+            await AttachMinionAsync(launched, IsDalamudLoaded(process), reporter, token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[CatHost] 进世界后挂 Minion 出错（游戏不受影响）");
+        }
+
+        if (!process.HasExited && !IsCloseRequested)
+            reporter.Stage(flow.CurrentStage ?? CatStages.RUNNING);
     }
 
     /// <summary>
@@ -1870,6 +1998,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 Guid                      = await EncryptOrNullAsync(oauth?.Guid).ConfigureAwait(false),
                 MinionFingerprint         = request.CardFingerprint,
                 MinionVariant             = request.Variant,
+                MinionClientDir           = clientDirs.CurrentPath,
                 AutoEnter                 = request.AutoEnter,
                 CharacterName             = request.CharacterName,
                 CharacterHomeWorld        = request.CharacterHomeWorld,
@@ -1907,6 +2036,53 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 };
             }
         );
+
+    /// <summary>
+    ///     组装了客户端目录后写进当前游戏的守护记录, 交接后接管方凭它接着负责这个目录
+    /// </summary>
+    private Task RewriteGameRecordMinionDirAsync(int processId, string? clientDir) =>
+        records.WriteAsync
+        (() =>
+            {
+                if (!records.TryGetRecorded(processId, out var startedAt))
+                    return Task.FromResult<GameRecord?>(null);
+
+                if (GameRecords.ReadMatching(processId, startedAt) is not { } record || record.MinionClientDir == clientDir)
+                    return Task.FromResult<GameRecord?>(null);
+
+                return Task.FromResult<GameRecord?>(record with { MinionClientDir = clientDir, UpdatedAt = DateTimeOffset.UtcNow });
+            }
+        );
+
+    /// <summary>
+    ///     游戏最终退出后收尾客户端目录: 交接了（目录归接管方）或游戏还在跑时不动
+    /// </summary>
+    private async Task RetireClientDirAsync()
+    {
+        if (handingOff || clientDirs.CurrentPath == null)
+            return;
+
+        if (currentProcess is { } process && !HasExited(process.UnderlyingProcess))
+        {
+            Log.Warning("[CatHost] 游戏 {Pid} 还在跑, 先不收尾客户端目录 {Dir}（游戏退出后由下次上号按残留清理）", process.ProcessID, clientDirs.CurrentPath);
+            return;
+        }
+
+        await clientDirs.RetireAsync().ConfigureAwait(false);
+    }
+
+    private static bool HasExited(Process process)
+    {
+        try
+        {
+            return process.HasExited;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "[CatHost] 读不到游戏进程是否退出, 按已退出处理");
+            return true;
+        }
+    }
 
     /// <summary>
     ///     游戏退出（或崩溃重开换了新进程）时删掉它的守护记录并放掉守护锁
@@ -2036,13 +2212,38 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         try
         {
+            // 这个游戏自己的客户端目录（崩溃重开、补挂时复用同一个）
+            var process  = launched.UnderlyingProcess;
+            var prepared = await clientDirs.PrepareAsync(request.MinionCard!, request.OperationId, process, SafeProcessStartedAt(process), cancellationToken)
+                                           .ConfigureAwait(false);
+
+            if (prepared.Failed)
+            {
+                Log.Error("[CatHost] 准备 Minion 客户端目录失败, 不挂: {Code} {Error}", prepared.ErrorCode, prepared.ErrorMessage);
+
+                if (!IsCloseRequested && !process.HasExited)
+                    reporter.Agent(CatAgentKinds.MINION, false, prepared.ErrorCode, prepared.ErrorMessage);
+
+                return;
+            }
+
+            if (prepared.InstallPath != null)
+                await RewriteGameRecordMinionDirAsync(process.Id, prepared.InstallPath).ConfigureAwait(false);
+
             // 占用记录里写上号请求带的账号名（外壳认得的那个）: 按备注找到的 WeGame 号, 它与账号库里的账号名不同
-            var result = await MinionAttacher.AttachAsync(request.MinionCard!, launched.UnderlyingProcess, gamePath, dalamudInjected, request.AccountName, cancellationToken)
+            var options = new MinionAttachOptions
+            {
+                InstallPath       = prepared.InstallPath,
+                TensorCoreEnabled = prepared.TensorCoreEnabled,
+                Queued            = () => reporter.Stage(CatStages.MINION_QUEUED),
+                Dequeued          = () => reporter.Stage(CatStages.ATTACHING_MINION)
+            };
+            var result = await MinionAttacher.AttachAsync(request.MinionCard!, launched.UnderlyingProcess, gamePath, dalamudInjected, request.AccountName, cancellationToken, options)
                                              .ConfigureAwait(false);
             ok = result.Ok;
 
-            if (IsCloseRequested)
-                Log.Information("[CatHost] 收到关闭请求, Minion 挂载结果不再上报: {Ok}", result.Ok);
+            if (IsCloseRequested || launched.UnderlyingProcess.HasExited)
+                Log.Information("[CatHost] 收到关闭请求或游戏已退出, Minion 挂载结果不再上报: {Ok}", result.Ok);
             else if (result.Ok)
                 reporter.Agent(CatAgentKinds.MINION, true);
             else
@@ -2050,6 +2251,11 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
                 Log.Error("[CatHost] Minion 挂载失败: {Error}", result.Error);
                 reporter.Agent(CatAgentKinds.MINION, false, CatCodes.ATTACH_FAILED, result.Error);
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // 游戏退出或收到关闭请求: 不是挂载失败, 不报 attachFailed; 与原来一样不往外抛, 调用方照常收尾
+            Log.Information("[CatHost] Minion 挂载途中被取消, 不上报");
         }
         catch (Exception ex)
         {

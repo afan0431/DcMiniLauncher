@@ -74,6 +74,28 @@ public sealed class GameRecordsTests : IDisposable
     }
 
     [Fact]
+    public void MinionClientDir_RoundTrips_AndIsLeftOutWhenNull()
+    {
+        using var game = StartSleeper();
+
+        try
+        {
+            const string CLIENT = @"E:\MINI-clients\1234-op-1";
+
+            Assert.True(GameRecords.Write(NewRecord(game) with { MinionClientDir = CLIENT }));
+            Assert.Equal(CLIENT, GameRecords.Read(game.Id)!.MinionClientDir);
+
+            Assert.True(GameRecords.Write(NewRecord(game)));
+            Assert.Null(GameRecords.Read(game.Id)!.MinionClientDir);
+            Assert.DoesNotContain("minionClientDir", File.ReadAllText(GameRecords.FilePath(game.Id)));
+        }
+        finally
+        {
+            game.Kill();
+        }
+    }
+
+    [Fact]
     public void CatJob_RoundTripsAsJson_AndIsLeftOutWhenNull()
     {
         using var game = StartSleeper();

@@ -11,7 +11,7 @@
 #include <string>
 
 // 模块版本, 通过 pipe 的 VERSION 命令回给启动器, 便于确认注进去的是哪一版
-#define MINIMODULE_VERSION "0.9.0"
+#define MINIMODULE_VERSION "0.10.0"
 
 // ---- 模式 (dllmain.cpp) -------------------------------------------------------
 // 只读模式: 启动器只为读角色和等级而注入时, 注入前写 <ProgramData>\DcMiniLauncher\module-<pid>.mode（readonly）,
@@ -23,6 +23,7 @@ bool ModuleReadOnly();
 void        LogInit();
 void        LogShutdown();
 void        LogF(const char* format, ...);
+void        LogFNoWait(const char* format, ...); // 拿不到日志锁就丢掉这一条: 进程退出时别的线程已被结束, 可能正持着锁
 std::string LogFilePath();
 
 // ---- 主线程执行 (mainthread.cpp) --------------------------------------------
@@ -46,6 +47,8 @@ uintptr_t ScanText(const char* signature);                     // 命中 E8/E9 �
 uintptr_t ScanStaticAddress(const char* signature, int offset); // RIP 相对寻址的静态地址
 uintptr_t ScanStaticAddressUnique(const char* signature, int offset); // 同上, 但扫完整个 .text 节, 命中不止一处时返回 0
 uintptr_t ScanTextRaw(const char* signature);                  // 不跟进 E8/E9, 给通配符开头的特征码用
+uintptr_t ScanTextCount(const char* signature, size_t* count);  // 同 ScanText, 但扫完整个 .text 节并带回命中个数
+bool      TextSectionContains(uintptr_t address);              // 地址是否在主模块 .text 节里
 
 // ---- 游戏结构体 (game.cpp) --------------------------------------------------
 bool        GameResolve();          // 解析特征码, 只做一次
@@ -67,6 +70,7 @@ std::string GameFocusCharacter(const std::string& who); // 选角界面切到该
 std::string GameLobbyState();   // 只读: 界面位置、当前服务器、选中项、暂时锁定、排队名次、对话框及提示文字、是否读盘
 std::string GameCharas();       // 只读: 整个大区的角色, 格式同 WHOLIST
 std::string GameWhoAmI();       // 只读: 游戏内当前角色名、ContentId、当前/原始世界
+bool        GameCharaName(unsigned long long contentId, std::string* name); // 只读: 按 ContentId 查角色名（选角列表或当前角色）; 要等主线程, 不在游戏线程上调
 std::string GameLevels();       // 只读: 全部职业等级（下标为 ClassJob 表的 ExpArrayIndex）
 std::string GameDuty();         // 只读: 角色是否在副本中（Conditions 的 BoundByDuty 类标志）
 std::string GameSelectCharacter(const std::string& who); // 当前服务器的角色列表里选中（高亮）, 不进入
@@ -98,6 +102,15 @@ void GameStopKeepAlive();
 bool        ContextMenuInstall();
 bool        ContextMenuUninstall();
 std::string ContextMenuStatus();
+
+// ---- 所有角色共用一套游戏配置 (charconfig_hook.cpp) --------------------------
+// 挂 FileInterface::OpenFile: 读共用文件之前放入本机共享目录里这一套的最新版, 写完之后真改了才发布。
+// 挂不上（特征码不全、不唯一、地址不一致）只少这一项, 心跳 %LOCALAPPDATA%\Cat\char-config\modules\<pid>.json 写明原因。
+// 卸载前必须调 Uninstall, 返回 false 就不能 FreeLibrary。
+bool        CharConfigInstall();
+bool        CharConfigUninstall();
+std::string CharConfigStatus();   // 管道 CHARCONFIG: 挂钩状态、当前配置套、最近几次动作
+void        CharConfigProcessExit(); // 进程正常退出时（DLL_PROCESS_DETACH）把已写完的文件补发布, 不等任何进程内的锁
 
 // ---- 命名管道服务端 (pipe.cpp) ----------------------------------------------
 // \\.\pipe\minilauncher-<pid> —— 按 PID 分开, 天然满足「多开不串」

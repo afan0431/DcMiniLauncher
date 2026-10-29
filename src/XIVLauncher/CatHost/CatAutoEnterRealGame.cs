@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using Serilog;
-using XIVLauncher.Common.Util;
 using XIVLauncher.DCTravel;
 using XIVLauncher.InGame;
 using XIVLauncher.Login.Models;
@@ -14,10 +13,10 @@ namespace XIVLauncher.CatHost;
 /// </summary>
 internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
 {
-    /// <summary>等游戏窗口出现的上限（模块要挂在窗口线程上, 窗口出现前注入会装不上主线程通道）</summary>
-    private static readonly TimeSpan WindowTimeout = TimeSpan.FromMinutes(3);
-
     private const int PIPE_CONNECT_TIMEOUT_MS = 10_000;
+
+    /// <summary>跨区收尾时管道闸被别的短操作占着, 最多等这么久</summary>
+    private static readonly TimeSpan GATE_WAIT = TimeSpan.FromSeconds(10);
 
     private readonly Process                   process;
     private readonly DCTravelClient            travelClient;
@@ -64,6 +63,12 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
     /// </summary>
     public bool ReadOnlyModule { get; init; }
 
+    /// <summary>
+    ///     这次自动进入角色是游戏内跨区那一单的收尾（请求带 enter）: 那一单在进世界前一直算进行中, 它就是自己, 所以不看 <see cref="InGameTravelJobs" />, 只看管道闸;
+    ///     闸被别的短操作（读选角列表等）占着时等一会儿再占, 不立刻当成模块失效
+    /// </summary>
+    public bool OwnedByTravelJob { get; init; }
+
     /// <inheritdoc />
     public IReadOnlyList<string> AreaNames => areas.Select(x => x.AreaName).ToArray();
 
@@ -72,7 +77,7 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
 
     /// <inheritdoc />
     public bool ModuleBusy =>
-        InGameTravelJobs.IsRunning(process.Id) || (gate == null && InGameTravelService.IsGateHeld(process.Id));
+        (!OwnedByTravelJob && InGameTravelJobs.IsRunning(process.Id)) || (gate == null && InGameTravelService.IsGateHeld(process.Id));
 
     /// <inheritdoc />
     public bool HasExited
@@ -91,52 +96,18 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
     }
 
     /// <inheritdoc />
-    public async Task<string?> AttachAsync(CancellationToken cancellationToken)
-    {
-        var deadline = clock.Elapsed + WindowTimeout;
-
-        while (true)
-        {
-            if (HasExited)
-                return "游戏进程已经退出";
-
-            process.Refresh();
-
-            if (process.MainWindowHandle != IntPtr.Zero)
-                break;
-
-            if (clock.Elapsed > deadline)
-                return $"等了 {WindowTimeout.TotalSeconds:F0} 秒游戏窗口没有出现";
-
-            await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken).ConfigureAwait(false);
-        }
-
-        if (!AdoptedGame || MiniModuleInjector.IsInjected(process))
-            return await Task.Run(() => MiniModuleInjector.Inject(process, ReadOnlyModule), cancellationToken).ConfigureAwait(false);
-
-        if (!CatModuleInjection.InjectOnAdopt)
-            return $"接管来的游戏里没有游戏内模块, 按环境变量 {CatModuleInjection.ADOPT_INJECT_VARIABLE} 的设置不补注入";
-
-        // 拿不到锁（超时、打不开）时不加锁照常注
-        using var injectGate = await CrossProcessMutex.TryAcquireAsync(CatModuleInjection.ADOPT_INJECT_MUTEX, CatModuleInjection.AdoptInjectWait).ConfigureAwait(false);
-
-        var error = await Task.Run(() => MiniModuleInjector.Inject(process, ReadOnlyModule), cancellationToken).ConfigureAwait(false);
-
-        if (injectGate != null)
-            await Task.Delay(CatModuleInjection.AdoptInjectSpacing, cancellationToken).ConfigureAwait(false);
-
-        return error;
-    }
+    public Task<string?> AttachAsync(CancellationToken cancellationToken) =>
+        CatModuleInjection.InjectWhenReadyAsync(new CatProcessModuleTarget(process), ReadOnlyModule, AdoptedGame, null, cancellationToken);
 
     /// <inheritdoc />
     public async Task<string> SendAsync(string command, CancellationToken cancellationToken)
     {
         if (module == null)
         {
-            if (InGameTravelJobs.IsRunning(process.Id))
+            if (!OwnedByTravelJob && InGameTravelJobs.IsRunning(process.Id))
                 throw new InvalidOperationException("这个客户端正在换大区, 游戏内模块被占用");
 
-            gate ??= InGameTravelService.TryEnterGate(process.Id) ?? throw new InvalidOperationException("游戏内模块正被别的操作占用");
+            gate ??= await EnterGateAsync(cancellationToken).ConfigureAwait(false) ?? throw new InvalidOperationException("游戏内模块正被别的操作占用");
 
             var client = new MiniModuleClient(process.Id);
 
@@ -162,6 +133,23 @@ internal sealed class CatAutoEnterRealGame : ICatAutoEnterGame, IDisposable
         {
             Release();
             throw;
+        }
+    }
+
+    /// <summary>占管道闸: 平常占不到就算了; 跨区收尾时最多等 <see cref="GATE_WAIT" /></summary>
+    private async Task<IDisposable?> EnterGateAsync(CancellationToken cancellationToken)
+    {
+        var deadline = clock.Elapsed + GATE_WAIT;
+
+        while (true)
+        {
+            if (InGameTravelService.TryEnterGate(process.Id) is { } lease)
+                return lease;
+
+            if (!OwnedByTravelJob || clock.Elapsed > deadline)
+                return null;
+
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
         }
     }
 

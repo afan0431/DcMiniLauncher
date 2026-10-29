@@ -75,6 +75,12 @@ public sealed record GameRecord
 
     public string? MinionVariant { get; init; }
 
+    /// <summary>
+    ///     这个游戏挂 Minion 用的客户端目录（<c>X:\MINI-clients\…</c>）; 直接挂主目录或没挂为 null。
+    ///     接管方凭它复用目录、在游戏最终退出后收尾删除
+    /// </summary>
+    public string? MinionClientDir { get; init; }
+
     public bool AutoEnter { get; init; }
 
     public string? CharacterName { get; init; }

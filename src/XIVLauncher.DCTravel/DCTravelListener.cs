@@ -379,6 +379,12 @@ public sealed class DCTravelListener : IDisposable, IAsyncDisposable
         /// <summary>true = 一直等到换完才回应；默认立刻返回, 进度用 /ingame-travel/status 查</summary>
         public bool Wait { get; set; }
 
+        /// <summary>
+        ///     true = 跨区落定后接着把这个角色登录进世界（启动器的自动进入角色）, 进了世界才报成功;
+        ///     默认停在新大区的选角界面。超域旅行、超域返回都认
+        /// </summary>
+        public bool Enter { get; set; }
+
         public InGameTravelIdentity Identity => new(Character, World, HomeWorld, Pid, ContentId);
     }
 

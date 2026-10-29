@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 namespace
@@ -19,6 +20,9 @@ namespace
     uintptr_t g_releaseLobbyContext = 0;
     uintptr_t g_setString           = 0;
     bool      g_resolved            = false;
+
+    // 特征码解析可能同时来自管道线程、共用配置的工作线程和模块启动线程
+    std::mutex g_resolveMutex;
 
     // ⚠ 带 __try 的函数里不能有需要展开的 C++ 对象 (MSVC C2712), 所以这里全是 POD
     struct ProbeData
@@ -1173,6 +1177,8 @@ namespace
 
     bool ResolvePlayerState()
     {
+        std::lock_guard<std::mutex> lock(g_resolveMutex);
+
         if (!g_playerStateTried)
         {
             g_playerStateTried = true;
@@ -2577,6 +2583,89 @@ std::string GameCharas()
     return header + body;
 }
 
+namespace
+{
+    struct CharaNameData
+    {
+        unsigned long long contentId;
+        bool               playerState; // PlayerState 的地址已解析
+        char               name[offsets::PLAYER_STATE_NAME_LEN + 1];
+    };
+
+    // 先在当前服务器的选角列表里按 ContentId 找; 找不到再看 PlayerState 里载入的是不是这个角色
+    void OpCharaName(const Pointers* p, CharaNameData* out)
+    {
+        out->name[0] = '\0';
+
+        __try
+        {
+            const auto lobby = reinterpret_cast<uint8_t*>(p->agentLobby);
+
+            if (lobby != nullptr)
+            {
+                const auto vector = lobby + offsets::AGENT_LOBBY_CHARA_SELECT_ENTRIES;
+                const auto first  = ReadAt<uint8_t**>(vector, offsets::STD_VECTOR_FIRST);
+                const auto last   = ReadAt<uint8_t**>(vector, offsets::STD_VECTOR_LAST);
+
+                if (first != nullptr && last != nullptr && last >= first && last - first <= 1000)
+                {
+                    for (auto entry = first; entry < last; ++entry)
+                    {
+                        if (*entry == nullptr || ReadAt<unsigned long long>(*entry, offsets::CHARA_ENTRY_CONTENT_ID) != out->contentId)
+                            continue;
+
+                        if (CopyCheckedName(*entry + offsets::CHARA_ENTRY_NAME, offsets::CHARA_ENTRY_NAME_LEN, out->name, false))
+                            return;
+                    }
+                }
+            }
+
+            if (!out->playerState)
+                return;
+
+            const auto state = reinterpret_cast<uint8_t*>(g_playerState);
+
+            if (ReadAt<unsigned char>(state, offsets::PLAYER_STATE_IS_LOADED) != 1 ||
+                ReadAt<unsigned long long>(state, offsets::PLAYER_STATE_CONTENT_ID) != out->contentId)
+                return;
+
+            if (!CopyCheckedName(state + offsets::PLAYER_STATE_NAME, offsets::PLAYER_STATE_NAME_LEN, out->name, false))
+                out->name[0] = '\0';
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            LogF("[game] 查角色名异常 code=0x%08X", GetExceptionCode());
+            out->name[0] = '\0';
+        }
+    }
+}
+
+// 按 ContentId 查角色名（只读, UTF-8）。要等主线程, 不能在游戏自己的线程上调; 查不到返回 false
+bool GameCharaName(unsigned long long contentId, std::string* name)
+{
+    CallStatePtr state;
+    std::string  failure;
+
+    if (contentId == 0 || !PrepareCall(state, failure))
+        return false;
+
+    auto data         = std::make_shared<CharaNameData>();
+    data->contentId   = contentId;
+    data->playerState = ResolvePlayerState();
+    data->name[0]     = '\0';
+
+    auto captured = state;
+
+    if (!MainThreadRun([captured, data] { OpCharaName(&captured->pointers, data.get()); }, 3000))
+        return false;
+
+    if (data->name[0] == '\0')
+        return false;
+
+    *name = data->name;
+    return true;
+}
+
 // 游戏内当前角色。响应只有一行, 角色名可能带空格所以放在行尾:
 //   OK loaded=<0|1> cid=<ContentId> world=<CurrentWorldId> home=<HomeWorldId> worldName=<当前世界名> homeName=<原始世界名>
 //      loggedIn=<0|1> inZone=<0|1> lobbyCid=<大厅数据里记的 ContentId> name=<名字>
@@ -3158,6 +3247,8 @@ void* GameFrameworkPointer()
 
 bool GameResolve()
 {
+    std::lock_guard<std::mutex> lock(g_resolveMutex);
+
     if (g_resolved)
         return true;
 

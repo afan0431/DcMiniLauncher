@@ -624,17 +624,17 @@ public sealed class CatSimulatedGameRunnerTests
     }
 
     [Fact]
-    public async Task AutoEnter_WithMinion_AttachesMinionBeforeEnteringTheLobby()
+    public async Task AutoEnter_WithMinion_AttachesMinionAfterEnteringTheWorld()
     {
         var reporter = new RecordingReporter();
-        var entries  = await RunAutoEnterUntilAsync(AutoEnterRequest("acc", true), reporter, "stage:inWorld");
+        var entries  = await RunAutoEnterUntilAsync(AutoEnterRequest("acc", true), reporter, "agent:minion:ok");
 
         Assert.Equal
         (
             [
-                "stage:preparing", "stage:starting", "started",
-                "stage:attachingMinion", "agent:minion:ok", "stage:running",
+                "stage:preparing", "stage:starting", "started", "stage:running",
                 "stage:enteringLobby", "characters:auto:1", "stage:enteringWorld", "character:模拟角色@LaNuoXiYa", "stage:inWorld",
+                "stage:attachingMinion", "agent:minion:ok", "stage:inWorld",
                 "exited"
             ],
             entries
@@ -652,15 +652,15 @@ public sealed class CatSimulatedGameRunnerTests
                       (
                           AutoEnterRequest(CatSimulatedGameRunner.CHARACTERS_PREFIX + "acc", true),
                           reporter,
-                          "stage:inWorld",
+                          "agent:minion:ok",
                           async () =>
                           {
                               await WaitUntilAsync(() => reporter.Entries.Contains("characters:choose:3"));
                               await Task.Delay(100);
 
-                              // 等人选的时候不往下走; Minion 在这之前已经挂好
+                              // 等人选的时候不往下走; Minion 要等进了世界才挂
                               Assert.Equal("characters:choose:3", reporter.Entries.Last());
-                              Assert.Contains("agent:minion:ok", reporter.Entries);
+                              Assert.DoesNotContain("stage:attachingMinion", reporter.Entries);
 
                               Assert.Equal(CatCodes.INVALID_PARAMS, runner.SelectCharacter("999").Code);
                               Assert.True(runner.SelectCharacter(CatSimulatedGameRunner.SIMULATED_CONTENT_ID_PREFIX + "2").Accepted);
@@ -670,10 +670,10 @@ public sealed class CatSimulatedGameRunnerTests
         Assert.Equal
         (
             [
-                "stage:preparing", "stage:starting", "started",
-                "stage:attachingMinion", "agent:minion:ok", "stage:running",
+                "stage:preparing", "stage:starting", "started", "stage:running",
                 "stage:enteringLobby", "stage:awaitingCharacterChoice", "characters:choose:3",
                 "stage:enteringWorld", "character:模拟角色二@HongYuHai", "stage:inWorld",
+                "stage:attachingMinion", "agent:minion:ok", "stage:inWorld",
                 "exited"
             ],
             entries
@@ -722,16 +722,16 @@ public sealed class CatSimulatedGameRunnerTests
     [Theory]
     [InlineData("stop:", "moduleUnavailable")]
     [InlineData("stop:lobbyError", "lobbyError")]
-    public async Task AutoEnter_Stop_LeavesTheGameRunning_WithMinionAlreadyAttached(string account, string code)
+    public async Task AutoEnter_Stop_LeavesTheGameRunning_WithoutAttachingMinion(string account, string code)
     {
         var reporter = new RecordingReporter();
         var entries  = await RunAutoEnterUntilAsync(AutoEnterRequest(account, true), reporter, $"stopped:{code}");
 
+        // 没进世界就不挂 Minion（真实启动里人手动进了世界才挂, 模拟模式没有人进）
         Assert.Equal
         (
             [
-                "stage:preparing", "stage:starting", "started",
-                "stage:attachingMinion", "agent:minion:ok", "stage:running",
+                "stage:preparing", "stage:starting", "started", "stage:running",
                 "stage:enteringLobby", $"stopped:{code}", "stage:running",
                 "exited"
             ],
