@@ -76,14 +76,21 @@ public static class DalamudPluginEnsurer
             }
         }
 
+        // 仓库也加进列表: 卫月只从装它的那个仓库（InstalledFromUrl）更新第三方插件, 且那个仓库要在列表里开着; 没有它, 开着的游戏永远看不到新版
+        var repoChanged    = config != null && EnsureRepo(config, repoUrl);
+        var profileChanged = config != null && installed != null && EnableInProfiles(config, name, installed.WorkingPluginId);
+
+        if (repoChanged || profileChanged)
+            WriteJsonAtomic(configPath, config!);
+
+        if (repoChanged)
+            actions.Add("仓库加进列表");
+
+        if (profileChanged)
+            actions.Add("在默认合集里开启");
+
         if (installed == null)
             return new Result(false, "none", warning ?? $"没有装 {name}");
-
-        if (config != null && EnableInProfiles(config, name, installed.WorkingPluginId))
-        {
-            WriteJsonAtomic(configPath, config);
-            actions.Add("在默认合集里开启");
-        }
 
         if (warning != null)
             actions.Add($"仍用已装的 {installed.Version}");
@@ -252,6 +259,39 @@ public static class DalamudPluginEnsurer
         }
 
         return changed;
+    }
+
+    /// <summary>ThirdRepoList 里没有这个地址就加一条开着的, 有但关着就打开; 返回有没有改动</summary>
+    private static bool EnsureRepo(JObject config, string repoUrl)
+    {
+        if (config["ThirdRepoList"]?["$values"] is not JArray repos)
+        {
+            repos = new JArray();
+            config["ThirdRepoList"] = new JObject
+            {
+                ["$type"]   = "System.Collections.Generic.List`1[[Dalamud.Configuration.ThirdPartyRepoSettings, Dalamud]], System.Private.CoreLib",
+                ["$values"] = repos,
+            };
+        }
+
+        var mine = repos.OfType<JObject>().Where(x => string.Equals(x.Value<string>("Url")?.Trim(), repoUrl, StringComparison.OrdinalIgnoreCase)).ToList();
+
+        if (mine.Count == 0)
+        {
+            repos.Add(new JObject
+            {
+                ["$type"]     = "Dalamud.Configuration.ThirdPartyRepoSettings, Dalamud",
+                ["Url"]       = repoUrl,
+                ["IsEnabled"] = true,
+            });
+            return true;
+        }
+
+        if (mine.Any(x => x.Value<bool?>("IsEnabled") == true))
+            return false;
+
+        mine[0]["IsEnabled"] = true;
+        return true;
     }
 
     private static bool SameId(JObject plugin, string workingId) =>
