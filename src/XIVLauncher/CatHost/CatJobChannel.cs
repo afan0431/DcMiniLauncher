@@ -56,6 +56,9 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     /// <summary>是否在副本中的事件</summary>
     public const string DUTY_EVENT = "game.duty";
 
+    /// <summary>选角界面读到的计费文字（月卡/点卡）事件</summary>
+    public const string BILLING_EVENT = "game.billing";
+
     /// <summary>角色快照格式</summary>
     public const string SNAPSHOT_SCHEMA = "cat-snapshot/1";
 
@@ -101,6 +104,7 @@ public sealed class CatJobChannel : ICatLocalEndpoints
 
     /// <summary>每个游戏进程上次发的"是否在副本中"（null = 发过"未知"）</summary>
     private readonly Dictionary<int, bool?> lastDuty = [];
+    private readonly Dictionary<int, string> lastBilling = [];
 
     /// <summary>每个游戏进程上一次经本机接口收下回报的时刻（Environment.TickCount64）</summary>
     private readonly Dictionary<int, long> lastPostedAt = [];
@@ -287,6 +291,9 @@ public sealed class CatJobChannel : ICatLocalEndpoints
             foreach (var other in lastDuty.Keys.Where(x => x != pid).ToArray())
                 lastDuty.Remove(other);
 
+            foreach (var other in lastBilling.Keys.Where(x => x != pid).ToArray())
+                lastBilling.Remove(other);
+
             foreach (var other in lastPostedAt.Keys.Where(x => x != pid).ToArray())
                 lastPostedAt.Remove(other);
         }
@@ -460,6 +467,34 @@ public sealed class CatJobChannel : ICatLocalEndpoints
             Log.Information("[CatHost] 副本状态 pid={Pid}: {InDuty}", current, inDuty switch { true => "在副本中", false => "不在副本中", null => "未知" });
 
             publish(DUTY_EVENT, new CatDutyEvent(operation, current, inDuty, CatProtocol.FormatTimestamp(at)));
+        }
+    }
+
+    /// <summary>
+    ///     选角界面读到的计费文字原文: 与这个游戏上次发的不同才发 game.billing（带读到的时刻）。原文为空时不发; 
+    ///     pid ≤ 0 = 当前守护的游戏, 给了 pid 但不是当前守护的游戏时丢掉
+    /// </summary>
+    public void ReportBilling(int pid, string raw, DateTimeOffset at)
+    {
+        raw = raw.Trim();
+
+        if (raw.Length == 0)
+            return;
+
+        var operation = operationId();
+
+        lock (stateLock)
+        {
+            if (gamePid is not { } current || (pid > 0 && pid != current))
+                return;
+
+            if (lastBilling.TryGetValue(current, out var last) && last == raw)
+                return;
+
+            lastBilling[current] = raw;
+            Log.Information("[CatHost] 读到计费原文 pid={Pid}: {Raw}", current, raw);
+
+            publish(BILLING_EVENT, new { operationId = operation, pid = current, raw, at = CatProtocol.FormatTimestamp(at) });
         }
     }
 

@@ -124,6 +124,9 @@ namespace
         if (command == "CHARAS")
             return GameCharas();
 
+        if (command == "BILLING")
+            return GameBilling();
+
         if (command == "WHOAMI")
             return GameWhoAmI();
 

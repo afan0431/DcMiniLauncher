@@ -575,7 +575,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             AdoptedGame    = true,
             ReadOnlyModule = CatModuleInjection.ReadOnlyForAdopt(true)
         };
-        var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, null));
+        var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, null)) { ReadBilling = true };
         var observeToken = cancellation.Token;
 
         autoEnter = flow;
@@ -1724,7 +1724,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         var process      = launched.UnderlyingProcess;
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(startToken);
         var game         = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea);
-        var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, autoEnter?.EnteredContentId));
+        var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, autoEnter?.EnteredContentId)) { ReadBilling = true };
         var token        = cancellation.Token;
 
         autoEnter = flow;

@@ -153,6 +153,9 @@ public sealed class CatAutoEnter
 
     private const byte LOGIN_FLAGS_BLOCKING = 1 | 2 | 4;
 
+    /// <summary>读计费文字最多试几次（隔 <see cref="CatAutoEnterTimings.Poll" />）</summary>
+    private const int BILLING_ATTEMPTS = 6;
+
     private readonly ICatAutoEnterGame   game;
     private readonly ICatLaunchReporter  reporter;
     private readonly CatAutoEnterTarget  target;
@@ -172,6 +175,7 @@ public sealed class CatAutoEnter
     private TimeSpan?                     lobbyUnreadableSince;
     private CatLevelReader?               levelReader;
     private CatDutyReader?                dutyReader;
+    private CatBillingReader?             billingReader;
 
     /// <summary>
     ///     创建一次编排
@@ -192,6 +196,9 @@ public sealed class CatAutoEnter
     ///     定不了登录哪个角色时直接停手（<see cref="CatAutoEnterStopCodes.CHARACTER_NOT_FOUND" />）, 不等人选: 游戏内跨区后进世界用, 那条路上没有人回答 selectCharacter
     /// </summary>
     public bool StopWhenChoiceNeeded { get; init; }
+
+    /// <summary>进了选角界面就读一次月卡/点卡剩余时间的界面文字并报告（失败不影响登录角色）; 只有真实启动的国服游戏开</summary>
+    public bool ReadBilling { get; init; }
 
     /// <summary>编排最后报的阶段; 还没开始时为 null。补注入、挂 Minion 改过阶段后用它恢复</summary>
     public string? CurrentStage
@@ -431,6 +438,9 @@ public sealed class CatAutoEnter
             // 3. 读整个大区的角色
             var (entries, listComplete) = await ReadCharactersAsync(cancellationToken).ConfigureAwait(false);
 
+            if (entries.Count > 0 && ReadBilling)
+                await ReadBillingAsync(cancellationToken).ConfigureAwait(false);
+
             if (entries.Count == 0)
             {
                 if (followedTarget)
@@ -605,6 +615,40 @@ public sealed class CatAutoEnter
 
             await DelayAsync(timings.Poll, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    ///     读选角界面的计费文字: 界面文字可能比角色列表晚一点才填上, 读不到时隔 <see cref="CatAutoEnterTimings.Poll" /> 再读, 最多 <see cref="BILLING_ATTEMPTS" /> 次。
+    ///     读不到、模块旧、通话出错都只记日志, 绝不影响登录角色
+    /// </summary>
+    private async Task ReadBillingAsync(CancellationToken cancellationToken)
+    {
+        billingReader ??= new CatBillingReader(reporter, game.ProcessId, timings.ReadTimeout);
+
+        for (var attempt = 0; attempt < BILLING_ATTEMPTS && !billingReader.Unsupported; attempt++)
+        {
+            if (attempt > 0)
+                await game.DelayAsync(timings.Poll, cancellationToken).ConfigureAwait(false);
+
+            try
+            {
+                var (read, found) = await billingReader.ReadAsync(game, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+
+                if (found || read != CatModuleRead.Answered)
+                    return;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "[CatAutoEnter] 这一次没读成计费文字");
+                return;
+            }
+        }
+
+        Log.Information("[CatAutoEnter] 选角界面没读到月卡/点卡文字, 不报计费");
     }
 
     /// <summary>

@@ -3109,6 +3109,142 @@ std::string GameLogin()
     return "FAIL exception";
 }
 
+// =============================================================================
+// 计费读数（只读）: 选角界面 `_CharaSelectRemain` 的文字节点里写着月卡/点卡剩余时间,
+// 例如「月卡：24天18小时12分 点卡：2小时2分［122分钟］」。BILLING 命令把含「月卡」或「点卡」的文字节点原文交给启动器,
+// 解析在 Cat 后端做（各种写法都可能出现, 模块不猜）。不改任何游戏数据。
+// 响应:
+//   OK found=<0|1> nodes=<文字节点数>        found=1 时后面每个含「月卡」/「点卡」的文字节点一行: T \t <节点 id> \t <原文>
+//   FAIL no-addon                            _CharaSelectRemain 不存在（不在选角界面、或界面还没建好）
+// =============================================================================
+
+namespace
+{
+    constexpr int    BILLING_MAX_TEXTS = 24;
+    constexpr size_t BILLING_TEXT_MAX  = 160;
+    constexpr int    BILLING_MAX_DEPTH = 3;
+
+    // AtkUnitBase.UldManager(+0x28) 里 NodeListCount(+0x42) / NodeList(+0x50); 组件节点 Component(+0xC0), 组件的 UldManager 在 +0x8
+    constexpr uintptr_t BILLING_UNIT_ULD_MANAGER         = 0x28;
+    constexpr uintptr_t BILLING_ULD_NODE_COUNT           = 0x42;
+    constexpr uintptr_t BILLING_ULD_NODE_LIST            = 0x50;
+    constexpr uintptr_t BILLING_NODE_ID                  = 0x08;
+    constexpr uintptr_t BILLING_NODE_TYPE                = 0x40;
+    constexpr uintptr_t BILLING_COMPONENT_NODE_COMPONENT = 0xC0;
+    constexpr uintptr_t BILLING_COMPONENT_ULD_MANAGER    = 0x08;
+    constexpr unsigned short BILLING_NODE_TYPE_TEXT      = 3;
+
+    // ⚠ 带 __try 的函数里不能有需要展开的 C++ 对象, 这里全是 POD
+    struct BillingData
+    {
+        int      addonPresent;
+        int      textNodes;
+        int      textCount;
+        unsigned textNodeId[BILLING_MAX_TEXTS];
+        char     texts[BILLING_MAX_TEXTS][BILLING_TEXT_MAX];
+    };
+
+    void BillingCollectTexts(uint8_t* uldManager, BillingData* out, int depth)
+    {
+        const auto count = ReadAt<unsigned short>(uldManager, BILLING_ULD_NODE_COUNT);
+        const auto list  = ReadAt<uint8_t**>(uldManager, BILLING_ULD_NODE_LIST);
+
+        if (!PlausiblePointer(list) || count == 0 || count > 512)
+            return;
+
+        for (unsigned short i = 0; i < count; ++i)
+        {
+            const auto node = list[i];
+
+            if (!PlausiblePointer(node))
+                continue;
+
+            const auto type = ReadAt<unsigned short>(node, BILLING_NODE_TYPE);
+
+            if (type == BILLING_NODE_TYPE_TEXT)
+            {
+                ++out->textNodes;
+
+                if (out->textCount >= BILLING_MAX_TEXTS)
+                    continue;
+
+                char text[BILLING_TEXT_MAX]{};
+                CopyUtf8String(node + offsets::ATK_TEXT_NODE_NODE_TEXT, text, BILLING_TEXT_MAX);
+                text[BILLING_TEXT_MAX - 1] = '\0';
+
+                // 只留含「月卡」/「点卡」的那条（UTF-8 字节串匹配）
+                if (strstr(text, u8"月卡") == nullptr && strstr(text, u8"点卡") == nullptr)
+                    continue;
+
+                const int slot = out->textCount++;
+                out->textNodeId[slot] = ReadAt<unsigned>(node, BILLING_NODE_ID);
+                memcpy(out->texts[slot], text, sizeof(text));
+            }
+            else if (type >= 1000 && depth + 1 < BILLING_MAX_DEPTH)
+            {
+                const auto component = ReadAt<uint8_t*>(node, BILLING_COMPONENT_NODE_COMPONENT);
+
+                if (PlausiblePointer(component))
+                    BillingCollectTexts(component + BILLING_COMPONENT_ULD_MANAGER, out, depth + 1);
+            }
+        }
+    }
+
+    void OpBilling(const Pointers* p, BillingData* out)
+    {
+        memset(out, 0, sizeof(BillingData));
+
+        __try
+        {
+            if (p->unitManager == nullptr)
+                return;
+
+            const auto addon = reinterpret_cast<GetAddonByNameFn>(g_getAddonByName)(p->unitManager, "_CharaSelectRemain", 1);
+
+            if (!PlausiblePointer(addon))
+                return;
+
+            out->addonPresent = 1;
+            BillingCollectTexts(reinterpret_cast<uint8_t*>(addon) + BILLING_UNIT_ULD_MANAGER, out, 0);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+}
+
+std::string GameBilling()
+{
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareCall(state, failure))
+        return failure;
+
+    auto data     = std::make_shared<BillingData>();
+    auto captured = state;
+
+    if (!MainThreadRun([captured, data] { OpBilling(&captured->pointers, data.get()); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    if (!data->addonPresent)
+        return "FAIL no-addon";
+
+    std::string response = "OK found=" + std::to_string(data->textCount > 0 ? 1 : 0) + " nodes=" + std::to_string(data->textNodes);
+
+    for (int i = 0; i < data->textCount; ++i)
+    {
+        char text[BILLING_TEXT_MAX];
+        memcpy(text, data->texts[i], sizeof(text));
+        text[sizeof(text) - 1] = '\0';
+        SanitizeText(text);
+
+        response += "\nT\t" + std::to_string(data->textNodeId[i]) + "\t" + text;
+    }
+
+    return response;
+}
+
 namespace
 {
     // 标题界面守卫（常驻, 默认开）:

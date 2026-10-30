@@ -345,6 +345,12 @@ internal sealed class RecordingReporter : ICatLaunchReporter
 
     public void Duty(int pid, bool? inDuty, DateTimeOffset at) =>
         DutyReports.Enqueue((pid, inDuty));
+
+    /// <summary>报出来的计费原文（pid, 原文）, 按顺序; 不进 <see cref="Entries" /></summary>
+    public ConcurrentQueue<(int Pid, string Raw)> BillingReports { get; } = new();
+
+    public void Billing(int pid, string raw, DateTimeOffset at) =>
+        BillingReports.Enqueue((pid, raw));
 }
 
 /// <summary>

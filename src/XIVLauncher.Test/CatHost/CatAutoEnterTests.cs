@@ -835,6 +835,66 @@ public sealed class CatAutoEnterTests
     }
 
     [Fact]
+    public async Task ReadBilling_ReportsTheRawTextOnceTheCharaSelectShowsIt_AndRetriesUntilThen()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        var asked            = 0;
+        game.Intercept = command => command == "BILLING"
+                                        ? ++asked < 3
+                                              ? "OK found=0 nodes=5"
+                                              : "OK found=1 nodes=5\nT\t7\t月卡：24天18小时12分 点卡：2小时2分［122分钟］"
+                                        : null;
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null)) { ReadBilling = true };
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+
+        Assert.Equal(3, game.Commands.Count(x => x == "BILLING"));
+        Assert.Equal(["月卡：24天18小时12分 点卡：2小时2分［122分钟］"], reporter.BillingReports.Select(x => x.Raw));
+        // 先读到计费文字, 再去选角色
+        Assert.True(game.Commands.IndexOf("BILLING") < game.Commands.IndexOf("ENTERCHARA 11"));
+    }
+
+    [Fact]
+    public async Task ReadBilling_OldModuleOrNothingToRead_DoesNotStopLoggingIn()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.Intercept = command => command == "BILLING" ? "FAIL unknown-command" : null;
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null)) { ReadBilling = true };
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+        Assert.Equal(1, game.Commands.Count(x => x == "BILLING"));
+        Assert.Empty(reporter.BillingReports);
+
+        var (game2, reporter2) = Setup(Chara("11", "小白"));
+        game2.Intercept = command => command == "BILLING" ? "FAIL no-addon" : null;
+
+        var flow2 = new CatAutoEnter(game2, reporter2, new CatAutoEnterTarget("小白", null)) { ReadBilling = true };
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await flow2.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+        Assert.Equal(6, game2.Commands.Count(x => x == "BILLING"));
+        Assert.Empty(reporter2.BillingReports);
+    }
+
+    [Fact]
+    public async Task ReadBilling_IsOffByDefault()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        var flow = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("小白", null));
+        Assert.Equal(CatAutoEnterOutcome.InWorld, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
+        Assert.DoesNotContain("BILLING", game.Commands);
+    }
+
+    [Theory]
+    [InlineData("OK found=1 nodes=9\nT\t7\t月卡：24天18小时12分 点卡：2小时2分［122分钟］", "月卡：24天18小时12分 点卡：2小时2分［122分钟］")]
+    [InlineData("OK found=1 nodes=9\r\nT\t7\t月卡：3天\r\nT\t8\t点卡：0分", "月卡：3天 点卡：0分")]
+    [InlineData("OK found=0 nodes=9", null)]
+    [InlineData("OK found=1 nodes=9\nT\t7\t   ", null)]
+    [InlineData("FAIL no-addon", null)]
+    [InlineData("", null)]
+    public void ParseBilling_ReadsTextLinesOfAFoundReply(string response, string? expected) =>
+        Assert.Equal(expected, CatModuleReplies.ParseBilling(response));
+
+    [Fact]
     public async Task Observe_AfterAStop_ReportsTheCharacterOnceSomeoneEntersByHand()
     {
         var (game, reporter) = Setup(Chara("11", "小白"));
