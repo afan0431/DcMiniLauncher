@@ -430,8 +430,23 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
             closeNow       = closeRequested;
         }
 
-        reporter.Started(process.Id, SafeProcessStartedAt(process));
+        var startedAt = SafeProcessStartedAt(process);
+
+        // 截取模块要赶在卫月装 Present 钩子之前注入: 进程一记下就在后台注, 不挡 started; 结果排在 started 之后报
+        var remoteHookInjection = closeNow || request.RemoteHook is not { } remoteHook
+                                      ? null
+                                      : Task.Run(() => CatRemoteHook.Inject(new CatProcessRemoteHookTarget(process), remoteHook), CancellationToken.None);
+
+        reporter.Started(process.Id, startedAt);
         Log.Information("[CatHost] 国际服游戏进程已创建 (PID={ProcessID}, Dalamud={Dalamud}, Minion={Minion})", process.Id, dalamud != null, request.Minion);
+
+        var remoteHookReport = remoteHookInjection?.ContinueWith
+        (
+            injection => reporter.RemoteHook(process.Id, startedAt, injection.Result),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        );
 
         if (closeNow)
         {
@@ -455,6 +470,10 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
         {
             Log.Information("[CatHost] 收到关闭请求, 不再等注入");
         }
+
+        // 截取模块的结果先于 running 报出（注入在游戏一起来就开始, 等卫月、挂 Minion 时通常已做完）
+        if (remoteHookReport != null)
+            await remoteHookReport.ConfigureAwait(false);
 
         if (!process.HasExited && !IsCloseRequested)
             reporter.Stage(CatStages.RUNNING);
