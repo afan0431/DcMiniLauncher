@@ -439,6 +439,9 @@ public sealed record CatCharacterInfo
     bool    Loginable
 );
 
+/// <summary>name = 插件的 InternalName; repo = 它的 pluginmaster 地址（https）</summary>
+public sealed record CatDalamudPluginParams(string? Name, string? Repo);
+
 /// <summary>
 ///     launch 的 remoteHook: DllPath = 截取模块完整路径; PipeName = 不带进程号的管道名（<c>\\.\pipe\cat-remote-&lt;32 位十六进制&gt;</c>）; Token = 管道认证令牌
 /// </summary>
@@ -463,7 +466,8 @@ public sealed record CatRemoteHookParams
 ///     weGameToken / weGameAccountId = 工作台下发的这个号的 WeGame 登录信息与 WeGame 用户号（只能用于 weGame 渠道, 两个要么都带要么都不带, 用户号全为数字）,
 ///     本机账号库没有这个号或存的不同时先写进账号库再登录, 见 <see cref="CatWeGameTokenHandoff" />;
 ///     authOnly = 只登录: 登录成功即发 launch.authorized 结束, 不取票据、不起游戏（只能用于 weGame 渠道, 不带按 false）, 见 <see cref="CatWeGameAuthOnly" />;
-///     remoteHook = 远程截取模块的路径、不带进程号的管道名与令牌, 游戏进程一创建就注入, 见 <see cref="CatRemoteHook" />（不带 = 不注入）
+///     remoteHook = 远程截取模块的路径、不带进程号的管道名与令牌, 游戏进程一创建就注入, 见 <see cref="CatRemoteHook" />（不带 = 不注入）;
+///     dalamudPlugins = 起游戏前装成仓库最新版并在默认合集里开着的卫月插件（只在 dalamud 为 true 时用）, 见 <see cref="XIVLauncher.Dalamud.DalamudPluginEnsurer" />
 /// </summary>
 public sealed record CatLaunchParams
 (
@@ -482,7 +486,8 @@ public sealed record CatLaunchParams
     string?          WeGameToken               = null,
     string?          WeGameAccountId           = null,
     bool?            AuthOnly                  = null,
-    CatRemoteHookParams? RemoteHook            = null
+    CatRemoteHookParams? RemoteHook            = null,
+    CatDalamudPluginParams[]? DalamudPlugins   = null
 )
 {
     /// <summary>

@@ -162,9 +162,11 @@ namespace offsets
     // 静态（RVA 0x4D4F22 / 0x4D5015）: bit0 置位时点角色先弹 Lobby 表第 76 行的是/否框（回调类别 16）;
     //   bit2 置位时先弹第 629 行的是/否框（回调类别 2, 答「是」之后才轮到登录确认框）;
     //   都没有才直接弹登录确认框（Lobby 表第 25 / 95 / 96 行, 回调类别 3, RVA 0x4DD870）。
-    // 那两种是/否框在问什么不知道, 所以带这两位的角色 ENTERCHARA 也拒绝, 交给人点。实机核对: 否
+    // 第 76 行: 1.0 继承角色要重设职业与外貌, 带 bit0 的 ENTERCHARA 拒绝, 交给人点。
+    // 第 629 行:「确定要以 X 登录游戏吗？※可以通过次级指令重新编辑角色形象」= 喝了幻想药还没改外貌（实机 2026-10-30
+    //   真島吾朗 flags74c=20, 10-15 / 10-22 另两个号 =4, 都停在这里）; 答「是」只是不改外貌直接登录, 启动器按文字认出后替人答。
     inline constexpr uintptr_t DC_CHARA_ENTRY_CLICK_FLAGS       = 0x74C;  // uint
-    inline constexpr unsigned  DC_CHARA_ENTRY_CLICK_PROMPT_MASK = 0x5;
+    inline constexpr unsigned  DC_CHARA_ENTRY_CLICK_PROMPT_MASK = 0x1;
 
     // ---- PlayerState（Client/Game/UI/PlayerState.cs）-----------------------
     // [StaticAddress(..., 3)] 直接是结构体地址（不是指针）。

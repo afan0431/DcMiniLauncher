@@ -12,7 +12,8 @@ namespace XIVLauncher.CatHost;
 ///     AutoEnter = 游戏起来后自动经标题、选角进入游戏; CharacterName / CharacterHomeWorld = 要登录的角色（可为空）;
 ///     WeGameToken / WeGameAccountId = 工作台下发的 WeGame 登录信息与 WeGame 用户号（只有 WeGame 号会带, 两个同时有或同时为 null）;
 ///     AuthOnly = 只登录: 登录成功即报 <see cref="ICatLaunchReporter.Authorized" /> 结束, 不起游戏（只有 WeGame 号会带, 此时 MinionCard 为 null、AutoEnter 为 false）;
-///     RemoteHook = 要注入的远程截取模块, 不注入为 null（AuthOnly 时为 null）
+///     RemoteHook = 要注入的远程截取模块, 不注入为 null（AuthOnly 时为 null）;
+///     DalamudPlugins = 起游戏前装好并开启的卫月插件（Dalamud 为 false 时为空）
 /// </summary>
 public sealed record CatLaunchRequest
 (
@@ -33,7 +34,8 @@ public sealed record CatLaunchRequest
     CatSecret?     WeGameToken               = null,
     string?        WeGameAccountId           = null,
     bool           AuthOnly                  = false,
-    CatRemoteHookParams? RemoteHook           = null
+    CatRemoteHookParams? RemoteHook           = null,
+    IReadOnlyList<CatDalamudPluginParams>? DalamudPlugins = null
 )
 {
     /// <summary>是否为 WeGame 版国服的号</summary>
@@ -399,6 +401,38 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     ///     （缺值说明后台没有配置这张卡或论坛账号）; profile 去空白后超长、ensureMods 超过个数或插件名不合法报 invalidParams（空白的 profile 与插件名当作没给）。
     ///     通过时返回 null 并给出要挂的卡。
     /// </summary>
+    internal const int MAX_DALAMUD_PLUGINS = 8;
+
+    internal static CatAcceptResult? ValidateDalamudPlugins(CatDalamudPluginParams[]? raw, out List<CatDalamudPluginParams>? plugins)
+    {
+        plugins = null;
+
+        if (raw == null)
+            return null;
+
+        if (raw.Length > MAX_DALAMUD_PLUGINS)
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"dalamudPlugins 最多 {MAX_DALAMUD_PLUGINS} 个");
+
+        foreach (var p in raw)
+        {
+            var name = p?.Name?.Trim();
+            var repo = p?.Repo?.Trim();
+
+            if (string.IsNullOrEmpty(name) || name.Length > MAX_MINION_PROFILE_LENGTH || name.IndexOfAny(System.IO.Path.GetInvalidFileNameChars()) >= 0 || name is "." or "..")
+                return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "dalamudPlugins 里的插件名不合法");
+
+            if (!Uri.TryCreate(repo, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps)
+                return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "dalamudPlugins 里的仓库地址要是 https 地址");
+
+            plugins ??= [];
+
+            if (!plugins.Any(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase)))
+                plugins.Add(new CatDalamudPluginParams(name, repo));
+        }
+
+        return null;
+    }
+
     internal static CatAcceptResult? ValidateMinion(CatMinionParams minion, out CatMinionLaunch? card)
     {
         card = null;
@@ -489,6 +523,9 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         if (parameters.CrashDialogTimeoutSeconds is { } crashTimeout and (< 1 or > CatProtocol.MAX_CRASH_DIALOG_TIMEOUT_SECONDS))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"crashDialogTimeoutSeconds 必须在 1 到 {CatProtocol.MAX_CRASH_DIALOG_TIMEOUT_SECONDS} 之间");
+
+        if (ValidateDalamudPlugins(parameters.DalamudPlugins, out var dalamudPlugins) is { } pluginsRejected)
+            return pluginsRejected;
 
         if (!CatPlatforms.TryParsePlatform(parameters.Platform, out var channel))
             return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, $"platform 只能是 {CatPlatforms.SHENGQU}、{CatPlatforms.WE_GAME} 或 {CatPlatforms.INTERNATIONAL}");
@@ -594,7 +631,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 hasWeGameToken ? new CatSecret(parameters.WeGameToken!) : null,
                 weGameAccountId,
                 authOnly,
-                remoteHook
+                remoteHook,
+                parameters.Dalamud ? dalamudPlugins : null
             );
             selected = runnerFactory(accepted);
             runner   = selected;

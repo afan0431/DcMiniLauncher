@@ -145,6 +145,12 @@ public sealed class CatAutoEnter
     /// <summary>排队提示框（SelectOk）的文字里有这个词</summary>
     public const string QUEUE_PROMPT = "排队";
 
+    /// <summary>
+    ///     喝了幻想药还没改外貌的角色, 点下去先弹的是/否框（Lobby 表第 629 行）里有这一句: 答「是」= 不改外貌直接登录, 之后才是登录确认框。
+    ///     这种框替人答一次（实机 2026-10-30 起; 之前一律停下交给人, 三台机器上停过）。
+    /// </summary>
+    public const string FANTASIA_PROMPT = "重新编辑角色形象";
+
     private const byte LOGIN_FLAGS_BLOCKING = 1 | 2 | 4;
 
     private readonly ICatAutoEnterGame   game;
@@ -350,6 +356,14 @@ public sealed class CatAutoEnter
         {
             var name    = target.Name.Trim();
             var matches = entries.Where(x => string.Equals(x.Name, name, StringComparison.Ordinal)).ToArray();
+
+            // 一字不差的没有时按写法归一再比一次（简繁、大小写、全半角、首尾的符号）: 任务单里的名字常是人手打的,
+            // 10-17 ~ 10-30 四台机器上「丷OwO丷 / 丷owo丷」「红烧土豆 / 紅燒土豆」「灵魂装载 / 靈魂裝載」「呜啦啦 / 呜啦啦·」都因此停在选角界面等人
+            if (matches.Length == 0)
+            {
+                var folded = CharacterNameFold.Fold(name);
+                matches = entries.Where(x => CharacterNameFold.Fold(x.Name) == folded).ToArray();
+            }
 
             if (matches.Length > 1 && !string.IsNullOrWhiteSpace(target.HomeWorld))
                 matches = matches.Where(x => WorldMatches(target.HomeWorld.Trim(), x.HomeWorldCode, WorldName(worlds, x.HomeWorldCode))).ToArray();
@@ -805,6 +819,7 @@ public sealed class CatAutoEnter
         var enterDeadline   = game.Elapsed + timings.EnterTimeout;
         var confirmed       = false;
         var clickedYes      = false;
+        var fantasiaYes     = false;
         var confirmClosed   = false;
         var queueing        = false;
         string? refusal     = null;
@@ -865,8 +880,14 @@ public sealed class CatAutoEnter
             // 「是」只替人点一次, 而且只点这一次点击带出来的登录确认框:
             // 「取消登录」那句不点; 文字读不到的不点; 点过之后那个框关了又出来别的是/否框, 不知道在问什么, 停手交给人。
             // 是不是登录确认框、对应的是不是这个角色, 由模块在点的那一刻自己再核对一遍（见模块的 DIALOG YES）。
+            // 幻想药那个框（FANTASIA_PROMPT）在登录确认框之前, 同样只答一次, 答完它还开着（正在关）时不再点。
+            var fantasia = lobby.YesNo && lobby.YesNoText.Contains(FANTASIA_PROMPT, StringComparison.Ordinal);
+
             if (!lobby.YesNo)
                 confirmClosed = clickedYes;
+            else if (fantasia && fantasiaYes)
+            {
+            }
             else if (!lobby.YesNoText.Contains(CANCEL_LOGIN_PROMPT, StringComparison.Ordinal))
             {
                 if (clickedYes)
@@ -881,9 +902,16 @@ public sealed class CatAutoEnter
                     refusal = "确认框上不是这个角色的名字";
                 else
                 {
-                    var reply = await SendAsync($"DIALOG YES {entry.ContentId}", "点登录确认框的「是」", cancellationToken).ConfigureAwait(false);
+                    var reply = await SendAsync($"DIALOG YES {entry.ContentId}", fantasia ? "点「不改外貌直接登录」的「是」" : "点登录确认框的「是」", cancellationToken).ConfigureAwait(false);
 
-                    if (CatModuleReplies.IsOk(reply))
+                    if (CatModuleReplies.IsOk(reply) && fantasia)
+                    {
+                        Log.Information("[CatAutoEnter] {Name} 喝了幻想药还没改外貌, 替人答了「不改外貌直接登录」", entry.Name);
+                        fantasiaYes   = true;
+                        confirmed     = true;
+                        enterDeadline = game.Elapsed + timings.EnterTimeout;
+                    }
+                    else if (CatModuleReplies.IsOk(reply))
                     {
                         clickedYes    = true;
                         confirmed     = true;

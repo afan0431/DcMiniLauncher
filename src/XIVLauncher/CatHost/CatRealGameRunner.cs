@@ -1580,6 +1580,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             {
                 dalamudSession = session;
                 dalamudOk      = true;
+                await EnsureDalamudPluginsAsync(reporter, startToken).ConfigureAwait(false);
             }
         }
 
@@ -2137,6 +2138,21 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     #endregion
 
     #region Dalamud 与 Minion
+
+    /// <summary>
+    ///     把 Cat 点名的卫月插件装成最新版并开着（自动做靠游戏里的 Afan）。装不上不拦启动: 报到卡片上, 人还能手动用这个号。
+    /// </summary>
+    private async Task EnsureDalamudPluginsAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        foreach (var plugin in request.DalamudPlugins ?? [])
+        {
+            var result = await DalamudPluginEnsurer.EnsureAsync(App.Dalamud.ConfigDirectory, plugin.Name!, plugin.Repo!, cancellationToken).ConfigureAwait(false);
+            Log.Information("[CatHost] 卫月插件 {Name}: {Action}{Error}", plugin.Name, result.Action, result.Error == null ? "" : $"（{result.Error}）");
+
+            if (!result.Ok)
+                reporter.Agent(CatAgentKinds.DALAMUD, false, CatCodes.DALAMUD_UNAVAILABLE, $"{plugin.Name} 插件没装上, 自动做用不了: {result.Error}");
+        }
+    }
 
     private (DalamudSession? Session, string? Error) PrepareDalamud(bool noPlugins, bool noThird)
     {

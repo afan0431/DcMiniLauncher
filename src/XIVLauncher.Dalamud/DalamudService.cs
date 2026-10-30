@@ -9,6 +9,8 @@ public sealed class DalamudService : IDalamudService
 
     public DalamudUpdater Updater { get; }
 
+    public DirectoryInfo ConfigDirectory => hostPaths.ConfigDirectory;
+
     public event Action<DalamudStatusSnapshot>? StatusChanged;
 
     public DalamudService
