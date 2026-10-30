@@ -23,6 +23,21 @@ public sealed class CatRemoteHookTests : IDisposable
     private CatRemoteHookParams Params => new(dllPath, PIPE, TOKEN);
 
     [Fact]
+    public void WaitForModuleBase_KeepsLookingUntilTheModuleAppears()
+    {
+        var lookups = 0;
+
+        var found = MiniModuleInjector.WaitForModuleBase(() => ++lookups < 3 ? null : 42, TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(1));
+
+        Assert.Equal((IntPtr)42, found);
+        Assert.Equal(3, lookups);
+    }
+
+    [Fact]
+    public void WaitForModuleBase_GivesUpAfterTheTimeout() =>
+        Assert.Null(MiniModuleInjector.WaitForModuleBase(() => null, TimeSpan.FromMilliseconds(20), TimeSpan.FromMilliseconds(1)));
+
+    [Fact]
     public void PipeNameFor_InsertsTheProcessId() =>
         Assert.Equal($@"\\.\pipe\cat-remote-4242-{HEX}", CatRemoteHook.PipeNameFor(PIPE, 4242));
 

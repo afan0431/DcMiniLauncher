@@ -22,6 +22,11 @@ public static class MiniModuleInjector
     /// <summary>本进程内的注入一个一个做: 同一个游戏被几处同时注入时, 后到的看到模块已在就跳过, 不会写两次模式文件、注两次</summary>
     private static readonly object InjectSync = new();
 
+    /// <summary>远程线程跑完后等模块出现在模块列表里的最长时间</summary>
+    private static readonly TimeSpan ModuleListWait = TimeSpan.FromSeconds(10);
+
+    private static readonly TimeSpan ModuleListPoll = TimeSpan.FromMilliseconds(200);
+
     /// <summary>
     ///     模块和启动器一起发布, 就在启动器自己的目录下。开发时由
     ///     <c>src\XIVLauncher.MiniModule\build.ps1</c> 直接产到同一个输出目录。
@@ -110,11 +115,31 @@ public static class MiniModuleInjector
         }
         catch (Exception ex)
         {
-            Log.Debug(ex, "[MiniModule] 读取目标进程模块列表失败");
+            Log.Information("[MiniModule] 读取目标进程模块列表失败: {Message}", ex.Message);
         }
 
         return null;
     }
+
+    /// <summary>反复查找模块直到找到或超时; 游戏刚起来时模块列表可能短暂取不到或还没更新</summary>
+    public static IntPtr? WaitForModuleBase(Func<IntPtr?> find, TimeSpan timeout, TimeSpan interval)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+
+        while (true)
+        {
+            if (find() is { } moduleBase)
+                return moduleBase;
+
+            if (DateTime.UtcNow >= deadline)
+                return null;
+
+            Thread.Sleep(interval);
+        }
+    }
+
+    private static IntPtr? WaitForModuleBase(Process gameProcess, string dllPath) =>
+        WaitForModuleBase(() => FindModuleBase(gameProcess, dllPath), ModuleListWait, ModuleListPoll);
 
     /// <summary>
     ///     在目标进程里 <c>LoadLibraryW(dllPath)</c>（dllPath 须是完整路径）。返回 null 表示模块已在目标进程的模块列表里, 否则是失败原因。
@@ -133,7 +158,7 @@ public static class MiniModuleInjector
         if (RunRemoteThread(gameProcess, loadLibrary, dllPath, out _) is { } failure)
             return failure;
 
-        return FindModuleBase(gameProcess, dllPath) == null
+        return WaitForModuleBase(gameProcess, dllPath) == null
                    ? new InjectFailure("远程线程跑完了, 但目标进程模块列表里没有这个 DLL（LoadLibraryW 失败）")
                    : null;
     }
@@ -146,7 +171,7 @@ public static class MiniModuleInjector
     {
         exitCode = 0;
 
-        if (FindModuleBase(gameProcess, dllPath) is not { } moduleBase)
+        if (WaitForModuleBase(gameProcess, dllPath) is not { } moduleBase)
             return new InjectFailure($"目标进程里没有加载 {Path.GetFileName(dllPath)}");
 
         uint? rva;
