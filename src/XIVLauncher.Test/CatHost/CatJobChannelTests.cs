@@ -783,6 +783,46 @@ public sealed class CatJobChannelTests
     }
 
     [Fact]
+    public void ReportBilling_SendsRawTextOncePerChangeAndAgainForANewGame()
+    {
+        var channel = NewChannel();
+        var at      = new DateTimeOffset(2026, 10, 31, 1, 4, 5, 678, TimeSpan.FromHours(8));
+        channel.GameStarted(1234);
+
+        channel.ReportBilling(1234, "月卡：24天18小时12分 点卡：2小时2分［122分钟］", at);
+        channel.ReportBilling(0, " 月卡：24天18小时12分 点卡：2小时2分［122分钟］ ", at);
+        channel.ReportBilling(0, "", at);
+        channel.ReportBilling(0, "点卡：2小时2分［122分钟］", at);
+
+        channel.GameStarted(5678);
+        channel.ReportBilling(0, "点卡：2小时2分［122分钟］", at);
+
+        var published = events.Where(x => x.Method == CatJobChannel.BILLING_EVENT).Select(x => JsonNode.Parse(x.Json)!.AsObject()).ToArray();
+
+        Assert.Equal(3, published.Length);
+        Assert.Equal(["月卡：24天18小时12分 点卡：2小时2分［122分钟］", "点卡：2小时2分［122分钟］", "点卡：2小时2分［122分钟］"], published.Select(x => x["raw"]!.GetValue<string>()));
+        Assert.Equal([1234, 1234, 5678], published.Select(x => x["pid"]!.GetValue<int>()));
+        Assert.All(published, x => Assert.Equal(["operationId", "pid", "raw", "at"], x.Select(p => p.Key)));
+        Assert.All(published, x => Assert.Equal(OPERATION, x["operationId"]!.GetValue<string>()));
+        Assert.Equal("2026-10-30T17:04:05.678Z", published[0]["at"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void ReportBilling_ForAnotherPidOrWithoutAGame_IsDropped()
+    {
+        var channel = NewChannel();
+        channel.ReportBilling(0, "月卡：1天", DateTimeOffset.UtcNow);
+
+        channel.GameStarted(1234);
+        channel.ReportBilling(999, "月卡：1天", DateTimeOffset.UtcNow);
+
+        channel.GameEnded(1234);
+        channel.ReportBilling(1234, "月卡：1天", DateTimeOffset.UtcNow);
+
+        Assert.Empty(events);
+    }
+
+    [Fact]
     public void ReportDuty_ForAnotherPidOrWithoutAGame_IsDropped()
     {
         var channel = NewChannel();

@@ -129,6 +129,14 @@ public interface ICatLaunchReporter
     {
     }
 
+    /// <summary>
+    ///     选角界面读到的计费文字原文（月卡/点卡剩余时间; 例「月卡：24天18小时12分 点卡：2小时2分［122分钟］」）, 解析在 Cat 后端; pid ≤ 0 表示当前守护的游戏。
+    ///     同一个游戏里原文有变化才发 game.billing
+    /// </summary>
+    void Billing(int pid, string raw, DateTimeOffset at)
+    {
+    }
+
     /// <summary>游戏进程已创建</summary>
     void Started(int pid, DateTimeOffset processStartedAt);
 
@@ -1241,6 +1249,10 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     /// <inheritdoc />
     public void Duty(int dutyPid, bool? inDuty, DateTimeOffset at) =>
         jobs.ReportDuty(dutyPid, inDuty, at);
+
+    /// <inheritdoc />
+    public void Billing(int billingPid, string raw, DateTimeOffset at) =>
+        jobs.ReportBilling(billingPid, raw, at);
 
     /// <inheritdoc />
     public void Failed(string code, string message)

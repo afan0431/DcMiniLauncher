@@ -73,6 +73,7 @@ std::string GameWhoAmI();       // 只读: 游戏内当前角色名、ContentId�
 bool        GameCharaName(unsigned long long contentId, std::string* name); // 只读: 按 ContentId 查角色名（选角列表或当前角色）; 要等主线程, 不在游戏线程上调
 std::string GameLevels();       // 只读: 全部职业等级（下标为 ClassJob 表的 ExpArrayIndex）
 std::string GameDuty();         // 只读: 角色是否在副本中（Conditions 的 BoundByDuty 类标志）
+std::string GameBilling();      // 只读: 选角界面 _CharaSelectRemain 里含「月卡」/「点卡」的文字原文; 格式见 game.cpp
 std::string GameSelectCharacter(const std::string& who); // 当前服务器的角色列表里选中（高亮）, 不进入
 std::string GameEnterCharacter(const std::string& who);  // 选中并回读确认后左键点击角色: 客户端自己检查并弹登录确认框
 std::string GameDialog(const std::string& arguments);    // "YES <contentId>" 点登录确认框的「是」; "NO"; "OK" 点错误框或确定框（排队提示不点）

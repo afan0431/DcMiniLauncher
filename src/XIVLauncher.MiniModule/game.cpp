@@ -3110,19 +3110,19 @@ std::string GameLogin()
 }
 
 // =============================================================================
-// 计费探针（只读）: 进选角界面时把「剩余天数/剩余时长」可能所在的内存和界面文字写进日志,
-// 用来在实机上核对偏移与月卡/点卡判定规则。不回传、不改任何游戏数据。
-// 日志行前缀 [billing-probe], 见 %TEMP%\minilauncher-module-<pid>.log
+// 计费读数（只读）: 选角界面 `_CharaSelectRemain` 的文字节点里写着月卡/点卡剩余时间,
+// 例如「月卡：24天18小时12分 点卡：2小时2分［122分钟］」。BILLING 命令把含「月卡」或「点卡」的文字节点原文交给启动器,
+// 解析在 Cat 后端做（各种写法都可能出现, 模块不猜）。不改任何游戏数据。
+// 响应:
+//   OK found=<0|1> nodes=<文字节点数>        found=1 时后面每个含「月卡」/「点卡」的文字节点一行: T \t <节点 id> \t <原文>
+//   FAIL no-addon                            _CharaSelectRemain 不存在（不在选角界面、或界面还没建好）
 // =============================================================================
 
 namespace
 {
-    // AgentLobby+0x48 = LobbyUIClient, 其 +0x48 = LobbySubscriptionInfo*（FFXIVClientStructs LobbyUIClient.cs）, 折到 AgentLobby 上 +0x90
-    constexpr uintptr_t BILLING_SUBSCRIPTION_INFO_PTR = offsets::AGENT_LOBBY_UI_CLIENT + 0x48;
-    constexpr size_t    BILLING_DUMP_SIZE             = 0x80;
-    constexpr int       BILLING_MAX_TEXTS             = 24;
-    constexpr size_t    BILLING_TEXT_MAX              = 160;
-    constexpr int       BILLING_MAX_DEPTH             = 3;
+    constexpr int    BILLING_MAX_TEXTS = 24;
+    constexpr size_t BILLING_TEXT_MAX  = 160;
+    constexpr int    BILLING_MAX_DEPTH = 3;
 
     // AtkUnitBase.UldManager(+0x28) 里 NodeListCount(+0x42) / NodeList(+0x50); 组件节点 Component(+0xC0), 组件的 UldManager 在 +0x8
     constexpr uintptr_t BILLING_UNIT_ULD_MANAGER         = 0x28;
@@ -3135,36 +3135,24 @@ namespace
     constexpr unsigned short BILLING_NODE_TYPE_TEXT      = 3;
 
     // ⚠ 带 __try 的函数里不能有需要展开的 C++ 对象, 这里全是 POD
-    struct BillingProbeData
+    struct BillingData
     {
-        void*          agentLobby;
-        void*          subscriptionInfo;
-        int            subscriptionReadable;
-        unsigned char  bytes[BILLING_DUMP_SIZE];
-
-        int            addonPresent;
-        void*          addon;
-        int            addonVisible;
-        int            addonReady;
-        unsigned       addonId;
-        unsigned short nodeCount;
-        int            textCount;
-        unsigned       textNodeId[BILLING_MAX_TEXTS];
-        char           texts[BILLING_MAX_TEXTS][BILLING_TEXT_MAX];
+        int      addonPresent;
+        int      textNodes;
+        int      textCount;
+        unsigned textNodeId[BILLING_MAX_TEXTS];
+        char     texts[BILLING_MAX_TEXTS][BILLING_TEXT_MAX];
     };
 
-    void BillingCollectTexts(uint8_t* uldManager, BillingProbeData* out, int depth)
+    void BillingCollectTexts(uint8_t* uldManager, BillingData* out, int depth)
     {
         const auto count = ReadAt<unsigned short>(uldManager, BILLING_ULD_NODE_COUNT);
         const auto list  = ReadAt<uint8_t**>(uldManager, BILLING_ULD_NODE_LIST);
 
-        if (depth == 0)
-            out->nodeCount = count;
-
         if (!PlausiblePointer(list) || count == 0 || count > 512)
             return;
 
-        for (unsigned short i = 0; i < count && out->textCount < BILLING_MAX_TEXTS; ++i)
+        for (unsigned short i = 0; i < count; ++i)
         {
             const auto node = list[i];
 
@@ -3175,9 +3163,22 @@ namespace
 
             if (type == BILLING_NODE_TYPE_TEXT)
             {
+                ++out->textNodes;
+
+                if (out->textCount >= BILLING_MAX_TEXTS)
+                    continue;
+
+                char text[BILLING_TEXT_MAX]{};
+                CopyUtf8String(node + offsets::ATK_TEXT_NODE_NODE_TEXT, text, BILLING_TEXT_MAX);
+                text[BILLING_TEXT_MAX - 1] = '\0';
+
+                // 只留含「月卡」/「点卡」的那条（UTF-8 字节串匹配）
+                if (strstr(text, u8"月卡") == nullptr && strstr(text, u8"点卡") == nullptr)
+                    continue;
+
                 const int slot = out->textCount++;
                 out->textNodeId[slot] = ReadAt<unsigned>(node, BILLING_NODE_ID);
-                CopyUtf8String(node + offsets::ATK_TEXT_NODE_NODE_TEXT, out->texts[slot], BILLING_TEXT_MAX);
+                memcpy(out->texts[slot], text, sizeof(text));
             }
             else if (type >= 1000 && depth + 1 < BILLING_MAX_DEPTH)
             {
@@ -3189,30 +3190,9 @@ namespace
         }
     }
 
-    // 读不到的部分保持 0, 日志里按 present/readable 标志区分
-    void OpBillingProbe(const Pointers* p, BillingProbeData* out)
+    void OpBilling(const Pointers* p, BillingData* out)
     {
-        memset(out, 0, sizeof(BillingProbeData));
-        out->agentLobby = p->agentLobby;
-
-        __try
-        {
-            if (PlausiblePointer(p->agentLobby))
-            {
-                out->subscriptionInfo = ReadAt<void*>(p->agentLobby, BILLING_SUBSCRIPTION_INFO_PTR);
-
-                if (PlausiblePointer(out->subscriptionInfo))
-                {
-                    memcpy(out->bytes, out->subscriptionInfo, BILLING_DUMP_SIZE);
-                    out->subscriptionReadable = 1;
-                }
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            out->subscriptionReadable = 0;
-            memset(out->bytes, 0, sizeof(out->bytes));
-        }
+        memset(out, 0, sizeof(BillingData));
 
         __try
         {
@@ -3225,75 +3205,44 @@ namespace
                 return;
 
             out->addonPresent = 1;
-            out->addon        = addon;
-            out->addonId      = ReadAt<unsigned short>(addon, offsets::ATK_UNIT_BASE_ID);
-            out->addonReady   = (ReadAt<unsigned char>(addon, offsets::ATK_UNIT_BASE_FLAGS1A1) >> offsets::ATK_UNIT_BASE_READY_BIT) & 1;
-            out->addonVisible = (ReadAt<unsigned>(addon, offsets::ATK_UNIT_BASE_FLAGS198) >> offsets::ATK_UNIT_BASE_VISIBLE_BIT) & 1;
-
             BillingCollectTexts(reinterpret_cast<uint8_t*>(addon) + BILLING_UNIT_ULD_MANAGER, out, 0);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            out->addonPresent = out->addonPresent ? out->addonPresent : 0;
         }
     }
+}
 
-    unsigned BillingWord(const BillingProbeData& d, size_t offset)
+std::string GameBilling()
+{
+    CallStatePtr state;
+    std::string  failure;
+
+    if (!PrepareCall(state, failure))
+        return failure;
+
+    auto data     = std::make_shared<BillingData>();
+    auto captured = state;
+
+    if (!MainThreadRun([captured, data] { OpBilling(&captured->pointers, data.get()); }, 3000))
+        return "FAIL mainthread-timeout";
+
+    if (!data->addonPresent)
+        return "FAIL no-addon";
+
+    std::string response = "OK found=" + std::to_string(data->textCount > 0 ? 1 : 0) + " nodes=" + std::to_string(data->textNodes);
+
+    for (int i = 0; i < data->textCount; ++i)
     {
-        unsigned value = 0;
-        memcpy(&value, d.bytes + offset, sizeof(value));
-        return value;
+        char text[BILLING_TEXT_MAX];
+        memcpy(text, data->texts[i], sizeof(text));
+        text[sizeof(text) - 1] = '\0';
+        SanitizeText(text);
+
+        response += "\nT\t" + std::to_string(data->textNodeId[i]) + "\t" + text;
     }
 
-    // seq = 本次进入选角后的第几次读（进入时、约 2 秒后、约 6 秒后各一次, 界面文字可能晚一点才填上）
-    void BillingProbeLog(const BillingProbeData& d, int entry, int seq)
-    {
-        LogF("[billing-probe] entry=%d seq=%d agentLobby=0x%p subInfoPtr(+0x%llX)=0x%p readable=%d",
-             entry, seq, d.agentLobby, static_cast<unsigned long long>(BILLING_SUBSCRIPTION_INFO_PTR),
-             d.subscriptionInfo, d.subscriptionReadable);
-
-        if (d.subscriptionReadable)
-        {
-            for (size_t row = 0; row < BILLING_DUMP_SIZE; row += 0x20)
-            {
-                char hex[0x20 * 3 + 1]{};
-
-                for (size_t i = 0; i < 0x20; ++i)
-                    _snprintf_s(hex + i * 3, 4, _TRUNCATE, "%02X ", d.bytes[row + i]);
-
-                LogF("[billing-probe] entry=%d seq=%d hex+0x%02X: %s", entry, seq, static_cast<unsigned>(row), hex);
-            }
-
-            LogF("[billing-probe] entry=%d seq=%d Flags(+0x08)=0x%08X TotalDaysSubscribed(+0x30)=%u DaysRemaining(+0x34)=%u "
-                 "int@0x38=%d int@0x3C=%d int@0x40=%d int@0x44=%d int@0x48=%d int@0x4C=%d",
-                 entry, seq, BillingWord(d, 0x08), BillingWord(d, 0x30), BillingWord(d, 0x34),
-                 static_cast<int>(BillingWord(d, 0x38)), static_cast<int>(BillingWord(d, 0x3C)),
-                 static_cast<int>(BillingWord(d, 0x40)), static_cast<int>(BillingWord(d, 0x44)),
-                 static_cast<int>(BillingWord(d, 0x48)), static_cast<int>(BillingWord(d, 0x4C)));
-        }
-        else
-        {
-            LogF("[billing-probe] entry=%d seq=%d 读不到（订阅信息指针无效或不可读）", entry, seq);
-        }
-
-        if (!d.addonPresent)
-        {
-            LogF("[billing-probe] entry=%d seq=%d _CharaSelectRemain 不存在", entry, seq);
-            return;
-        }
-
-        LogF("[billing-probe] entry=%d seq=%d _CharaSelectRemain addon=0x%p id=%u ready=%d visible=%d nodeCount=%u texts=%d",
-             entry, seq, d.addon, d.addonId, d.addonReady, d.addonVisible, static_cast<unsigned>(d.nodeCount), d.textCount);
-
-        for (int i = 0; i < d.textCount; ++i)
-        {
-            char text[BILLING_TEXT_MAX];
-            memcpy(text, d.texts[i], sizeof(text));
-            text[sizeof(text) - 1] = '\0';
-            SanitizeText(text);
-            LogF("[billing-probe] entry=%d seq=%d text node=%u: \"%s\"", entry, seq, d.textNodeId[i], text[0] ? text : "(空)");
-        }
-    }
+    return response;
 }
 
 namespace
@@ -3320,12 +3269,6 @@ namespace
 
         bool lastMovie = false;
 
-        // 计费探针: 每次从非选角进入选角算一次 entry, 进入时 / 约 2 秒后 / 约 6 秒后各读一次
-        int lastWhere    = -99;
-        int probeEntry   = 0;
-        int probeSeq     = 0;
-        int sinceEntryMs = 0;
-
         while (g_guardRunning.load())
         {
             if (g_titleGuard.load())
@@ -3348,51 +3291,6 @@ namespace
                 }, 1000);
 
                 const bool inMovie = state->result == -10;
-
-                // 探针只在读到明确位置时判断; -1（读不到）不改变状态
-                if (state->result == 2)
-                {
-                    if (lastWhere != 2)
-                    {
-                        ++probeEntry;
-                        probeSeq     = 0;
-                        sinceEntryMs = 0;
-                    }
-                    else
-                    {
-                        sinceEntryMs += 500;
-                    }
-
-                    const bool due = (probeSeq == 0) || (probeSeq == 1 && sinceEntryMs >= 2000) ||
-                                     (probeSeq == 2 && sinceEntryMs >= 6000);
-
-                    if (due)
-                    {
-                        auto probe = std::make_shared<BillingProbeData>();
-                        auto ok    = std::make_shared<std::atomic<bool>>(false);
-
-                        MainThreadRun([probe, ok]
-                        {
-                            Pointers pointers{};
-
-                            if (!GetPointers(&pointers))
-                                return;
-
-                            OpBillingProbe(&pointers, probe.get());
-                            ok->store(true);
-                        }, 1000);
-
-                        if (ok->load())
-                            BillingProbeLog(*probe, probeEntry, probeSeq);
-                        else
-                            LogF("[billing-probe] entry=%d seq=%d 读不到（主线程超时或指针取不到）", probeEntry, probeSeq);
-
-                        ++probeSeq;
-                    }
-                }
-
-                if (state->result >= 0 || state->result == -10)
-                    lastWhere = state->result == -10 ? 0 : state->result;
 
                 if (inMovie)
                 {
