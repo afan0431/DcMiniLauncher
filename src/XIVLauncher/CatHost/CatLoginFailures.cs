@@ -74,6 +74,7 @@ public static class CatLoginFailures
     /// </summary>
     public static bool IsKnownRejection(int errorCode) =>
         errorCode is (int)LoginExceptionCode.OutdatedLoginInfo
+                  or (int)LoginExceptionCode.AutoLoginExpired
                   or (int)LoginExceptionCode.FirstLoginOnDevice
                   or (int)LoginExceptionCode.ThirdPartyVerificationFailed
                   or (int)LoginExceptionCode.InvalidInput

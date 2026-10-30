@@ -35,6 +35,7 @@ public sealed class CatLoginFailuresTests
     [Theory]
     [InlineData((int)LoginExceptionCode.FirstLoginOnDevice)]
     [InlineData((int)LoginExceptionCode.OutdatedLoginInfo)]
+    [InlineData((int)LoginExceptionCode.AutoLoginExpired)]
     [InlineData((int)LoginExceptionCode.ThirdPartyVerificationFailed)]
     [InlineData(-10242301)]
     public void KnownRejectionCodes_AreRejected(int code) =>

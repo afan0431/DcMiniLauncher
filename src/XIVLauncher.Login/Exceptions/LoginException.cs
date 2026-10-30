@@ -46,6 +46,11 @@ public enum LoginExceptionCode
     OutdatedLoginInfo = -10515004,
 
     /// <summary>
+    ///     对不起，自动登录已失效，请重新登录（快速登录凭证失效; 2026-10-31 无界面上号实测）
+    /// </summary>
+    AutoLoginExpired = -10515005,
+
+    /// <summary>
     ///     滑块验证超时或取消
     /// </summary>
     SlideTimeoutOrCanceled = 1,
