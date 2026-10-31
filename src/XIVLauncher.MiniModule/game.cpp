@@ -3115,6 +3115,7 @@ std::string GameLogin()
 // 解析在 Cat 后端做（各种写法都可能出现, 模块不猜）。不改任何游戏数据。
 // 响应:
 //   OK found=<0|1> nodes=<文字节点数>        found=1 时后面每个含「月卡」/「点卡」的文字节点一行: T \t <节点 id> \t <原文>
+//                                            found=0 时后面每个文字节点一行: D \t <节点 id> \t <字节数> \t <开头字节的十六进制> \t <原文>（排查界面写法用）
 //   FAIL no-addon                            _CharaSelectRemain 不存在（不在选角界面、或界面还没建好）
 // =============================================================================
 
@@ -3123,6 +3124,8 @@ namespace
     constexpr int    BILLING_MAX_TEXTS = 24;
     constexpr size_t BILLING_TEXT_MAX  = 160;
     constexpr int    BILLING_MAX_DEPTH = 3;
+    constexpr int    BILLING_MAX_OTHERS = 12;
+    constexpr size_t BILLING_HEX_BYTES  = 48;
 
     // AtkUnitBase.UldManager(+0x28) 里 NodeListCount(+0x42) / NodeList(+0x50); 组件节点 Component(+0xC0), 组件的 UldManager 在 +0x8
     constexpr uintptr_t BILLING_UNIT_ULD_MANAGER         = 0x28;
@@ -3142,6 +3145,9 @@ namespace
         int      textCount;
         unsigned textNodeId[BILLING_MAX_TEXTS];
         char     texts[BILLING_MAX_TEXTS][BILLING_TEXT_MAX];
+        int      otherCount;
+        unsigned otherNodeId[BILLING_MAX_OTHERS];
+        char     others[BILLING_MAX_OTHERS][BILLING_TEXT_MAX];
     };
 
     void BillingCollectTexts(uint8_t* uldManager, BillingData* out, int depth)
@@ -3172,9 +3178,18 @@ namespace
                 CopyUtf8String(node + offsets::ATK_TEXT_NODE_NODE_TEXT, text, BILLING_TEXT_MAX);
                 text[BILLING_TEXT_MAX - 1] = '\0';
 
-                // 只留含「月卡」/「点卡」的那条（UTF-8 字节串匹配）
+                // 只留含「月卡」/「点卡」的那条（UTF-8 字节串匹配）; 其余的另记一份, 都不匹配时交出去排查
                 if (strstr(text, u8"月卡") == nullptr && strstr(text, u8"点卡") == nullptr)
+                {
+                    if (out->otherCount < BILLING_MAX_OTHERS)
+                    {
+                        const int other = out->otherCount++;
+                        out->otherNodeId[other] = ReadAt<unsigned>(node, BILLING_NODE_ID);
+                        memcpy(out->others[other], text, sizeof(text));
+                    }
+
                     continue;
+                }
 
                 const int slot = out->textCount++;
                 out->textNodeId[slot] = ReadAt<unsigned>(node, BILLING_NODE_ID);
@@ -3240,6 +3255,31 @@ std::string GameBilling()
         SanitizeText(text);
 
         response += "\nT\t" + std::to_string(data->textNodeId[i]) + "\t" + text;
+    }
+
+    if (data->textCount > 0)
+        return response;
+
+    static constexpr char HEX[] = "0123456789ABCDEF";
+
+    for (int i = 0; i < data->otherCount; ++i)
+    {
+        char text[BILLING_TEXT_MAX];
+        memcpy(text, data->others[i], sizeof(text));
+        text[sizeof(text) - 1] = '\0';
+
+        const size_t length = strlen(text);
+        std::string  hex;
+
+        for (size_t b = 0; b < length && b < BILLING_HEX_BYTES; ++b)
+        {
+            const auto value = static_cast<uint8_t>(text[b]);
+            hex += HEX[value >> 4];
+            hex += HEX[value & 0xF];
+        }
+
+        SanitizeText(text);
+        response += "\nD\t" + std::to_string(data->otherNodeId[i]) + "\t" + std::to_string(length) + "\t" + hex + "\t" + text;
     }
 
     return response;

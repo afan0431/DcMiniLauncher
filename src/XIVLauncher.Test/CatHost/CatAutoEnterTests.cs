@@ -894,6 +894,35 @@ public sealed class CatAutoEnterTests
     public void ParseBilling_ReadsTextLinesOfAFoundReply(string response, string? expected) =>
         Assert.Equal(expected, CatModuleReplies.ParseBilling(response));
 
+    [Theory]
+    [InlineData("OK found=0 nodes=2\nD\t3\t0\t\t\r\nD\t4\t6\tE69C88E58DA1\t月卡", "OK found=0 nodes=2 | #3 0B | #4 6B E69C88E58DA1 「月卡」")]
+    [InlineData("OK found=0 nodes=5", "OK found=0 nodes=5")]
+    [InlineData("FAIL no-addon", "FAIL no-addon")]
+    [InlineData("OK found=0 nodes=1\nX\tjunk", "OK found=0 nodes=1")]
+    public void DescribeBillingMiss_ListsEveryTextNodeTheModuleSaw(string response, string expected) =>
+        Assert.Equal(expected, CatModuleReplies.DescribeBillingMiss(response));
+
+    [Fact]
+    public async Task ReadBilling_WhenNothingMatches_KeepsWhatTheScreenShowedForThatRound()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        var asked            = 0;
+        game.Intercept = command => command == "BILLING"
+                                        ? ++asked < 4 ? "OK found=0 nodes=1\nD\t3\t0\t\t" : "OK found=0 nodes=1\nD\t3\t3\tE5899E\t剩"
+                                        : null;
+
+        var reader = new CatBillingReader(reporter, 1234, TimeSpan.FromSeconds(1));
+        reader.BeginRound();
+
+        for (var i = 0; i < 6; i++)
+            Assert.False((await reader.ReadAsync(game, DateTimeOffset.UtcNow, CancellationToken.None)).Found);
+
+        Assert.Equal("OK found=0 nodes=1 | #3 0B → OK found=0 nodes=1 | #3 3B E5899E 「剩」", reader.Misses);
+        reader.BeginRound();
+        Assert.Equal(string.Empty, reader.Misses);
+        Assert.Empty(reporter.BillingReports);
+    }
+
     [Fact]
     public async Task Observe_AfterAStop_ReportsTheCharacterOnceSomeoneEntersByHand()
     {

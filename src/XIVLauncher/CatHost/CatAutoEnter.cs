@@ -624,6 +624,7 @@ public sealed class CatAutoEnter
     private async Task ReadBillingAsync(CancellationToken cancellationToken)
     {
         billingReader ??= new CatBillingReader(reporter, game.ProcessId, timings.ReadTimeout);
+        billingReader.BeginRound();
 
         for (var attempt = 0; attempt < BILLING_ATTEMPTS && !billingReader.Unsupported; attempt++)
         {
@@ -648,7 +649,7 @@ public sealed class CatAutoEnter
             }
         }
 
-        Log.Information("[CatAutoEnter] 选角界面没读到月卡/点卡文字, 不报计费");
+        Log.Information("[CatAutoEnter] 选角界面没读到月卡/点卡文字, 不报计费; 界面上是: {Seen}", billingReader.Misses);
     }
 
     /// <summary>

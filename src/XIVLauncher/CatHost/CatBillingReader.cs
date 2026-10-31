@@ -14,10 +14,18 @@ internal sealed class CatBillingReader(ICatLaunchReporter reporter, int processI
     /// <summary>模块命令</summary>
     public const string COMMAND = "BILLING";
 
+    private readonly List<string> misses = [];
+
     private bool unsupported;
 
     /// <summary>模块不认识 <c>BILLING</c>, 不再读</summary>
     public bool Unsupported => unsupported;
+
+    /// <summary>这一轮没读到时模块答的界面文字（相邻相同的只留一条, 用「→」连起来）; 排查界面写法用</summary>
+    public string Misses => string.Join(" → ", misses);
+
+    /// <summary>开始新一轮读数（进一次选角界面算一轮）, 清掉上一轮记下的界面文字</summary>
+    public void BeginRound() => misses.Clear();
 
     /// <summary>
     ///     读一次; 读到原文并报出去返回 <see cref="CatModuleRead.Answered" /> 且 Found 为真。
@@ -43,7 +51,12 @@ internal sealed class CatBillingReader(ICatLaunchReporter reporter, int processI
 
         if (CatModuleReplies.ParseBilling(response) is not { } raw)
         {
-            Log.Debug("[CatHost] 这一次没读到计费文字: {Response}", CatModuleReplies.FirstLine(response));
+            var seen = CatModuleReplies.DescribeBillingMiss(response);
+            Log.Debug("[CatHost] 这一次没读到计费文字: {Response}", seen);
+
+            if (misses.Count == 0 || misses[^1] != seen)
+                misses.Add(seen);
+
             return (CatModuleRead.Answered, false);
         }
 
@@ -79,5 +92,29 @@ internal static partial class CatModuleReplies
         }
 
         return texts.Count == 0 ? null : string.Join(' ', texts);
+    }
+
+    /// <summary>
+    ///     没读到计费时模块答了什么, 写成一行: 首行摘要, 后面是 found=0 时模块附上的各文字节点
+    ///     （<c>D \t 节点id \t 字节数 \t 开头字节的十六进制 \t 原文</c>）, 例「OK found=0 nodes=5 | #3 0B | #4 6B E69C88E58DA1 「月卡」」
+    /// </summary>
+    public static string DescribeBillingMiss(string response)
+    {
+        var lines = response.Split('\n');
+        var parts = new List<string> { lines[0].TrimEnd('\r') };
+
+        foreach (var line in lines.Skip(1))
+        {
+            var fields = line.TrimEnd('\r').Split('\t', 5);
+
+            if (fields.Length < 3 || fields[0] != "D")
+                continue;
+
+            var hex  = fields.Length > 3 && fields[3].Length > 0 ? $" {fields[3]}" : string.Empty;
+            var text = fields.Length > 4 && fields[4].Trim() is { Length: > 0 } shown ? $" 「{shown}」" : string.Empty;
+            parts.Add($"#{fields[1]} {fields[2]}B{hex}{text}");
+        }
+
+        return string.Join(" | ", parts);
     }
 }
