@@ -8,11 +8,12 @@ namespace XIVLauncher.Common.Game;
 
 public static class NativeAclFix
 {
-    public static Process LaunchGame(string workingDir, string exePath, string arguments, IDictionary<string, string> envVars, DPIAwareness dpiAwareness, Action<Process> beforeResume)
+    public static Process LaunchGame(string workingDir, string exePath, string arguments, IDictionary<string, string> envVars, DPIAwareness dpiAwareness, Action<Process> beforeResume) =>
+        GameInstanceLimit.Launch(() => LaunchCore(workingDir, exePath, arguments, envVars, dpiAwareness, beforeResume));
+
+    private static Process LaunchCore(string workingDir, string exePath, string arguments, IDictionary<string, string> envVars, DPIAwareness dpiAwareness, Action<Process> beforeResume)
     {
         Process process = null;
-
-        GameInstanceLimit.Release();
 
         var userName = Environment.UserName;
 
