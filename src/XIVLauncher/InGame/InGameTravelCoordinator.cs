@@ -323,6 +323,17 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             var progress = new Progress<string>(text => InGameTravelJobs.Report(pid, prefix + text));
             var context  = leg.Context;
 
+            // 第二段的角色等返回落地后才查（PlanAsync 里超域中查不到, 见 ResolveForwardContextAsync）
+            if (!leg.IsBack && context.Character == null)
+            {
+                var character = await FindCharacterAsync(context.CharacterName!, context.SourceGroup!).ConfigureAwait(false);
+
+                if (character == null)
+                    return InGameTravelResult.Failed($"{prefix}已回到原始大区, 但在 {context.SourceGroup!.AreaName}/{context.SourceGroup.GroupName} 上没查到角色 {context.CharacterName}");
+
+                context = context with { Character = character };
+            }
+
             result = leg.IsBack
                          ? await service.TravelBackAsync(gameProcess, context.SourceGroup!, context.ReturnOrderId!,
                                                          context.TargetArea!, context.CharacterName, progress, CancellationToken.None).ConfigureAwait(false)
@@ -359,9 +370,9 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     ///       <item>超域中 + 要去别的大区 → 2 段: 超域返回 → （冷却 60 秒）→ 超域旅行</item>
     ///       <item>跨界传送中 → 拒绝: SDO 不接受从做客世界发起超域, 得先在游戏内返回原始世界</item>
     ///     </list>
-    ///     两段的目标都能**提前**定下来: SDO 的超域业务一律以原始服务器为源, 而
-    ///     <c>queryRoleList4Migration</c> 按原始服务器列角色 —— 角色人还在做客地时,
-    ///     它的 roleId 照样查得到。所以不必等第一段跑完再解析第二段。
+    ///     两段的目标大区 / 服务器提前定下来（SDO 的超域业务一律以原始服务器为源）; 但第二段要的角色
+    ///     等第一段落地后才查: 角色人还在做客地时原始服务器的角色列表里没有它
+    ///     （10-29 鱼鱼无敌啦、10-31 咩噗奶兔包 两次实机都查不到, 推翻了 08-20 的「照样查得到」）。
     /// </summary>
     private async Task<(IReadOnlyList<TravelLeg> Legs, CharacterState? State, string? Error)> PlanAsync
     (
@@ -401,7 +412,7 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             return ([], state, $"角色 {state.Name} 没在超域 —— 它本来就在原始大区");
         }
 
-        var forward = await ResolveForwardContextAsync(request, state, cancellationToken).ConfigureAwait(false);
+        var forward = await ResolveForwardContextAsync(request, state, state.Away, cancellationToken).ConfigureAwait(false);
 
         if (forward.Error != null)
             return ([], state, forward.Error);
@@ -469,7 +480,7 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     ///     游戏内是 <c>Player.currentworld</c> / <c>homeworld</c>，选角界面是
     ///     <c>CharaSelectCharacterEntry</c>。SDO 那边给不了：
     ///     <c>queryRoleList4Migration</c> 是按**原始服务器**列角色的，
-    ///     角色超域出去之后它照样把角色列在原始服务器下（2026-08-20 实测）。
+    ///     角色超域出去之后原始服务器的列表里查不到它（10-29、10-31 实机；08-20「照样列着」的结论已推翻）。
     /// </summary>
     private sealed record CharacterState
     {
@@ -659,16 +670,22 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
     (
         DCTravelListener.InGameTravelRequest request,
         CharacterState                       state,
+        bool                                 deferCharacter,
         CancellationToken                    cancellationToken
     )
     {
         // SDO 的超域业务一律以原始服务器为源 —— 角色此刻在不在原始大区都一样。
-        // 超域中时这一段是「第二段」, 跑之前第一段已经把角色送回原始大区了。
+        // 超域中时这一段是「第二段」: 角色等第一段送回原始大区后再查（RunLegsAsync）, 这里只定目标。
         var sourceGroup = state.HomeGroup;
-        var character   = await FindCharacterAsync(state.Name, sourceGroup).ConfigureAwait(false);
+        DCTravelCharacter? character = null;
 
-        if (character == null)
-            return TravelContext.Failed($"在 {sourceGroup.AreaName}/{sourceGroup.GroupName} 上没查到角色 {state.Name}");
+        if (!deferCharacter)
+        {
+            character = await FindCharacterAsync(state.Name, sourceGroup).ConfigureAwait(false);
+
+            if (character == null)
+                return TravelContext.Failed($"在 {sourceGroup.AreaName}/{sourceGroup.GroupName} 上没查到角色 {state.Name}");
+        }
         // 2. 目标大区/服务器
         var targetAreas = await client.QueryGroupListTravelTarget(sourceGroup.AreaID, sourceGroup.GroupID).ConfigureAwait(false);
 
@@ -694,9 +711,9 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
             return TravelContext.Failed($"拿不到大区 {targetArea.AreaName} 的登录主机名");
 
         Log.Information("[InGameTravel] 解析完成: {Character}@{SourceGroup} → {TargetArea}/{TargetGroup} ({Lobby})",
-                        character.Name, sourceGroup.GroupName, targetArea.AreaName, targetGroup.GroupName, loginArea.AreaLobby);
+                        state.Name, sourceGroup.GroupName, targetArea.AreaName, targetGroup.GroupName, loginArea.AreaLobby);
 
-        return new TravelContext(sourceGroup, targetGroup, character, loginArea, null);
+        return new TravelContext(sourceGroup, targetGroup, character, loginArea, null) { CharacterName = state.Name };
     }
 
     private static DCTravelListener.InGameTravelResponse Failed(string message)
