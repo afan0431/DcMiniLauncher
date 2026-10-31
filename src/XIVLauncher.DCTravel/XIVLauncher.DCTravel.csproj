@@ -24,6 +24,10 @@
     </ItemGroup>
 
     <ItemGroup>
+        <InternalsVisibleTo Include="XIVLauncher.Test"/>
+    </ItemGroup>
+
+    <ItemGroup>
         <PackageReference Include="EmbedIO"/>
         <PackageReference Include="Newtonsoft.Json"/>
         <PackageReference Include="Serilog"/>

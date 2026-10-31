@@ -143,7 +143,10 @@ public sealed class DCTravelRuntimeService : ILoginSessionRefreshSink, IDisposab
         catch (Exception ex)
         {
             // 初始化失败但监听器已启动, 插件会收到可读的错误
-            Log.Warning(ex, "[DCTravelListener] 超域旅行初始化失败, 监听器仍在运行");
+            Log.Warning(ex, "[DCTravelListener] 超域旅行初始化失败, 监听器仍在运行, 后台按退避重试");
+
+            // 保活循环在未初始化时会按退避重建会话
+            _ = Client.KeepCookieAlive();
 
             if (Client.MaintenanceState == DCTravelMaintenanceState.UnderMaintenance)
                 StartMaintenanceRecovery(version);

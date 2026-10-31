@@ -50,8 +50,22 @@ public partial class DCTravelClient : IDisposable
             ["User-Agent"]         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0"
         }.ToFrozenDictionary();
 
-    private bool IsInitialized =>
+    internal bool IsInitialized =>
         Volatile.Read(ref initializedState) == 1;
+
+    /// <summary>
+    ///     会话恢复失败后的退避间隔: 参数是已连续失败的次数 (从 0 起), 15 秒起每次翻倍, 封顶 5 分钟。
+    ///     后台保活循环据此决定下一次重建的时间, 避免对盛趣接口紧密重试。
+    /// </summary>
+    internal Func<int, TimeSpan> RecoveryBackoff { get; set; } = DefaultRecoveryBackoff;
+
+    /// <summary>
+    ///     请求触发的会话重建失败后, 这段时间内的后续请求直接复用上次的失败原因, 不再各自去打盛趣接口。
+    /// </summary>
+    internal TimeSpan RequestRecoveryCooldown { get; set; } = TimeSpan.FromSeconds(10);
+
+    internal static TimeSpan DefaultRecoveryBackoff(int failures) =>
+        TimeSpan.FromSeconds(Math.Min(15d * Math.Pow(2, Math.Clamp(failures, 0, 10)), 300d));
 
     private readonly HttpClient      httpClient;
     private readonly CookieContainer cookieContainer;
@@ -62,9 +76,16 @@ public partial class DCTravelClient : IDisposable
     private int    keepAliveRunning;
     private int    disposeState;
     private Task?  sessionRecoveryTask;
+    private long   lastRecoveryFailureTick = long.MinValue;
+    private string lastRecoveryFailure     = string.Empty;
     private CancellationTokenSource lifetimeCts = new();
 
-    public DCTravelClient(string nSessionID)
+    public DCTravelClient(string nSessionID) : this(nSessionID, null)
+    {
+    }
+
+    /// <param name="messageHandler">测试用: 替换底层 HTTP 处理器; 不给则使用带 Cookie 容器的默认处理器</param>
+    internal DCTravelClient(string nSessionID, HttpMessageHandler? messageHandler)
     {
         cookieContainer = new();
         if (!string.IsNullOrEmpty(nSessionID))
@@ -73,7 +94,7 @@ public partial class DCTravelClient : IDisposable
         cookieContainer.Add(new Cookie("SECURE_CAS_LOGIN_STATE", "1", "/", DOMAIN));
         cookieContainer.Add(new Cookie("isLogin",                "1", "/", DOMAIN));
 
-        var handler = new HttpClientHandler
+        HttpMessageHandler handler = messageHandler ?? new HttpClientHandler
         {
             CookieContainer        = cookieContainer,
             UseCookies             = true,
@@ -188,7 +209,7 @@ public partial class DCTravelClient : IDisposable
     )
     {
         if (!ignoreInitialized && !IsInitialized)
-            throw new DCTravelAPIException("DcTraveler 未初始化, 请先调用 GetValidCookie()");
+            await EnsureInitializedForRequest().ConfigureAwait(false);
 
         const int MAX_ATTEMPTS = 3;
 
@@ -297,6 +318,40 @@ public partial class DCTravelClient : IDisposable
         return fresh.Task;
     }
 
+    /// <summary>
+    ///     请求发现会话还没建立时, 先走单飞重建再继续; 重建失败则带着底层原因抛出。
+    ///     维护期间不重建 (维护恢复另有定时器); 上次重建刚失败不久也直接复用失败原因。
+    /// </summary>
+    private async Task EnsureInitializedForRequest()
+    {
+        if (MaintenanceState == DCTravelMaintenanceState.UnderMaintenance)
+            throw new DCTravelAPIException("DcTraveler 未初始化: 超域旅行服务维护中", -10339180);
+
+        var cooldown = RequestRecoveryCooldown;
+        var failedAt = Volatile.Read(ref lastRecoveryFailureTick);
+
+        if (failedAt != long.MinValue && Environment.TickCount64 - failedAt < cooldown.TotalMilliseconds)
+            throw new DCTravelAPIException($"DcTraveler 未初始化, 刚重建会话失败: {Volatile.Read(ref lastRecoveryFailure)}");
+
+        Log.Information("[DCTravelClient] 会话未初始化, 请求触发重建");
+
+        try
+        {
+            await EnsureSessionRecovered().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref lastRecoveryFailure, ex.Message);
+            Volatile.Write(ref lastRecoveryFailureTick, Environment.TickCount64);
+            throw new DCTravelAPIException($"DcTraveler 未初始化, 重建会话失败: {ex.Message}");
+        }
+
+        if (!IsInitialized)
+            throw new DCTravelAPIException("DcTraveler 未初始化, 重建会话后仍未就绪");
+
+        Volatile.Write(ref lastRecoveryFailureTick, long.MinValue);
+    }
+
     private async Task RunSessionRecoveryAsync(TaskCompletionSource completion)
     {
         try
@@ -385,6 +440,8 @@ public partial class DCTravelClient : IDisposable
         }
 
         var cancellationToken = Volatile.Read(ref lifetimeCts).Token;
+        var recoveryFailures  = 0;
+        DateTime? recoverAt   = null;
 
         try
         {
@@ -392,7 +449,42 @@ public partial class DCTravelClient : IDisposable
             {
                 if (!IsInitialized)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+                    // 维护期间由维护恢复定时器负责, 这里只等
+                    if (MaintenanceState == DCTravelMaintenanceState.UnderMaintenance)
+                    {
+                        recoverAt = null;
+                        await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    recoverAt ??= DateTime.UtcNow + RecoveryBackoff(recoveryFailures);
+
+                    if (DateTime.UtcNow < recoverAt)
+                    {
+                        var wait = recoverAt.Value - DateTime.UtcNow;
+                        await Task.Delay(wait < TimeSpan.FromSeconds(1) ? wait : TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    try
+                    {
+                        await EnsureSessionRecovered().ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        recoveryFailures++;
+                        Log.Warning(ex, "[DCTravelClient] 后台重建会话失败, 已连续失败 {Failures} 次", recoveryFailures);
+                    }
+
+                    recoverAt = null;
+
+                    if (IsInitialized)
+                        recoveryFailures = 0;
+
                     continue;
                 }
 

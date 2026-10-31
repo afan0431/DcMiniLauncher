@@ -45,6 +45,11 @@ public sealed class InGameTravelService(DCTravelClient client)
     /// </summary>
     private const string LOGOUT_COMMAND = "LOGOUT";
 
+    /// <summary>文本命令登出等不到选角界面时降级用的直接登出</summary>
+    private const string LOGOUT_DIRECT_COMMAND = "LOGOUT DIRECT";
+
+    private const string LOGOUT_TIMEOUT_MARKER = "logout-timeout";
+
     /// <summary>状态查询连续失败这么多次就放弃（和启动器外部传送那套一致）</summary>
     private const int MAX_CONSECUTIVE_FAILURES = 3;
 
@@ -352,7 +357,7 @@ public sealed class InGameTravelService(DCTravelClient client)
                 // 角色还在世界里: 走游戏自己的登出流程回到角色选择界面, 再往下走。
                 // 绝不能在这里直接 RETURNTITLE —— 那个在世界里调必崩。
                 Report(progress, "角色在游戏内, 正在登出…");
-                await CommandAsync(module, LOGOUT_COMMAND, cancellationToken).ConfigureAwait(false);
+                await LogoutFromWorldAsync(module, cancellationToken).ConfigureAwait(false);
 
                 where = await module.SendAsync("WHERE", cancellationToken).ConfigureAwait(false);
 
@@ -858,6 +863,33 @@ public sealed class InGameTravelService(DCTravelClient client)
         }
 
         return false;
+    }
+
+    /// <summary>
+    ///     把在世界里的角色登出到选角界面。文本命令登出超时（弹窗、过场挡住确认框）时,
+    ///     先确认角色是否仍在世界里, 仍在则改发一次 <c>LOGOUT DIRECT</c>, 再不成才抛。
+    /// </summary>
+    internal static async Task LogoutFromWorldAsync(IMiniModuleChannel module, CancellationToken cancellationToken)
+    {
+        var response = await module.SendAsync(LOGOUT_COMMAND, cancellationToken).ConfigureAwait(false);
+
+        if (response.StartsWith("OK", StringComparison.Ordinal))
+            return;
+
+        if (!response.Contains(LOGOUT_TIMEOUT_MARKER, StringComparison.Ordinal))
+            throw new InvalidOperationException($"模块命令 {LOGOUT_COMMAND} 失败: {response}");
+
+        var where = await module.SendAsync("WHERE", cancellationToken).ConfigureAwait(false);
+
+        if (!where.Contains("where=ingame", StringComparison.Ordinal))
+            return;
+
+        Log.Warning("[InGameTravel] 登出超时, 改用直接登出重试: {Response}", response);
+
+        var direct = await module.SendAsync(LOGOUT_DIRECT_COMMAND, cancellationToken).ConfigureAwait(false);
+
+        if (!direct.StartsWith("OK", StringComparison.Ordinal))
+            throw new InvalidOperationException($"模块命令 LOGOUT 失败: {response}; 直接登出也失败: {direct}");
     }
 
     /// <summary>发一条模块命令, 回应不是 OK 就抛 —— 换服这几步任何一步没成都不能继续往下走。</summary>

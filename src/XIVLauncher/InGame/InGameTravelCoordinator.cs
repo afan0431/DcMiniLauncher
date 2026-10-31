@@ -603,20 +603,13 @@ public sealed class InGameTravelCoordinator(DCTravelClient client)
         return null;
     }
 
-    /// <summary>在原始服务器上把角色查出来 —— 下新单要 <c>roleId</c>。只问这一个服务器。</summary>
-    private async Task<DCTravelCharacter?> FindCharacterAsync(string roleName, DCTravelGroup homeGroup)
+    /// <summary>
+    ///     在原始服务器上把角色查出来 —— 下新单要 <c>roleId</c>。只问这一个服务器。
+    ///     查询本身失败（会话未初始化、网络、限流）时异常原样往上抛; 只有查到了列表而里头没有该角色才返回 null。
+    /// </summary>
+    internal async Task<DCTravelCharacter?> FindCharacterAsync(string roleName, DCTravelGroup homeGroup)
     {
-        List<DCTravelCharacter> roles;
-
-        try
-        {
-            roles = await client.QueryRoleList(homeGroup.AreaID, homeGroup.GroupID).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "[InGameTravel] 查角色失败 A={AreaID} G={GroupID}", homeGroup.AreaID, homeGroup.GroupID);
-            return null;
-        }
+        var roles = await client.QueryRoleList(homeGroup.AreaID, homeGroup.GroupID).ConfigureAwait(false);
 
         return roles.FirstOrDefault(x => string.Equals(x.Name, roleName, StringComparison.Ordinal));
     }
