@@ -3111,10 +3111,11 @@ std::string GameLogin()
 
 // =============================================================================
 // 计费读数（只读）: 选角界面 `_CharaSelectRemain` 的文字节点里写着月卡/点卡剩余时间,
-// 例如「月卡：24天18小时12分 点卡：2小时2分［122分钟］」。BILLING 命令把含「月卡」或「点卡」的文字节点原文交给启动器,
+// 游戏原样写「剩余天数: 26天　剩余时长: 0分钟」, 装了改写界面的插件时是「月卡：24天18小时12分 点卡：2小时2分［122分钟］」。
+// BILLING 命令把含「月卡」「点卡」「剩余天数」「剩余时长」之一的文字节点原文交给启动器,
 // 解析在 Cat 后端做（各种写法都可能出现, 模块不猜）。不改任何游戏数据。
 // 响应:
-//   OK found=<0|1> nodes=<文字节点数>        found=1 时后面每个含「月卡」/「点卡」的文字节点一行: T \t <节点 id> \t <原文>
+//   OK found=<0|1> nodes=<文字节点数>        found=1 时后面每个写着计费的文字节点一行: T \t <节点 id> \t <原文>
 //                                            found=0 时后面每个文字节点一行: D \t <节点 id> \t <字节数> \t <开头字节的十六进制> \t <原文>（排查界面写法用）
 //   FAIL no-addon                            _CharaSelectRemain 不存在（不在选角界面、或界面还没建好）
 // =============================================================================
@@ -3178,8 +3179,9 @@ namespace
                 CopyUtf8String(node + offsets::ATK_TEXT_NODE_NODE_TEXT, text, BILLING_TEXT_MAX);
                 text[BILLING_TEXT_MAX - 1] = '\0';
 
-                // 只留含「月卡」/「点卡」的那条（UTF-8 字节串匹配）; 其余的另记一份, 都不匹配时交出去排查
-                if (strstr(text, u8"月卡") == nullptr && strstr(text, u8"点卡") == nullptr)
+                // 只留写着计费的那条（UTF-8 字节串匹配）: 插件改写过的「月卡/点卡」或游戏原样的「剩余天数/剩余时长」; 其余的另记一份, 都不匹配时交出去排查
+                if (strstr(text, u8"月卡") == nullptr && strstr(text, u8"点卡") == nullptr &&
+                    strstr(text, u8"剩余天数") == nullptr && strstr(text, u8"剩余时长") == nullptr)
                 {
                     if (out->otherCount < BILLING_MAX_OTHERS)
                     {
