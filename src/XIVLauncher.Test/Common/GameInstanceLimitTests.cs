@@ -65,6 +65,87 @@ public sealed class GameInstanceLimitTests : IDisposable
         Assert.Equal(0, closed);
     }
 
+    [Fact]
+    public void Launch_StartsOneGameAtATime()
+    {
+        var lockName = $@"Local\cat-launch-lock-{id}";
+        var running  = 0;
+        var peak     = 0;
+
+        int Start()
+        {
+            var now = Interlocked.Increment(ref running);
+            InterlockedMax(ref peak, now);
+            Thread.Sleep(200);
+            Interlocked.Decrement(ref running);
+            return now;
+        }
+
+        var launches = Enumerable.Range(0, 3)
+                                 .Select(_ => Task.Factory.StartNew(
+                                             () => GameInstanceLimit.Launch(lockName, () => 0, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(1), Start),
+                                             TaskCreationOptions.LongRunning))
+                                 .ToArray();
+
+        Assert.True(Task.WaitAll(launches, TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, peak);
+    }
+
+    [Fact]
+    public void Launch_GoesOnWhenReleaseHangs()
+    {
+        using var never = new ManualResetEventSlim();
+        var       watch = Stopwatch.StartNew();
+
+        var result = GameInstanceLimit.Launch($@"Local\cat-launch-lock-{id}", () =>
+        {
+            never.Wait();
+            return 0;
+        }, TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(200), () => 42);
+
+        never.Set();
+        Assert.Equal(42, result);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public void Launch_GoesOnWhenLockIsHeldTooLong()
+    {
+        var       lockName = $@"Local\cat-launch-lock-{id}";
+        using var held     = new ManualResetEventSlim();
+        using var done     = new ManualResetEventSlim();
+
+        var holderThread = new Thread(() =>
+        {
+            using var other = new Mutex(true, lockName);
+            held.Set();
+            done.Wait();
+            other.ReleaseMutex();
+        });
+        holderThread.Start();
+        Assert.True(held.Wait(TimeSpan.FromSeconds(5)));
+
+        try
+        {
+            var result = GameInstanceLimit.Launch(lockName, () => 0, TimeSpan.FromMilliseconds(200), TimeSpan.FromSeconds(1), () => 7);
+            Assert.Equal(7, result);
+        }
+        finally
+        {
+            done.Set();
+            holderThread.Join(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    private static void InterlockedMax(ref int target, int value)
+    {
+        int current;
+
+        while ((current = Volatile.Read(ref target)) < value && Interlocked.CompareExchange(ref target, value, current) != current)
+        {
+        }
+    }
+
     private static Process StartHolder(params string[] names)
     {
         var creates = string.Join("; ", names.Select((name, i) => $"$m{i} = [System.Threading.Mutex]::new($false, '{name}')"));

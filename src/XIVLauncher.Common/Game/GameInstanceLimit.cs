@@ -18,6 +18,21 @@ public static class GameInstanceLimit
     /// </summary>
     public const string MUTEX_NAME_MARKER = "6AA83AB5-BAC4-4a36-9F66-A309770760CB_ffxiv_game";
 
+    /// <summary>
+    ///     本机各启动器进程"解除多开限制 + 开游戏进程"一次只做一个时共用的锁
+    /// </summary>
+    public const string LAUNCH_LOCK_NAME = @"Local\cat-dml-game-launch";
+
+    /// <summary>
+    ///     等别的启动器开完游戏最多等多久, 过了不再等、照常开
+    /// </summary>
+    public static readonly TimeSpan LaunchLockWait = TimeSpan.FromSeconds(90);
+
+    /// <summary>
+    ///     解除多开限制最多等多久, 过了不再等、照常开游戏
+    /// </summary>
+    public static readonly TimeSpan ReleaseWait = TimeSpan.FromSeconds(10);
+
     private const string GAME_PROCESS_NAME = "ffxiv_dx11";
 
     private const int  PROCESS_HANDLE_INFORMATION   = 51;
@@ -27,6 +42,58 @@ public static class GameInstanceLimit
     private const uint PROCESS_QUERY_INFORMATION    = 0x0400;
     private const uint DUPLICATE_CLOSE_SOURCE       = 0x0001;
     private const uint DUPLICATE_SAME_ACCESS        = 0x0002;
+
+    /// <summary>
+    ///     开一个游戏: 本机同一时间只有一个启动器在解除多开限制并开游戏进程 (几个号同时上号时, 一个在读别的游戏的句柄表、另一个正在开游戏会卡住不动),
+    ///     解除多开限制限时做完, 再开游戏
+    /// </summary>
+    /// <param name="start">开游戏进程</param>
+    public static T Launch<T>(Func<T> start) => Launch(LAUNCH_LOCK_NAME, Release, LaunchLockWait, ReleaseWait, start);
+
+    /// <summary>
+    ///     开一个游戏: 拿到 <paramref name="lockName" /> 锁 (最多等 <paramref name="lockWait" />, 等不到也照常开), 限时 <paramref name="releaseWait" /> 做
+    ///     <paramref name="release" />, 再做 <paramref name="start" />, 最后放锁
+    /// </summary>
+    /// <param name="lockName">本机锁名</param>
+    /// <param name="release">解除多开限制</param>
+    /// <param name="lockWait">等锁最多多久</param>
+    /// <param name="releaseWait">解除多开限制最多等多久</param>
+    /// <param name="start">开游戏进程</param>
+    public static T Launch<T>(string lockName, Func<int> release, TimeSpan lockWait, TimeSpan releaseWait, Func<T> start)
+    {
+        using var gate  = new Mutex(false, lockName);
+        var       owned = false;
+        var       wait  = Stopwatch.StartNew();
+
+        try
+        {
+            try
+            {
+                owned = gate.WaitOne(lockWait);
+            }
+            catch (AbandonedMutexException)
+            {
+                owned = true;
+            }
+
+            if (!owned)
+                Log.Warning("[多开] 等别的启动器开游戏超过 {Seconds}s, 不再等", (int)lockWait.TotalSeconds);
+            else if (wait.Elapsed > TimeSpan.FromSeconds(1))
+                Log.Information("[多开] 等别的启动器开完游戏用了 {Seconds:0.0}s", wait.Elapsed.TotalSeconds);
+
+            var releasing = Task.Run(release);
+
+            if (!releasing.Wait(releaseWait))
+                Log.Warning("[多开] 解除多开限制 {Seconds}s 没做完, 先接着开游戏", (int)releaseWait.TotalSeconds);
+
+            return start();
+        }
+        finally
+        {
+            if (owned)
+                gate.ReleaseMutex();
+        }
+    }
 
     /// <summary>
     ///     关掉本机所有游戏进程占用的名额互斥体。从不抛异常, 失败只记日志
