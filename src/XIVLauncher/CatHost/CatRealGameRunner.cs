@@ -1713,18 +1713,134 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         return (launched, dalamudOk, companionAppManager);
     }
 
+    /// <summary>登出后等标题界面出来的上限（游戏自己的登出要几秒到十几秒）</summary>
+    private static readonly TimeSpan ParkTitleTimeout = TimeSpan.FromMinutes(2);
+
+    /// <inheritdoc />
+    public async Task ReturnTitleAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        var launched = currentProcess;
+
+        if (launched == null || launched.UnderlyingProcess.HasExited)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.CANCELLED, "游戏进程已退出");
+            return;
+        }
+
+        if (dcTravel == null)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这次上号没有开自动进入角色, 停到标题后进不回来, 没有登出");
+            return;
+        }
+
+        // 先停掉在看当前角色的那段（它把登出当成异常）, 再占闸连模块
+        lock (cleanupLock)
+        {
+            if (autoEnterCancellations.Remove(launched.ProcessID, out var running))
+                running.Cancel();
+        }
+
+        using var gate = InGame.InGameTravelService.TryEnterGate(launched.ProcessID);
+
+        if (gate == null)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "游戏内模块正被别的操作占着（跨区等）, 没有登出");
+            return;
+        }
+
+        var injectError = InGame.MiniModuleInjector.Inject(launched.UnderlyingProcess);
+
+        if (injectError != null)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, $"注入游戏内模块失败: {injectError}");
+            return;
+        }
+
+        using var module = new InGame.MiniModuleClient(launched.ProcessID);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, closeCts.Token);
+        var       token  = linked.Token;
+
+        try
+        {
+            await module.ConnectAsync(10_000, token).ConfigureAwait(false);
+            reporter.Stage(CatStages.LEAVING_WORLD);
+            Log.Information("[CatHost] 停到标题: 角色登出");
+            await InGame.InGameTravelService.LogoutFromWorldAsync(module, token).ConfigureAwait(false);
+
+            var deadline = DateTimeOffset.UtcNow + ParkTitleTimeout;
+
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                var ready = await module.SendAsync("TITLEREADY", token).ConfigureAwait(false);
+
+                if (ready.Contains("ready=1", StringComparison.Ordinal))
+                    break;
+
+                if (DateTimeOffset.UtcNow >= deadline)
+                {
+                    reporter.AutoEnterStopped(CatAutoEnterStopCodes.TIMEOUT, "登出后两分钟没回到标题界面");
+                    return;
+                }
+
+                await module.SendAsync("SKIPMOVIE", token).ConfigureAwait(false);
+                await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+            }
+
+            // 标题守卫: 闲置时飘进片头动画就投 ESC 退出来（模块默认就开着, 这里再确认一次）
+            await module.SendAsync("KEEPALIVE ON", token).ConfigureAwait(false);
+            Log.Information("[CatHost] 停到标题: 已在标题界面");
+            reporter.Stage(CatStages.AT_TITLE);
+        }
+        catch (OperationCanceledException)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.CANCELLED, "收到关闭请求, 没有停到标题");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 停到标题失败");
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, $"登出没成功: {ex.Message}");
+        }
+    }
+
+    /// <inheritdoc />
+    public Task EnterCharacterAsync(string? name, string? homeWorld, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        var launched = currentProcess;
+
+        if (launched == null || launched.UnderlyingProcess.HasExited)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.CANCELLED, "游戏进程已退出");
+            return Task.CompletedTask;
+        }
+
+        if (dcTravel == null)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这次上号没有开自动进入角色");
+            return Task.CompletedTask;
+        }
+
+        var target = name == null
+            ? new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, autoEnter?.EnteredContentId)
+            : new CatAutoEnterTarget(name, homeWorld ?? request.CharacterHomeWorld, null);
+
+        Log.Information("[CatHost] 从标题进角色");
+        StartAutoEnter(launched, reporter, closeCts.Token, target);
+        return Task.CompletedTask;
+    }
+
     /// <summary>
     ///     在后台自动进入角色（不挡崩溃守护）: 编排 → 之后隔一段时间看一次当前角色。
     ///     带 Minion 的在角色第一次进世界后挂（编排停手后人手动进去的也算）; 没进世界游戏就退了则不挂。
     ///     等人选角色、排队都可能很久, 所以不在启动流程里等; 游戏进程收尾时取消。
     ///     崩溃重启后的新进程接着登录上一次实际进的那个角色。
     /// </summary>
-    private void StartAutoEnter(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken startToken)
+    private void StartAutoEnter(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken startToken, CatAutoEnterTarget? target = null)
     {
         var process      = launched.UnderlyingProcess;
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(startToken);
         var game         = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea);
-        var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, autoEnter?.EnteredContentId)) { ReadBilling = true };
+        var flow         = new CatAutoEnter(game, reporter, target ?? new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, autoEnter?.EnteredContentId)) { ReadBilling = true };
         var token        = cancellation.Token;
 
         autoEnter = flow;

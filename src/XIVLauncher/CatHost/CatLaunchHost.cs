@@ -232,6 +232,25 @@ public interface ICatGameRunner
     ICatGameExit? GameExit => null;
 
     /// <summary>
+    ///     角色登出回标题界面, 游戏照常守护（停到标题）: 进度经 <see cref="ICatLaunchReporter.Stage" /> 报
+    ///     （<see cref="CatStages.LEAVING_WORLD" /> → <see cref="CatStages.AT_TITLE" />）, 没做成经 <see cref="ICatLaunchReporter.AutoEnterStopped" /> 报
+    /// </summary>
+    Task ReturnTitleAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这个启动器不支持停到标题");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    ///     从标题界面进角色（停到标题之后）: 同自动进入角色, 目标为空时进上一次进过的那个角色
+    /// </summary>
+    Task EnterCharacterAsync(string? name, string? homeWorld, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这个启动器不支持从标题进角色");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
     ///     客户说设备验证的短信已经发了: 点验证窗口的「确定」。立即返回是否点了, 结果经
     ///     <see cref="ICatLaunchReporter.WeGameSmsResult" /> 或 <see cref="ICatLaunchReporter.WeGameChallengeCleared" /> 报告。
     ///     不在等 WeGame 登录的启动器一律回 notRunning。
@@ -299,6 +318,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     private bool?             dalamudOk;
     private bool?             minionOk;
     private int               injectBusy;
+    private int               parkBusy;
     private bool              closeRequested;
     private bool              handOffRequested;
     private volatile bool     handOffCommitted;
@@ -394,6 +414,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             "weGame.confirmSms" => Task.FromResult<object?>(ConfirmWeGameSms(Deserialize<CatWeGameConfirmSmsParams>(parameters))),
             "weGame.answerImageSelect" => Task.FromResult<object?>(AnswerWeGameImageSelect(Deserialize<CatWeGameAnswerImageSelectParams>(parameters))),
             "selectCharacter" => Task.FromResult<object?>(SelectCharacter(Deserialize<CatSelectCharacterParams>(parameters))),
+            CatParkTitle.RETURN_METHOD => Task.FromResult<object?>(ReturnTitle()),
+            CatParkTitle.ENTER_METHOD  => Task.FromResult<object?>(EnterCharacter(Deserialize<CatEnterCharacterParams>(parameters))),
             CatJobChannel.METHOD => Task.FromResult<object?>(SetJob(Deserialize<CatSetJobParams>(parameters))),
             _        => throw new CatRpcException(CatRpcException.METHOD_NOT_FOUND, $"未知方法: {method}")
         };
@@ -829,6 +851,88 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         return CatAcceptResult.Ok();
     }
+
+    /// <summary>
+    ///     returnTitle: 角色在世界里时登出回标题界面, 游戏不关、照常守护。立即返回是否接受, 进度经 game.stage 报。
+    /// </summary>
+    public CatAcceptResult ReturnTitle()
+    {
+        ICatGameRunner? current;
+
+        lock (stateLock)
+        {
+            if (pid == null || stage != CatStages.IN_WORLD || closeRequested || runnerFaulted)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "角色不在游戏世界里");
+
+            if (handOffRequested)
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "正在交接停止, 本进程即将退出");
+
+            current = runner;
+
+            if (current == null)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
+
+            if (Interlocked.Exchange(ref parkBusy, 1) == 1)
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "上一次停到标题 / 进角色还没结束");
+        }
+
+        RunPark(() => current.ReturnTitleAsync(this, CancellationToken.None), "停到标题");
+        return CatAcceptResult.Ok();
+    }
+
+    /// <summary>
+    ///     enterCharacter: 游戏停在标题界面时（returnTitle 之后）进角色。立即返回是否接受, 进度经 game.stage 报。
+    /// </summary>
+    public CatAcceptResult EnterCharacter(CatEnterCharacterParams? parameters)
+    {
+        var name      = parameters?.Name?.Trim();
+        var homeWorld = parameters?.HomeWorld?.Trim();
+
+        if (name is { Length: > MAX_CHARACTER_NAME_LENGTH } || homeWorld is { Length: > MAX_HOME_WORLD_LENGTH })
+            return CatAcceptResult.Rejected(CatCodes.INVALID_PARAMS, "name 或 homeWorld 过长");
+
+        ICatGameRunner? current;
+
+        lock (stateLock)
+        {
+            if (pid == null || stage != CatStages.AT_TITLE || closeRequested || runnerFaulted)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "游戏没有停在标题界面");
+
+            if (handOffRequested)
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "正在交接停止, 本进程即将退出");
+
+            current = runner;
+
+            if (current == null)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
+
+            if (Interlocked.Exchange(ref parkBusy, 1) == 1)
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "上一次停到标题 / 进角色还没结束");
+        }
+
+        RunPark(() => current.EnterCharacterAsync(string.IsNullOrEmpty(name) ? null : name, string.IsNullOrEmpty(homeWorld) ? null : homeWorld, this, CancellationToken.None), "从标题进角色");
+        return CatAcceptResult.Ok();
+    }
+
+    private void RunPark(Func<Task> work, string what) =>
+        _ = Task.Run
+        (async () =>
+            {
+                try
+                {
+                    await work().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Serilog.Log.Error(ex, "[CatHost] {What}时出错", what);
+                    Log("error", $"{what}时出错: {ex.Message}");
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref parkBusy, 0);
+                }
+            }
+        );
 
     /// <summary>
     ///     下号: 关掉崩溃重启 → 请游戏自己关闭（超时结束进程）→ 补报 Minion 停机 → game.exited → 本进程退出。
