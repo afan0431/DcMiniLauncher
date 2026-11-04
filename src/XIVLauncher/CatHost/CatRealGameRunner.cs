@@ -1713,18 +1713,149 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         return (launched, dalamudOk, companionAppManager);
     }
 
+    /// <summary>登出后等选角界面出来的上限（游戏自己的登出要几秒, 落到标题时还要再点一次「开始游戏」）</summary>
+    private static readonly TimeSpan ParkTimeout = TimeSpan.FromMinutes(2);
+
+    /// <inheritdoc />
+    public async Task ParkAtCharaSelectAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        var launched = currentProcess;
+
+        if (launched == null || launched.UnderlyingProcess.HasExited)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.CANCELLED, "游戏进程已退出");
+            return;
+        }
+
+        if (dcTravel == null)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这次上号没有开自动进入角色, 停在选角界面后进不回来, 没有登出");
+            return;
+        }
+
+        // 先停掉在看当前角色的那段（它把登出当成异常）, 再占闸连模块
+        lock (cleanupLock)
+        {
+            if (autoEnterCancellations.Remove(launched.ProcessID, out var running))
+                running.Cancel();
+        }
+
+        using var gate = InGame.InGameTravelService.TryEnterGate(launched.ProcessID);
+
+        if (gate == null)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "游戏内模块正被别的操作占着（跨区等）, 没有登出");
+            return;
+        }
+
+        var injectError = InGame.MiniModuleInjector.Inject(launched.UnderlyingProcess);
+
+        if (injectError != null)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, $"注入游戏内模块失败: {injectError}");
+            return;
+        }
+
+        using var module = new InGame.MiniModuleClient(launched.ProcessID);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, closeCts.Token);
+        var       token  = linked.Token;
+
+        try
+        {
+            await module.ConnectAsync(10_000, token).ConfigureAwait(false);
+            reporter.Stage(CatStages.LEAVING_WORLD);
+            Log.Information("[CatHost] 停在选角界面: 角色登出");
+            await InGame.InGameTravelService.LogoutFromWorldAsync(module, token).ConfigureAwait(false);
+
+            // 登出可能直接落在选角界面, 也可能落在标题界面: 落在标题就点「开始游戏」进选角界面（只点一次）
+            var deadline = DateTimeOffset.UtcNow + ParkTimeout;
+            var clicked  = false;
+
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                var where = await module.SendAsync("WHERE", token).ConfigureAwait(false);
+
+                if (where.Contains("where=" + CatModuleReplies.WHERE_CHARA_SELECT, StringComparison.Ordinal))
+                    break;
+
+                if (!clicked && where.Contains("where=" + CatModuleReplies.WHERE_TITLE, StringComparison.Ordinal))
+                {
+                    var ready = await module.SendAsync("TITLEREADY", token).ConfigureAwait(false);
+
+                    if (ready.Contains("ready=1", StringComparison.Ordinal) &&
+                        CatModuleReplies.IsOk(await module.SendAsync("LOGIN", token).ConfigureAwait(false)))
+                    {
+                        clicked = true;
+                        Log.Information("[CatHost] 停在选角界面: 登出落在标题界面, 已点「开始游戏」");
+                    }
+                }
+                else if (!clicked && where.Contains("where=" + CatModuleReplies.WHERE_BUSY, StringComparison.Ordinal))
+                {
+                    await module.SendAsync("SKIPMOVIE", token).ConfigureAwait(false);
+                }
+
+                if (DateTimeOffset.UtcNow >= deadline)
+                {
+                    reporter.AutoEnterStopped(CatAutoEnterStopCodes.TIMEOUT, clicked ? "点了「开始游戏」后两分钟没进选角界面" : "登出后两分钟没到选角界面");
+                    return;
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+            }
+
+            Log.Information("[CatHost] 停在选角界面: 已在选角界面");
+            reporter.Stage(CatStages.AT_CHARA_SELECT);
+        }
+        catch (OperationCanceledException)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.CANCELLED, "收到关闭请求, 没有停在选角界面");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 停在选角界面失败");
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, $"登出没成功: {ex.Message}");
+        }
+    }
+
+    /// <inheritdoc />
+    public Task EnterCharacterAsync(string? name, string? homeWorld, ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    {
+        var launched = currentProcess;
+
+        if (launched == null || launched.UnderlyingProcess.HasExited)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.CANCELLED, "游戏进程已退出");
+            return Task.CompletedTask;
+        }
+
+        if (dcTravel == null)
+        {
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这次上号没有开自动进入角色");
+            return Task.CompletedTask;
+        }
+
+        var target = name == null
+            ? new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, autoEnter?.EnteredContentId)
+            : new CatAutoEnterTarget(name, homeWorld ?? request.CharacterHomeWorld, null);
+
+        Log.Information("[CatHost] 从选角界面进角色");
+        StartAutoEnter(launched, reporter, closeCts.Token, target);
+        return Task.CompletedTask;
+    }
+
     /// <summary>
     ///     在后台自动进入角色（不挡崩溃守护）: 编排 → 之后隔一段时间看一次当前角色。
     ///     带 Minion 的在角色第一次进世界后挂（编排停手后人手动进去的也算）; 没进世界游戏就退了则不挂。
     ///     等人选角色、排队都可能很久, 所以不在启动流程里等; 游戏进程收尾时取消。
     ///     崩溃重启后的新进程接着登录上一次实际进的那个角色。
     /// </summary>
-    private void StartAutoEnter(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken startToken)
+    private void StartAutoEnter(FFXIVProcess launched, ICatLaunchReporter reporter, CancellationToken startToken, CatAutoEnterTarget? target = null)
     {
         var process      = launched.UnderlyingProcess;
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(startToken);
         var game         = new CatAutoEnterRealGame(process, dcTravel!.Client, context.Areas, context.Area.AreaName, RememberEnteredArea);
-        var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, autoEnter?.EnteredContentId)) { ReadBilling = true };
+        var flow         = new CatAutoEnter(game, reporter, target ?? new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, autoEnter?.EnteredContentId)) { ReadBilling = true };
         var token        = cancellation.Token;
 
         autoEnter = flow;

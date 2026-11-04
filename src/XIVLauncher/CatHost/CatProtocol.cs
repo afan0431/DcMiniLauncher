@@ -133,11 +133,18 @@ public static class CatStages
     /// <summary>角色已进入游戏</summary>
     public const string IN_WORLD = "inWorld";
 
+    /// <summary>parkAtCharaSelect: 角色正在登出、回选角界面</summary>
+    public const string LEAVING_WORLD = "leavingWorld";
+
+    /// <summary>parkAtCharaSelect 之后: 角色已登出、游戏停在选角界面, 照常守护, 等 enterCharacter 再进</summary>
+    public const string AT_CHARA_SELECT = "atCharaSelect";
+
     /// <summary>
     ///     游戏进程是否在运行: <see cref="RUNNING" /> 以及它之后的自动进入角色各阶段
     /// </summary>
     public static bool IsGameRunning(string stage) =>
-        stage is RUNNING or ENTERING_LOBBY or SWITCHING_AREA or AWAITING_CHARACTER_CHOICE or ENTERING_WORLD or QUEUEING or IN_WORLD;
+        stage is RUNNING or ENTERING_LOBBY or SWITCHING_AREA or AWAITING_CHARACTER_CHOICE or ENTERING_WORLD or QUEUEING or IN_WORLD
+              or LEAVING_WORLD or AT_CHARA_SELECT;
 }
 
 /// <summary>game.autoEnterStopped 的 code: 自动进入角色停在了哪一类问题上（游戏不关, 交给人手动操作）</summary>
@@ -549,6 +556,24 @@ public static class CatHandOff
     /// <summary>交接成功后发的事件, 载荷 { operationId, pid, processStartedAt }; 之后进程以 <see cref="CatHostRuntime.EXIT_HANDED_OFF" /> 退出</summary>
     public const string EVENT = "game.handedOff";
 }
+
+/// <summary>
+///     parkAtCharaSelect / enterCharacter（停在选角界面再接着进）: 下号不关游戏, 角色登出停在选角界面, 之后同一个号再从选角界面进角色。
+///     不停在标题界面: 标题界面停久了登录不进去。外壳按类型名探测启动器支不支持。
+///     两个方法都立即返回是否接受, 进度经 game.stage 报（leavingWorld → atCharaSelect; 进角色同自动进入角色的各阶段）,
+///     没做成经 game.autoEnterStopped 报。
+/// </summary>
+public static class CatParkCharaSelect
+{
+    /// <summary>登出停在选角界面: 不带参数</summary>
+    public const string PARK_METHOD = "parkAtCharaSelect";
+
+    /// <summary>从选角界面进角色: 参数见 <see cref="CatEnterCharacterParams" /></summary>
+    public const string ENTER_METHOD = "enterCharacter";
+}
+
+/// <summary>enterCharacter 参数: 要进的角色名与原服务器; 都不给就进上一次进过的那个角色</summary>
+public sealed record CatEnterCharacterParams(string? Name, string? HomeWorld);
 
 /// <summary>setJob 参数: job = 服务器生成的 cat-job/1 任务单, 原样转交 Afan</summary>
 public sealed record CatSetJobParams(JsonElement? Job);
