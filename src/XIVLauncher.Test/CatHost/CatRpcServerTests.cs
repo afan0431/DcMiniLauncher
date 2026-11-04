@@ -1572,11 +1572,11 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Fact]
-    public async Task ReturnTitle_IsOnlyAcceptedInWorld_AndEnterCharacterOnlyAtTitle()
+    public async Task ParkAtCharaSelect_IsOnlyAcceptedInWorld_AndEnterCharacterOnlyThere()
     {
         await using var client = await ConnectAndHelloAsync();
 
-        var early = await client.RequestAsync("returnTitle", new { });
+        var early = await client.RequestAsync("parkAtCharaSelect", new { });
         Assert.Equal("notRunning", early["result"]!["code"]!.GetValue<string>());
 
         await client.RequestAsync("launch", new { operationId = "op1", accountName = "acc", dalamud = false, autoEnter = true });
@@ -1584,7 +1584,7 @@ public sealed class CatRpcServerTests : IDisposable
         runner.Reporter!.Started(1234, DateTimeOffset.UtcNow);
         runner.Reporter.Stage(CatStages.RUNNING);
 
-        var notInWorld = await client.RequestAsync("returnTitle", new { });
+        var notInWorld = await client.RequestAsync("parkAtCharaSelect", new { });
         Assert.Equal("notRunning", notInWorld["result"]!["code"]!.GetValue<string>());
 
         var enterEarly = await client.RequestAsync("enterCharacter", new { });
@@ -1592,19 +1592,19 @@ public sealed class CatRpcServerTests : IDisposable
 
         runner.Reporter.Stage(CatStages.IN_WORLD);
 
-        var accepted = await client.RequestAsync("returnTitle", new { });
+        var accepted = await client.RequestAsync("parkAtCharaSelect", new { });
         Assert.True(accepted["result"]!["accepted"]!.GetValue<bool>());
 
-        runner.Reporter.Stage(CatStages.AT_TITLE);
-        Assert.True(CatStages.IsGameRunning(CatStages.AT_TITLE));
+        runner.Reporter.Stage(CatStages.AT_CHARA_SELECT);
+        Assert.True(CatStages.IsGameRunning(CatStages.AT_CHARA_SELECT));
 
         var tooLong = await client.RequestAsync("enterCharacter", new { name = new string('名', CatLaunchHost.MAX_CHARACTER_NAME_LENGTH + 1) });
         Assert.Equal("invalidParams", tooLong["result"]!["code"]!.GetValue<string>());
 
-        var again = await client.RequestAsync("returnTitle", new { });
+        var again = await client.RequestAsync("parkAtCharaSelect", new { });
         Assert.Equal("notRunning", again["result"]!["code"]!.GetValue<string>());
 
-        // returnTitle 的后台活做完才放开（替身立刻做完, 但放开在另一个线程上）
+        // parkAtCharaSelect 的后台活做完才放开（替身立刻做完, 但放开在另一个线程上）
         var enter = await client.RequestAsync("enterCharacter", new { });
 
         for (var i = 0; i < 100 && enter["result"]!["code"]?.GetValue<string>() == "busy"; i++)

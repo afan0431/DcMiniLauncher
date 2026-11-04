@@ -1713,11 +1713,11 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         return (launched, dalamudOk, companionAppManager);
     }
 
-    /// <summary>登出后等标题界面出来的上限（游戏自己的登出要几秒到十几秒）</summary>
-    private static readonly TimeSpan ParkTitleTimeout = TimeSpan.FromMinutes(2);
+    /// <summary>登出后等选角界面出来的上限（游戏自己的登出要几秒, 落到标题时还要再点一次「开始游戏」）</summary>
+    private static readonly TimeSpan ParkTimeout = TimeSpan.FromMinutes(2);
 
     /// <inheritdoc />
-    public async Task ReturnTitleAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    public async Task ParkAtCharaSelectAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
         var launched = currentProcess;
 
@@ -1729,7 +1729,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
         if (dcTravel == null)
         {
-            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这次上号没有开自动进入角色, 停到标题后进不回来, 没有登出");
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这次上号没有开自动进入角色, 停在选角界面后进不回来, 没有登出");
             return;
         }
 
@@ -1764,41 +1764,56 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         {
             await module.ConnectAsync(10_000, token).ConfigureAwait(false);
             reporter.Stage(CatStages.LEAVING_WORLD);
-            Log.Information("[CatHost] 停到标题: 角色登出");
+            Log.Information("[CatHost] 停在选角界面: 角色登出");
             await InGame.InGameTravelService.LogoutFromWorldAsync(module, token).ConfigureAwait(false);
 
-            var deadline = DateTimeOffset.UtcNow + ParkTitleTimeout;
+            // 登出可能直接落在选角界面, 也可能落在标题界面: 落在标题就点「开始游戏」进选角界面（只点一次）
+            var deadline = DateTimeOffset.UtcNow + ParkTimeout;
+            var clicked  = false;
 
             while (true)
             {
                 token.ThrowIfCancellationRequested();
-                var ready = await module.SendAsync("TITLEREADY", token).ConfigureAwait(false);
+                var where = await module.SendAsync("WHERE", token).ConfigureAwait(false);
 
-                if (ready.Contains("ready=1", StringComparison.Ordinal))
+                if (where.Contains("where=" + CatModuleReplies.WHERE_CHARA_SELECT, StringComparison.Ordinal))
                     break;
+
+                if (!clicked && where.Contains("where=" + CatModuleReplies.WHERE_TITLE, StringComparison.Ordinal))
+                {
+                    var ready = await module.SendAsync("TITLEREADY", token).ConfigureAwait(false);
+
+                    if (ready.Contains("ready=1", StringComparison.Ordinal) &&
+                        CatModuleReplies.IsOk(await module.SendAsync("LOGIN", token).ConfigureAwait(false)))
+                    {
+                        clicked = true;
+                        Log.Information("[CatHost] 停在选角界面: 登出落在标题界面, 已点「开始游戏」");
+                    }
+                }
+                else if (!clicked && where.Contains("where=" + CatModuleReplies.WHERE_BUSY, StringComparison.Ordinal))
+                {
+                    await module.SendAsync("SKIPMOVIE", token).ConfigureAwait(false);
+                }
 
                 if (DateTimeOffset.UtcNow >= deadline)
                 {
-                    reporter.AutoEnterStopped(CatAutoEnterStopCodes.TIMEOUT, "登出后两分钟没回到标题界面");
+                    reporter.AutoEnterStopped(CatAutoEnterStopCodes.TIMEOUT, clicked ? "点了「开始游戏」后两分钟没进选角界面" : "登出后两分钟没到选角界面");
                     return;
                 }
 
-                await module.SendAsync("SKIPMOVIE", token).ConfigureAwait(false);
                 await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
             }
 
-            // 标题守卫: 闲置时飘进片头动画就投 ESC 退出来（模块默认就开着, 这里再确认一次）
-            await module.SendAsync("KEEPALIVE ON", token).ConfigureAwait(false);
-            Log.Information("[CatHost] 停到标题: 已在标题界面");
-            reporter.Stage(CatStages.AT_TITLE);
+            Log.Information("[CatHost] 停在选角界面: 已在选角界面");
+            reporter.Stage(CatStages.AT_CHARA_SELECT);
         }
         catch (OperationCanceledException)
         {
-            reporter.AutoEnterStopped(CatAutoEnterStopCodes.CANCELLED, "收到关闭请求, 没有停到标题");
+            reporter.AutoEnterStopped(CatAutoEnterStopCodes.CANCELLED, "收到关闭请求, 没有停在选角界面");
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "[CatHost] 停到标题失败");
+            Log.Warning(ex, "[CatHost] 停在选角界面失败");
             reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, $"登出没成功: {ex.Message}");
         }
     }
@@ -1824,7 +1839,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             ? new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld, autoEnter?.EnteredContentId)
             : new CatAutoEnterTarget(name, homeWorld ?? request.CharacterHomeWorld, null);
 
-        Log.Information("[CatHost] 从标题进角色");
+        Log.Information("[CatHost] 从选角界面进角色");
         StartAutoEnter(launched, reporter, closeCts.Token, target);
         return Task.CompletedTask;
     }

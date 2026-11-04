@@ -232,21 +232,21 @@ public interface ICatGameRunner
     ICatGameExit? GameExit => null;
 
     /// <summary>
-    ///     角色登出回标题界面, 游戏照常守护（停到标题）: 进度经 <see cref="ICatLaunchReporter.Stage" /> 报
-    ///     （<see cref="CatStages.LEAVING_WORLD" /> → <see cref="CatStages.AT_TITLE" />）, 没做成经 <see cref="ICatLaunchReporter.AutoEnterStopped" /> 报
+    ///     角色登出停在选角界面, 游戏照常守护: 进度经 <see cref="ICatLaunchReporter.Stage" /> 报
+    ///     （<see cref="CatStages.LEAVING_WORLD" /> → <see cref="CatStages.AT_CHARA_SELECT" />）, 没做成经 <see cref="ICatLaunchReporter.AutoEnterStopped" /> 报
     /// </summary>
-    Task ReturnTitleAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
+    Task ParkAtCharaSelectAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
-        reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这个启动器不支持停到标题");
+        reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这个启动器不支持停在选角界面");
         return Task.CompletedTask;
     }
 
     /// <summary>
-    ///     从标题界面进角色（停到标题之后）: 同自动进入角色, 目标为空时进上一次进过的那个角色
+    ///     从选角界面进角色（停在选角界面之后）: 同自动进入角色, 目标为空时进上一次进过的那个角色
     /// </summary>
     Task EnterCharacterAsync(string? name, string? homeWorld, ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
-        reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这个启动器不支持从标题进角色");
+        reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, "这个启动器不支持从选角界面进角色");
         return Task.CompletedTask;
     }
 
@@ -414,8 +414,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
             "weGame.confirmSms" => Task.FromResult<object?>(ConfirmWeGameSms(Deserialize<CatWeGameConfirmSmsParams>(parameters))),
             "weGame.answerImageSelect" => Task.FromResult<object?>(AnswerWeGameImageSelect(Deserialize<CatWeGameAnswerImageSelectParams>(parameters))),
             "selectCharacter" => Task.FromResult<object?>(SelectCharacter(Deserialize<CatSelectCharacterParams>(parameters))),
-            CatParkTitle.RETURN_METHOD => Task.FromResult<object?>(ReturnTitle()),
-            CatParkTitle.ENTER_METHOD  => Task.FromResult<object?>(EnterCharacter(Deserialize<CatEnterCharacterParams>(parameters))),
+            CatParkCharaSelect.PARK_METHOD  => Task.FromResult<object?>(ParkAtCharaSelect()),
+            CatParkCharaSelect.ENTER_METHOD => Task.FromResult<object?>(EnterCharacter(Deserialize<CatEnterCharacterParams>(parameters))),
             CatJobChannel.METHOD => Task.FromResult<object?>(SetJob(Deserialize<CatSetJobParams>(parameters))),
             _        => throw new CatRpcException(CatRpcException.METHOD_NOT_FOUND, $"未知方法: {method}")
         };
@@ -853,9 +853,9 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
     }
 
     /// <summary>
-    ///     returnTitle: 角色在世界里时登出回标题界面, 游戏不关、照常守护。立即返回是否接受, 进度经 game.stage 报。
+    ///     parkAtCharaSelect: 角色在世界里时登出、停在选角界面, 游戏不关、照常守护。立即返回是否接受, 进度经 game.stage 报。
     /// </summary>
-    public CatAcceptResult ReturnTitle()
+    public CatAcceptResult ParkAtCharaSelect()
     {
         ICatGameRunner? current;
 
@@ -873,15 +873,15 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
 
             if (Interlocked.Exchange(ref parkBusy, 1) == 1)
-                return CatAcceptResult.Rejected(CatCodes.BUSY, "上一次停到标题 / 进角色还没结束");
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "上一次停在选角界面 / 进角色还没结束");
         }
 
-        RunPark(() => current.ReturnTitleAsync(this, CancellationToken.None), "停到标题");
+        RunPark(() => current.ParkAtCharaSelectAsync(this, CancellationToken.None), "停在选角界面");
         return CatAcceptResult.Ok();
     }
 
     /// <summary>
-    ///     enterCharacter: 游戏停在标题界面时（returnTitle 之后）进角色。立即返回是否接受, 进度经 game.stage 报。
+    ///     enterCharacter: 游戏停在选角界面时（parkAtCharaSelect 之后）进角色。立即返回是否接受, 进度经 game.stage 报。
     /// </summary>
     public CatAcceptResult EnterCharacter(CatEnterCharacterParams? parameters)
     {
@@ -895,8 +895,8 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
 
         lock (stateLock)
         {
-            if (pid == null || stage != CatStages.AT_TITLE || closeRequested || runnerFaulted)
-                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "游戏没有停在标题界面");
+            if (pid == null || stage != CatStages.AT_CHARA_SELECT || closeRequested || runnerFaulted)
+                return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "游戏没有停在选角界面");
 
             if (handOffRequested)
                 return CatAcceptResult.Rejected(CatCodes.BUSY, "正在交接停止, 本进程即将退出");
@@ -907,10 +907,10 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
                 return CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有运行中的游戏");
 
             if (Interlocked.Exchange(ref parkBusy, 1) == 1)
-                return CatAcceptResult.Rejected(CatCodes.BUSY, "上一次停到标题 / 进角色还没结束");
+                return CatAcceptResult.Rejected(CatCodes.BUSY, "上一次停在选角界面 / 进角色还没结束");
         }
 
-        RunPark(() => current.EnterCharacterAsync(string.IsNullOrEmpty(name) ? null : name, string.IsNullOrEmpty(homeWorld) ? null : homeWorld, this, CancellationToken.None), "从标题进角色");
+        RunPark(() => current.EnterCharacterAsync(string.IsNullOrEmpty(name) ? null : name, string.IsNullOrEmpty(homeWorld) ? null : homeWorld, this, CancellationToken.None), "从选角界面进角色");
         return CatAcceptResult.Ok();
     }
 
