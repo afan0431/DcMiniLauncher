@@ -354,7 +354,7 @@ internal sealed class RecordingReporter : ICatLaunchReporter
 }
 
 /// <summary>
-///     记录调用、不接硬件的假硬件键鼠。遇硬件键盘打不出的字符（非 US-ASCII 可打印）照真实实现返回 false
+///     记录调用、不接硬件的假硬件键盘。遇硬件键盘打不出的字符（非 US-ASCII 可打印）照真实实现返回 false
 /// </summary>
 internal sealed class StubHidKeyboard : ICatHidKeyboard
 {
@@ -364,12 +364,11 @@ internal sealed class StubHidKeyboard : ICatHidKeyboard
 
     public StringBuilder Typed { get; } = new();
 
+    /// <summary>按过的键, 连按几下就记几条</summary>
     public List<(HidModifiers Modifiers, HidKey Key)> Presses { get; } = [];
 
-    public List<(int X, int Y)> Clicks { get; } = [];
-
-    /// <summary>每次点击后回调（测试用它在某个坐标被点时翻转登录状态）</summary>
-    public Action<int, int>? OnClick { get; set; }
+    /// <summary>每打一个字之后回调（测试用它在打字途中抢走前台 / 焦点）</summary>
+    public Action<char>? OnType { get; set; }
 
     public string? PortName => OpenResult ? "COM-TEST" : null;
 
@@ -384,61 +383,80 @@ internal sealed class StubHidKeyboard : ICatHidKeyboard
         if (!CatHid9329Protocol.CanType(text))
             return Task.FromResult(false);
 
-        Typed.Append(text);
+        foreach (var c in text)
+        {
+            Typed.Append(c);
+            OnType?.Invoke(c);
+        }
+
         return Task.FromResult(true);
     }
 
-    public Task PressAsync(HidModifiers modifiers, HidKey key, CancellationToken ct)
+    public Task PressAsync(HidModifiers modifiers, HidKey key, CancellationToken ct, int count = 1)
     {
-        Presses.Add((modifiers, key));
-        return Task.CompletedTask;
-    }
+        for (var i = 0; i < count; i++)
+            Presses.Add((modifiers, key));
 
-    public Task ClickAsync(int screenX, int screenY, int screenWidth, int screenHeight, CancellationToken ct)
-    {
-        Clicks.Add((screenX, screenY));
-        OnClick?.Invoke(screenX, screenY);
         return Task.CompletedTask;
     }
 }
 
 /// <summary>
-///     假的前台窗口操作。SignedIn 翻 true 后登录窗消失、主窗口出现; InterruptUntilCheck 控制前几次核对前台返回 false（模拟前台被抢走）
+///     假的前台与焦点操作。SignedIn 翻 true 后登录窗消失; ForegroundLostUntil / PasswordFocusLostUntil 控制前几次核对返回 false（模拟被抢走）;
+///     GameStarted 翻 true 后算游戏的登录组件已起来
 /// </summary>
 internal sealed class StubWeGameForeground : ICatWeGameForeground
 {
-    private int checks;
+    private int foregroundChecks;
+    private int passwordChecks;
 
     public CatWeGameWindowRect? Login { get; set; } = new(0, 0, 1210, 680);
 
-    public CatWeGameWindowRect? Main { get; set; } = new(0, 0, 1600, 900);
-
-    public CatScreenSize Screen { get; set; } = new(1920, 1080);
-
     public bool SignedIn { get; set; }
 
+    /// <summary>切前台成不成功</summary>
+    public bool FocusResult { get; set; } = true;
+
     /// <summary>前几次 <see cref="LoginWindowIsForeground" /> 返回 false, 之后一直 true</summary>
-    public int InterruptUntilCheck { get; set; }
+    public int ForegroundLostUntil { get; set; }
+
+    /// <summary>前几次 <see cref="PasswordBoxFocused" /> 返回 false, 之后一直 true</summary>
+    public int PasswordFocusLostUntil { get; set; }
+
+    /// <summary>密码框露没露出来（在不在账号密码页）</summary>
+    public bool PasswordVisible { get; set; } = true;
+
+    public bool GameStarted { get; set; }
 
     public int FocusCount { get; private set; }
 
-    public CatWeGameWindowRect? LoginWindow() => SignedIn ? null : Login;
+    public int PasswordFocusCount { get; private set; }
 
-    public CatWeGameWindowRect? MainWindow() => SignedIn ? Main : null;
+    public CatWeGameWindowRect? LoginWindow() => SignedIn ? null : Login;
 
     public bool FocusLoginWindow()
     {
         FocusCount++;
-        return Login != null;
+        return LoginWindow() != null && FocusResult;
     }
 
-    public bool LoginWindowIsForeground() => ++checks > InterruptUntilCheck;
+    public bool LoginWindowIsForeground() => ++foregroundChecks > ForegroundLostUntil;
 
-    public CatScreenSize PrimaryScreen() => Screen;
+    public bool PasswordBoxVisible() => !SignedIn && PasswordVisible;
+
+    public bool FocusPasswordBox()
+    {
+        PasswordFocusCount++;
+        return PasswordBoxVisible();
+    }
+
+    public bool PasswordBoxFocused() => ++passwordChecks > PasswordFocusLostUntil;
+
+    public bool GameLoginStartedSince(DateTime since) => GameStarted;
 }
 
 /// <summary>
-///     假的 WeGame 屏幕操作。页面判断 / 密码错用可设的值或探针, 截窗可以换成探针（测试驱动状态变化）
+///     假的 WeGame 屏幕操作。截窗可以换成探针（测试驱动状态变化）; 主界面状态与选大区对话框可设, 点击都记下来
 /// </summary>
 internal sealed class StubWeGameScreen : ICatWeGameScreen
 {
@@ -447,19 +465,37 @@ internal sealed class StubWeGameScreen : ICatWeGameScreen
     /// <summary>设了就由它给出每次截窗的结果, 不看 <see cref="Window" /></summary>
     public Func<CatWeGameLoginWindow?>? CaptureProbe { get; set; }
 
-    public bool? QqPasswordPage { get; set; } = true;
+    /// <summary>主界面; 默认没出来</summary>
+    public CatWeGameMainWindow? Main { get; set; }
 
-    public bool AccountIsMatch { get; set; }
+    /// <summary>设了就由它给出主界面, 不看 <see cref="Main" /></summary>
+    public Func<CatWeGameMainWindow?>? MainProbe { get; set; }
+
+    public bool RegionDialogOpen { get; set; }
+
+    public int RegionConfirms { get; private set; }
 
     public Func<bool> PasswordRejectedProbe { get; set; } = () => false;
 
     public List<(int X, int Y)> Clicks { get; } = [];
+
+    public List<(int X, int Y)> MainClicks { get; } = [];
+
+    /// <summary>点登录窗口时回调</summary>
+    public Action<int, int>? OnClick { get; set; }
+
+    /// <summary>点主界面时回调</summary>
+    public Action<int, int>? OnMainClick { get; set; }
+
+    /// <summary>确认选大区时回调</summary>
+    public Action? OnRegionConfirm { get; set; }
 
     public CatWeGameLoginWindow? CaptureLoginWindow() => CaptureProbe != null ? CaptureProbe() : Window;
 
     public bool ClickLoginWindow(int x, int y)
     {
         Clicks.Add((x, y));
+        OnClick?.Invoke(x, y);
         return Window != null;
     }
 
@@ -467,9 +503,24 @@ internal sealed class StubWeGameScreen : ICatWeGameScreen
 
     public bool ConfirmSmsPrompt() => false;
 
-    public bool? OnQqPasswordPage() => QqPasswordPage;
+    public CatWeGameMainWindow? CaptureMainWindow() => MainProbe != null ? MainProbe() : Main;
 
-    public bool AccountMatches(string account) => AccountIsMatch;
+    public bool ClickMainWindow(int x, int y)
+    {
+        MainClicks.Add((x, y));
+        OnMainClick?.Invoke(x, y);
+        return true;
+    }
+
+    public bool ConfirmRegionDialog()
+    {
+        if (!RegionDialogOpen)
+            return false;
+
+        RegionConfirms++;
+        OnRegionConfirm?.Invoke();
+        return true;
+    }
 
     public bool PasswordRejected() => PasswordRejectedProbe();
 }

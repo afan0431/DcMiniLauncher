@@ -84,16 +84,6 @@ public sealed class CatHid9329Tests
         Assert.Equal(expected, CatHid9329Protocol.CanType(text));
     }
 
-    [Theory]
-    [InlineData(0, 2560, 0)]
-    [InlineData(2560, 2560, 4095)]
-    [InlineData(1280, 2560, 2048)]
-    [InlineData(100, 0, 0)]
-    public void ToAbs_ScalesPixelToFullScale(int pixel, int span, int expected)
-    {
-        Assert.Equal(expected, CatHid9329Protocol.ToAbs(pixel, span));
-    }
-
     [Fact]
     public void IsInfoReply_AcceptsValidReply_RejectsGarbage()
     {

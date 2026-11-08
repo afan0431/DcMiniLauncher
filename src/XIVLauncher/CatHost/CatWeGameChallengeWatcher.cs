@@ -176,15 +176,22 @@ public interface ICatWeGameScreen
     bool ConfirmSmsPrompt();
 
     /// <summary>
-    ///     当前登录窗口在不在 QQ 账号密码页（密码框可见）: true = 在, false = 明确不在, null = 认不出（硬件自动登录用, 图像特征阈值留实机核对）
+    ///     截取登录后的 WeGame 主界面并认「启动」与协议勾选框; 主界面还没出来时返回 null（硬件自动登录用）
     /// </summary>
-    bool? OnQqPasswordPage() =>
+    CatWeGameMainWindow? CaptureMainWindow() =>
         null;
 
     /// <summary>
-    ///     账号下拉框当前是不是已经填着这个号（是就不用清空重输）; 认不出时返回 false, 宁可清空重输（硬件自动登录用）
+    ///     在主界面的客户区坐标上点一下（不移动鼠标、不改变前台）; 主界面不在时返回 false
     /// </summary>
-    bool AccountMatches(string account) =>
+    bool ClickMainWindow(int x, int y) =>
+        false;
+
+    /// <summary>
+    ///     首次点「启动」后弹出的「区服状态」选大区对话框在的话, 按默认选中的大区点「确定」, 返回 true; 不在时返回 false。
+    ///     选哪个大区不影响上号: 登录信息在游戏的登录组件里就取走了, 进哪个服由工作台下发
+    /// </summary>
+    bool ConfirmRegionDialog() =>
         false;
 
     /// <summary>
