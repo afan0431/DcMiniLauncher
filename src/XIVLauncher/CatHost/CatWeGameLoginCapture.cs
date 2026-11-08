@@ -122,7 +122,7 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
 
     /// <summary>
     ///     本机外接的硬件键鼠; 设了才会对 QQ 账号密码方式的号自动输入账号密码（见 <see cref="CatWeGameHwLogin" />）, 为 null 时一律等员工手动。
-    ///     接着硬件时点登录窗里的弹窗（图片验证码、重新验证）也用硬件鼠标
+    ///     硬件只用来打字, 所有点击都发后台鼠标消息, 不动鼠标
     /// </summary>
     public ICatHidKeyboard? Keyboard { get; init; }
 
@@ -557,7 +557,7 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
     }
 
     /// <summary>
-    ///     WeGame 已拉起: 开始看它的窗口（没给 <see cref="Screen" /> 时不看）。点弹窗时接了硬件键鼠用硬件鼠标, 否则发后台鼠标消息;
+    ///     WeGame 已拉起: 开始看它的窗口（没给 <see cref="Screen" /> 时不看）。点弹窗发后台鼠标消息;
     ///     popupOnly = 先只看弹窗（硬件自动登录期间）
     /// </summary>
     private Task StartWatcher(CatLaunchRequest request, ICatLaunchReporter reporter, bool popupOnly, CancellationToken cancellationToken)
@@ -565,7 +565,7 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
         if (Screen == null)
             return Task.CompletedTask;
 
-        var clicker = new CatWeGameClicker(Screen, Keyboard, Foreground);
+        var clicker = new CatWeGameScreenClicker(Screen);
         var created = WatchInterval is { } interval
                           ? new CatWeGameChallengeWatcher(Screen, reporter, redactor, request.WeGameScan) { Interval = interval, ClickSettle = interval, Clicker = clicker }
                           : new CatWeGameChallengeWatcher(Screen, reporter, redactor, request.WeGameScan) { Clicker = clicker };

@@ -32,6 +32,9 @@ public enum HidKey : byte
 
     /// <summary>Delete</summary>
     Delete = 0x4C,
+
+    /// <summary>End（光标移到行尾）</summary>
+    End = 0x4D,
 }
 
 /// <summary>硬件键盘的修饰键 (USB HID 第 1 字节的位)</summary>
@@ -52,7 +55,7 @@ public enum HidModifiers : byte
 }
 
 /// <summary>
-///     本机外接的硬件键鼠 (CH9329): 对当前前台窗口模拟真实的键盘输入和鼠标点击。
+///     本机外接的硬件键鼠 (CH9329): 对当前前台窗口模拟真实的键盘输入（只用键盘, 不动鼠标）。
 ///     <para>
 ///         WeGame 的密码框有安全键盘, 软件模拟的按键 (SendInput 等) 打不进去;
 ///         硬件键鼠在操作系统看来就是一套真实的 USB 键鼠, 所以能打进去。见 task 10-16。
@@ -73,11 +76,8 @@ public interface ICatHidKeyboard
     /// </summary>
     Task<bool> TypeTextAsync(string text, CancellationToken ct);
 
-    /// <summary>按下并抬起一个 (带修饰键的) 按键, 如 Ctrl+A、Delete</summary>
-    Task PressAsync(HidModifiers modifiers, HidKey key, CancellationToken ct);
-
-    /// <summary>在主屏的某个像素位置点一下左键 (绝对定位)</summary>
-    Task ClickAsync(int screenX, int screenY, int screenWidth, int screenHeight, CancellationToken ct);
+    /// <summary>按下并抬起一个 (带修饰键的) 按键 <paramref name="count" /> 次, 如 Ctrl+A、Delete、连按退格</summary>
+    Task PressAsync(HidModifiers modifiers, HidKey key, CancellationToken ct, int count = 1);
 }
 
 /// <summary>和硬件之间收发字节的底层通道, 抽出来好让测试不接真串口</summary>
@@ -109,16 +109,12 @@ internal static class CatHid9329Protocol
     /// <summary>串口波特率 (CH9329 出厂默认)</summary>
     internal const int BAUD_RATE = 9600;
 
-    /// <summary>鼠标绝对坐标的满量程</summary>
-    internal const int ABS_FULL_SCALE = 4096;
-
     private const byte H0 = 0x57;
     private const byte H1 = 0xAB;
     private const byte ADDR = 0x00;
 
     private const byte CMD_GET_INFO = 0x01;
     private const byte CMD_KEYBOARD = 0x02;
-    private const byte CMD_MOUSE_ABS = 0x04;
 
     private const byte REPLY_GET_INFO = 0x81;
 
@@ -138,28 +134,6 @@ internal static class CatHid9329Protocol
 
     /// <summary>所有键抬起</summary>
     internal static byte[] KeyboardReleaseFrame() => Frame(CMD_KEYBOARD, new byte[8]);
-
-    /// <summary>一帧鼠标绝对移动 + 左键状态 (button: 0 抬起, 1 左键按下)</summary>
-    internal static byte[] MouseAbsFrame(byte button, int absX, int absY)
-    {
-        var data = new byte[]
-        {
-            0x02, // 绝对坐标模式
-            button,
-            (byte)(absX & 0xFF), (byte)((absX >> 8) & 0xFF),
-            (byte)(absY & 0xFF), (byte)((absY >> 8) & 0xFF),
-            0x00 // 滚轮
-        };
-        return Frame(CMD_MOUSE_ABS, data);
-    }
-
-    /// <summary>屏幕像素 → 0..4095 绝对坐标</summary>
-    internal static int ToAbs(int pixel, int span)
-    {
-        if (span <= 0) return 0;
-        var v = (int)((long)pixel * ABS_FULL_SCALE / span);
-        return Math.Clamp(v, 0, ABS_FULL_SCALE - 1);
-    }
 
     /// <summary>收到的字节是不是一帧合法的 GET_INFO 应答</summary>
     internal static bool IsInfoReply(byte[] bytes)
@@ -420,20 +394,11 @@ public sealed class CatHid9329(ICatHidTransport? transport = null) : ICatHidKeyb
     }
 
     /// <inheritdoc />
-    public Task PressAsync(HidModifiers modifiers, HidKey key, CancellationToken ct) =>
-        RunExclusiveAsync(port => Tap(port, modifiers, key, ct), ct);
-
-    /// <inheritdoc />
-    public Task ClickAsync(int screenX, int screenY, int screenWidth, int screenHeight, CancellationToken ct) =>
+    public Task PressAsync(HidModifiers modifiers, HidKey key, CancellationToken ct, int count = 1) =>
         RunExclusiveAsync(port =>
         {
-            var absX = CatHid9329Protocol.ToAbs(screenX, screenWidth);
-            var absY = CatHid9329Protocol.ToAbs(screenY, screenHeight);
-            port.Write(CatHid9329Protocol.MouseAbsFrame(0x00, absX, absY)); // 先移动到位
-            SleepOrThrow(ct);
-            port.Write(CatHid9329Protocol.MouseAbsFrame(0x01, absX, absY)); // 左键按下
-            SleepOrThrow(ct);
-            port.Write(CatHid9329Protocol.MouseAbsFrame(0x00, absX, absY)); // 左键抬起
+            for (var i = 0; i < count; i++)
+                Tap(port, modifiers, key, ct);
         }, ct);
 
     private void Tap(ICatHidPort port, HidModifiers modifiers, HidKey key, CancellationToken ct)

@@ -1,7 +1,5 @@
-using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Serilog;
@@ -96,7 +94,7 @@ public sealed class CatZxingQrCodec : ICatWeGameQrCodec
 /// <summary>
 ///     等 WeGame 登录期间对本机屏幕的真实操作。
 ///     <para>
-///         登录窗口: wegame 进程里类名 TWINCONTROL、标题正好是「WeGame」的可见顶层窗口（登录后的主窗口标题是「Wegame」, 不算）。
+///         登录窗口、选大区对话框、登录后的主界面怎么认见 <see cref="CatWeGameWindows" />。
 ///         截取用 PrintWindow, 窗口不在最前面也截得到; 点击用给窗口发鼠标消息的办法, 不移动鼠标、不改变前台窗口。
 ///     </para>
 ///     <para>设备验证窗口的读取和点击还没有实现（要等那个窗口出现后做过检查才知道怎么读）: 一律当作没有这个窗口。</para>
@@ -104,10 +102,6 @@ public sealed class CatZxingQrCodec : ICatWeGameQrCodec
 /// </summary>
 public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScreen
 {
-    private const string LOGIN_PROCESS_NAME = "wegame";
-    private const string LOGIN_WINDOW_CLASS = "TWINCONTROL";
-    private const string LOGIN_WINDOW_TITLE = "WeGame";
-
     private const uint PW_RENDERFULLCONTENT = 0x00000002;
     private const uint WM_MOUSEMOVE         = 0x0200;
     private const uint WM_LBUTTONDOWN       = 0x0201;
@@ -119,6 +113,14 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
     private const uint SWP_NOACTIVATE       = 0x0010;
 
     private static readonly IntPtr HWND_BOTTOM = 1;
+
+    /// <summary>主界面是网页做的: 鼠标移过去停一下按钮才认点击</summary>
+    private static readonly TimeSpan MainHover = TimeSpan.FromMilliseconds(80);
+
+    /// <summary>选大区对话框「确定」按钮（按 720×540 量）</summary>
+    private static readonly (int X, int Y) RegionConfirm = (127, 502);
+
+    private static readonly (int W, int H) RegionDesign = (720, 540);
 
     private const int BITMAP_INFO_HEADER_SIZE = 40;
 
@@ -273,19 +275,44 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
     public bool ConfirmSmsPrompt() =>
         false;
 
+    /// <inheritdoc />
+    public CatWeGameMainWindow? CaptureMainWindow()
+    {
+        var window = CatWeGameWindows.FindMainWindow();
+
+        if (window == IntPtr.Zero || CatWeGameWindows.ClientSize(window) is not { } client)
+            return null;
+
+        if (!TryCapture(window, out var pixels, out var width, out var height) || ClientOffset(window) is not { } offset)
+            return null;
+
+        var cropped = CropClient(pixels, width, height, offset.X, offset.Y, client.Width, client.Height);
+        return cropped == null ? null : CatWeGameMainReader.Read(cropped, client.Width, client.Height);
+    }
+
+    /// <inheritdoc />
+    public bool ClickMainWindow(int x, int y)
+    {
+        var window = CatWeGameWindows.FindMainWindow();
+        return window != IntPtr.Zero && CatWeGameWindows.PostClick(CatWeGameWindows.MainInputWindow(window), x, y, MainHover);
+    }
+
+    /// <inheritdoc />
+    public bool ConfirmRegionDialog()
+    {
+        var dialog = CatWeGameWindows.FindRegionDialog();
+
+        if (dialog == IntPtr.Zero || CatWeGameWindows.ClientSize(dialog) is not { } client)
+            return false;
+
+        var (x, y) = (RegionConfirm.X * client.Width / RegionDesign.W, RegionConfirm.Y * client.Height / RegionDesign.H);
+        return CatWeGameWindows.PostClick(dialog, x, y, TimeSpan.Zero);
+    }
+
     /// <summary>
-    ///     硬件自动登录要用到的页面判断（账号密码页、密码错误）。这几项的图像特征（密码框边框、「登录」橙块、错误提示的位置与颜色）
-    ///     要在接了 CH9329 的挂机电脑上对 StartFor 拉起的 1210×680 窗口实机核对后再定阈值（见 window-geometry.md 待实测项）。
-    ///     核对前一律返回「认不出」的保守值: 导航时按在页上继续试、不误报密码错, 自动登录走不通就按超时退回员工手动。
+    ///     登录窗口上有没有「密码错误」之类的提示。还没在真实画面上见过密码错的样子, 先一律返回 false:
+    ///     密码错时按等登录结果超时退回员工手动
     /// </summary>
-    public bool? OnQqPasswordPage() =>
-        null;
-
-    /// <inheritdoc />
-    public bool AccountMatches(string account) =>
-        false;
-
-    /// <inheritdoc />
     public bool PasswordRejected() =>
         false;
 
@@ -473,55 +500,8 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         return panel;
     }
 
-    private static IntPtr FindLoginWindow()
-    {
-        var found = IntPtr.Zero;
-
-        EnumWindows
-        (
-            (window, _) =>
-            {
-                if (!IsWindowVisible(window) || GetClassNameOf(window) != LOGIN_WINDOW_CLASS || GetTitleOf(window) != LOGIN_WINDOW_TITLE || !BelongsToWeGame(window))
-                    return true;
-
-                found = window;
-                return false;
-            },
-            IntPtr.Zero
-        );
-
-        return found;
-    }
-
-    private static bool BelongsToWeGame(IntPtr window)
-    {
-        GetWindowThreadProcessId(window, out var pid);
-
-        if (pid == 0)
-            return false;
-
-        try
-        {
-            using var process = Process.GetProcessById((int)pid);
-            return string.Equals(process.ProcessName, LOGIN_PROCESS_NAME, StringComparison.OrdinalIgnoreCase);
-        }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
-        {
-            return false;
-        }
-    }
-
-    private static string GetClassNameOf(IntPtr window)
-    {
-        var buffer = new StringBuilder(256);
-        return GetClassNameW(window, buffer, buffer.Capacity) > 0 ? buffer.ToString() : string.Empty;
-    }
-
-    private static string GetTitleOf(IntPtr window)
-    {
-        var buffer = new StringBuilder(256);
-        return GetWindowTextW(window, buffer, buffer.Capacity) > 0 ? buffer.ToString() : string.Empty;
-    }
+    private static IntPtr FindLoginWindow() =>
+        CatWeGameWindows.FindLoginWindow();
 
     /// <summary>
     ///     把整个窗口画到内存里的位图上, 取出像素
@@ -587,8 +567,6 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
         }
     }
 
-    private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
-
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT
     {
@@ -624,12 +602,6 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
     }
 
     [DllImport("user32.dll")]
-    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
-
-    [DllImport("user32.dll")]
-    private static extern bool IsWindowVisible(IntPtr window);
-
-    [DllImport("user32.dll")]
     private static extern bool IsIconic(IntPtr window);
 
     [DllImport("user32.dll")]
@@ -637,15 +609,6 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
 
     [DllImport("user32.dll")]
     private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern int GetClassNameW(IntPtr window, StringBuilder className, int maxCount);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern int GetWindowTextW(IntPtr window, StringBuilder text, int maxCount);
-
-    [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
 
     [DllImport("user32.dll")]
     private static extern bool GetWindowRect(IntPtr window, out RECT rect);
