@@ -224,6 +224,13 @@ namespace offsets
     inline constexpr uintptr_t ADDON_SELECT_PROMPT_TEXT = 0x238;  // AtkTextNode*
     inline constexpr uintptr_t ATK_TEXT_NODE_NODE_TEXT  = 0xD0;   // AtkTextNode.cs:22 Utf8String。静态: 否  实机: 否
 
+    // AtkUnitBase.UldManager 与其中的节点表、节点类型（与 BILLING 读选角界面文字节点用的同一组, 实机: 是（11-01 读到计费原文））
+    inline constexpr uintptr_t ATK_UNIT_BASE_ULD_MANAGER = 0x28;
+    inline constexpr uintptr_t ATK_ULD_NODE_COUNT        = 0x42;  // ushort
+    inline constexpr uintptr_t ATK_ULD_NODE_LIST         = 0x50;  // AtkResNode**
+    inline constexpr uintptr_t ATK_RES_NODE_TYPE         = 0x40;  // ushort
+    inline constexpr unsigned short ATK_NODE_TYPE_TEXT   = 3;
+
     // AtkValue.cs:3-15 —— 类型的低 4 位; 0x20 是 Managed 标志
     inline constexpr unsigned ATK_VALUE_TYPE_MASK         = 0xF;
     inline constexpr unsigned ATK_VALUE_TYPE_STRING       = 0x8;

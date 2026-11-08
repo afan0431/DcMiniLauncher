@@ -11,7 +11,7 @@
 #include <string>
 
 // 模块版本, 通过 pipe 的 VERSION 命令回给启动器, 便于确认注进去的是哪一版
-#define MINIMODULE_VERSION "0.10.0"
+#define MINIMODULE_VERSION "0.11.0"
 
 // ---- 模式 (dllmain.cpp) -------------------------------------------------------
 // 只读模式: 启动器只为读角色和等级而注入时, 注入前写 <ProgramData>\DcMiniLauncher\module-<pid>.mode（readonly）,
@@ -76,7 +76,7 @@ std::string GameDuty();         // 只读: 角色是否在副本中（Conditions
 std::string GameBilling();      // 只读: 选角界面 _CharaSelectRemain 里含「月卡」/「点卡」的文字原文; 格式见 game.cpp
 std::string GameSelectCharacter(const std::string& who); // 当前服务器的角色列表里选中（高亮）, 不进入
 std::string GameEnterCharacter(const std::string& who);  // 选中并回读确认后左键点击角色: 客户端自己检查并弹登录确认框
-std::string GameDialog(const std::string& arguments);    // "YES <contentId>" 点登录确认框的「是」; "NO"; "OK" 点错误框或确定框（排队提示不点）
+std::string GameDialog(const std::string& arguments);    // "YES <contentId>" 点登录确认框的「是」; "NO"; "OK" 点错误框或确定框（排队提示不点）; "NOTICE" 点大厅的提示确定框（排队提示不点）
 std::string GameSkipMovie(); // 给游戏窗口投 ESC 结束片头动画, 等到界面可操作为止
 // 游戏内登出到角色选择界面。direct=false 走 /logout 文本命令 + 确认框（等同玩家操作, 最保守);
 // direct=true 直接调 AgentLobby::HandleLogout（更底层, 不弹确认框)

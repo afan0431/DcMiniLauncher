@@ -1,4 +1,4 @@
-﻿# MiniLauncherModule 离线冒烟: 不开游戏, 用假宿主 (testhost.exe) 把整条链子跑一遍
+# MiniLauncherModule 离线冒烟: 不开游戏, 用假宿主 (testhost.exe) 把整条链子跑一遍
 #
 #   powershell -ExecutionPolicy Bypass -File src\XIVLauncher.MiniModule\test\run-gate-test.ps1
 #
@@ -242,7 +242,7 @@ try
         $unknown = Send-ModuleCommand -Pipe $pipe -Command 'NOSUCHCOMMAND'
         if ($unknown -ne 'FAIL unknown-command') { $failures += "未知命令的回应不对: $unknown" }
 
-        if ($version -notmatch 'version=0\.10\.0 ') { $failures += "模块版本不是 0.10.0: $version" }
+        if ($version -notmatch 'version=0\.11\.0 ') { $failures += "模块版本不是 0.11.0: $version" }
         if ($version -notmatch 'mode=readonly ') { $failures += "模块没有读到只读模式文件: $version" }
 
         # 自动选角的命令: 假宿主不是游戏, 特征码一条都命中不了, 每条都必须安全地回 FAIL, 宿主不能挂
@@ -287,7 +287,7 @@ try
             Write-Host "心跳 → hooked=$($heartbeat.hooked) lastError=$($heartbeat.lastError)"
             if ($heartbeat.hooked -ne $false) { $failures += "心跳 hooked 应为 false: $($heartbeat.hooked)" }
             if ($heartbeat.pid -ne $process.Id) { $failures += "心跳 pid 不对: $($heartbeat.pid)" }
-            if ($heartbeat.moduleVersion -ne '0.10.0') { $failures += "心跳 moduleVersion 不对: $($heartbeat.moduleVersion)" }
+            if ($heartbeat.moduleVersion -ne '0.11.0') { $failures += "心跳 moduleVersion 不对: $($heartbeat.moduleVersion)" }
             if ("$($heartbeat.lastError)" -notmatch '找不到 FileInterface::OpenFile') { $failures += "心跳 lastError 没写明原因: $($heartbeat.lastError)" }
         }
 

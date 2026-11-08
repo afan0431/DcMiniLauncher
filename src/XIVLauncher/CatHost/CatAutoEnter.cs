@@ -124,6 +124,20 @@ public sealed class CatAutoEnterTimings
     /// </summary>
     public TimeSpan ReadTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    ///     注入后最多等模块的管道多久: 模块按顺序装好各处钩子才开管道, 游戏刚起来主线程忙时要 3～10 秒（实测 11-08 一次 10.3 秒）;
+    ///     期间连不上管道隔 <see cref="ModuleReadyPoll" /> 再问
+    /// </summary>
+    public TimeSpan ModuleReadyTimeout { get; init; } = TimeSpan.FromSeconds(90);
+
+    /// <summary>
+    ///     被告知角色还没下线后, 第几次重新登录前各等多久; 用完还不行就停手。依据: 10-18 ~ 11-07 八次里能进的都在提示后 30～75 秒内进了游戏
+    /// </summary>
+    public IReadOnlyList<TimeSpan> RelogDelays { get; init; } = [TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60)];
+
+    /// <summary>等模块管道期间两次连接之间的间隔</summary>
+    public TimeSpan ModuleReadyPoll { get; init; } = TimeSpan.FromSeconds(1);
+
     /// <summary>读职业等级要用的模块注入失败后, 隔多久再试</summary>
     public TimeSpan AttachRetryInterval { get; init; } = TimeSpan.FromSeconds(60);
 
@@ -150,6 +164,12 @@ public sealed class CatAutoEnter
     ///     这种框替人答一次（实机 2026-10-30 起; 之前一律停下交给人, 三台机器上停过）。
     /// </summary>
     public const string FANTASIA_PROMPT = "重新编辑角色形象";
+
+    /// <summary>
+    ///     登录角色时服务器说角色还没下线的确定框里有这一句（实机原话「上次该角色退出时系统出现异常，或正在通过其他客户端登录，已强制令该角色下线。
+    ///     稍等片刻即可进行重新登录。」）: 点掉后按 <see cref="CatAutoEnterTimings.RelogDelays" /> 等一会儿重新登录
+    /// </summary>
+    public const string FORCED_LOGOUT_PROMPT = "强制令该角色下线";
 
     private const byte LOGIN_FLAGS_BLOCKING = 1 | 2 | 4;
 
@@ -406,8 +426,7 @@ public sealed class CatAutoEnter
         if (await game.AttachAsync(cancellationToken).ConfigureAwait(false) is { } attachError)
             throw new StopException(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, $"游戏内模块没有注入成功: {attachError}");
 
-        var (versionOk, version, versionResponse) = await MiniModuleClient.HandshakeAsync(new Channel(this, "问模块版本"), MiniModuleClient.AutoEnterMinimumVersion, cancellationToken)
-                                                                            .ConfigureAwait(false);
+        var (versionOk, version, versionResponse) = await HandshakeAsync(cancellationToken).ConfigureAwait(false);
 
         if (!versionOk)
         {
@@ -507,8 +526,32 @@ public sealed class CatAutoEnter
             if ((entry.LoginFlags & LOGIN_FLAGS_BLOCKING) != 0)
                 throw new StopException(CatAutoEnterStopCodes.CHARACTER_LOCKED, $"角色 {entry.Name} 现在不能登录（被锁定、要改名或缺资料片, 标记 {entry.LoginFlags}）");
 
-            // 5–6. 切服务器 → 选中 → 点进入 → 确认 → 排队
-            await EnterAsync(entry, cancellationToken).ConfigureAwait(false);
+            // 5–6. 切服务器 → 选中 → 点进入 → 确认 → 排队; 被告知角色还没下线时等一会儿重新登录
+            for (var retry = 0;; retry++)
+            {
+                try
+                {
+                    await EnterAsync(entry, cancellationToken).ConfigureAwait(false);
+                    break;
+                }
+                catch (RetryEnterException notice) when (retry < timings.RelogDelays.Count)
+                {
+                    var delay = timings.RelogDelays[retry];
+                    Log.Information("[CatAutoEnter] {Name} 还没在服务器那边下线（{Notice}）, {Seconds:F0} 秒后第 {Retry} 次重新登录",
+                                    entry.Name, notice.Message, delay.TotalSeconds, retry + 1);
+                    SetStage(CatStages.ENTERING_WORLD);
+                    await DelayAsync(delay, cancellationToken).ConfigureAwait(false);
+                }
+                catch (RetryEnterException notice)
+                {
+                    throw new StopException
+                    (
+                        CatAutoEnterStopCodes.LOBBY_ERROR,
+                        $"重新登录 {timings.RelogDelays.Count} 次后游戏仍提示角色没有下线: {notice.Message}"
+                    );
+                }
+            }
+
             break;
         }
 
@@ -542,7 +585,7 @@ public sealed class CatAutoEnter
             if (lobby != null)
             {
                 if (lobby.Dialogue)
-                    throw new StopException(CatAutoEnterStopCodes.LOBBY_ERROR, $"进入选角界面时大厅提示: {Describe(lobby.DialogueText)}");
+                    throw await DialogueStopAsync(lobby, "进入选角界面", cancellationToken).ConfigureAwait(false);
 
                 switch (lobby.Where)
                 {
@@ -815,7 +858,7 @@ public sealed class CatAutoEnter
                     return null;
 
                 if (lobby is { Dialogue: true })
-                    throw new StopException(CatAutoEnterStopCodes.LOBBY_ERROR, $"等人选角色时大厅提示: {Describe(lobby.DialogueText)}");
+                    throw await DialogueStopAsync(lobby, "等人选角色", cancellationToken).ConfigureAwait(false);
             }
         }
         finally
@@ -891,12 +934,23 @@ public sealed class CatAutoEnter
                 return;
 
             if (lobby.Dialogue)
-                throw new StopException(CatAutoEnterStopCodes.LOBBY_ERROR, $"登录角色时大厅提示: {Describe(lobby.DialogueText)}");
+                throw await DialogueStopAsync(lobby, "登录角色", cancellationToken).ConfigureAwait(false);
 
             if (lobby.Ok)
             {
                 switch (KindOfOk(lobby))
                 {
+                    case OkKind.Notice when lobby.OkText.Contains(FORCED_LOGOUT_PROMPT, StringComparison.Ordinal):
+                    {
+                        // 服务器那边角色还没下线（上一次没登出完就结束了、或刚在别处登录过）: 游戏原话「稍等片刻即可进行重新登录」, 点掉再登
+                        var reply = await SendAsync("DIALOG NOTICE", "点掉「已强制令该角色下线」的提示", cancellationToken).ConfigureAwait(false);
+
+                        if (CatModuleReplies.IsOk(reply))
+                            throw new RetryEnterException(lobby.OkText);
+
+                        throw new StopException(CatAutoEnterStopCodes.LOBBY_ERROR, $"登录角色时游戏提示: {Describe(lobby.OkText)}（没能点掉: {CatModuleReplies.FirstLine(reply)}）");
+                    }
+
                     case OkKind.Notice:
                         throw new StopException(CatAutoEnterStopCodes.LOBBY_ERROR, $"登录角色时游戏提示: {Describe(lobby.OkText)}");
 
@@ -1278,7 +1332,7 @@ public sealed class CatAutoEnter
             if (game.HasExited)
                 throw new OperationCanceledException("游戏进程已经退出");
 
-            throw new StopException(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, $"和游戏内模块通话失败（{step}）: {ex.Message}");
+            throw new StopException(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, $"和游戏内模块通话失败（{step}）: {ex.Message}") { CommFailure = true };
         }
 
         if (response.Contains("sigscan-failed", StringComparison.Ordinal))
@@ -1305,9 +1359,55 @@ public sealed class CatAutoEnter
             owner.SendAsync(command, step, cancellationToken);
     }
 
+    /// <summary>
+    ///     问模块版本: 注入后模块要装好各处钩子才开管道, 连不上、通话断了在 <see cref="CatAutoEnterTimings.ModuleReadyTimeout" /> 内隔一会儿再问;
+    ///     模块回了话（版本旧、特征码失效、不认识命令）照常立即停手
+    /// </summary>
+    private async Task<(bool Ok, Version? Version, string Response)> HandshakeAsync(CancellationToken cancellationToken)
+    {
+        var deadline = game.Elapsed + timings.ModuleReadyTimeout;
+        var tries    = 0;
+
+        while (true)
+        {
+            try
+            {
+                var result = await MiniModuleClient.HandshakeAsync(new Channel(this, "问模块版本"), MiniModuleClient.AutoEnterMinimumVersion, cancellationToken)
+                                                   .ConfigureAwait(false);
+
+                if (tries > 0)
+                    Log.Information("[CatAutoEnter] 游戏内模块第 {Tries} 次才连上（注入后等了 {Seconds:F1} 秒）", tries + 1, (game.Elapsed - deadline + timings.ModuleReadyTimeout).TotalSeconds);
+
+                return result;
+            }
+            catch (StopException stop) when (stop.CommFailure && game.Elapsed < deadline)
+            {
+                tries++;
+                Log.Debug("[CatAutoEnter] 游戏内模块还没开管道, 稍后再问: {Message}", stop.Message);
+                await DelayAsync(timings.ModuleReadyPoll, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    ///     大厅弹出错误框（登录、连大厅失败, 如游戏时间用完、网络断开）: 带游戏原话停手, 框留在界面上不替人点
+    /// </summary>
+    private Task<Exception> DialogueStopAsync(CatModuleReplies.LobbyState lobby, string step, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Log.Information("[CatAutoEnter] {Step}时大厅弹出错误框: {Text}", step, Describe(lobby.DialogueText));
+        return Task.FromResult<Exception>(new StopException(CatAutoEnterStopCodes.LOBBY_ERROR, $"{step}时大厅提示: {Describe(lobby.DialogueText)}"));
+    }
+
+    /// <summary>登录角色时被告知角色还没下线, 提示框已点掉, 要等一会儿重新登录</summary>
+    private sealed class RetryEnterException(string notice) : Exception(notice);
+
     private sealed class StopException(string code, string message) : Exception(message)
     {
         public string Code { get; } = code;
+
+        /// <summary>和模块通话失败（连不上管道、管道断了）, 不是模块回了话</summary>
+        public bool CommFailure { get; init; }
     }
 
     #endregion
@@ -1393,6 +1493,7 @@ internal static partial class CatModuleReplies
         // 后面每个在场的对话框一行: D \t <SelectYesno|SelectOk|Dialogue> \t <addon id> \t <ready> \t <visible> \t <提示文字>;
         // 最后的 T 行是其中最该看的那个（是/否框优先, 其次错误框, 最后确定框）。没有 D 行时按这个优先级把 T 行归给对应的框
         var texts   = new Dictionary<string, string>(StringComparer.Ordinal);
+        var shown   = new Dictionary<string, bool>(StringComparer.Ordinal);
         var primary = string.Empty;
         var lines   = response.Split('\n');
 
@@ -1405,7 +1506,10 @@ internal static partial class CatModuleReplies
                 var parts = line.Split('\t', 6);
 
                 if (parts.Length == 6)
+                {
                     texts[parts[1]] = parts[5].Trim();
+                    shown[parts[1]] = parts[3] == "1" && parts[4] == "1";
+                }
             }
             else if (line.StartsWith("T ", StringComparison.Ordinal) || line.StartsWith("T\t", StringComparison.Ordinal))
             {
@@ -1416,7 +1520,8 @@ internal static partial class CatModuleReplies
 
         var yesNo    = Flag(fields, "yesno");
         var ok       = Flag(fields, "ok");
-        var dialogue = Flag(fields, "dialogue");
+        // 错误框在建、在关（还没就绪或不可见）时不算弹出, 下一轮再看; 旧模块没有 D 行时按在不在算
+        var dialogue = Flag(fields, "dialogue") && shown.GetValueOrDefault("Dialogue", true);
 
         return new LobbyState
         (

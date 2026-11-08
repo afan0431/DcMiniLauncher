@@ -73,9 +73,11 @@ public static class CatGameCloser
 
                     return await KillAsync(process).ConfigureAwait(false);
 
+                // 不在世界里也可能是登出正在进行（11-07 实测: 登出写盘中被当成不在世界当场结束, 服务器那边角色没下线, 下一次登录被强制下线）:
+                // 不直接结束进程, 走下面的关闭消息, 让它把登出做完自己退出, 时限到了才结束
                 case CatGameExitOutcome.NotInWorld:
-                    Log.Information("[CatHost] 游戏不在世界里, 直接结束进程 PID={Pid}", pid);
-                    return await KillAsync(process).ConfigureAwait(false);
+                    Log.Information("[CatHost] 游戏不在世界里, 请它自己关闭 PID={Pid}", pid);
+                    break;
             }
 
             if (HasExited(process))
