@@ -29,6 +29,11 @@
     </ItemGroup>
 
     <ItemGroup>
+        <!-- 国际服 CatLobby 插件的纯协议层（不依赖 Dalamud）按文件链接进来测 -->
+        <Compile Include="..\XIVLauncher.CatLobby\Protocol\*.cs" Link="CatLobby\Protocol\%(Filename)%(Extension)" />
+    </ItemGroup>
+
+    <ItemGroup>
         <ProjectReference Include="..\XIVLauncher\XIVLauncher.csproj" />
         <ProjectReference Include="..\XIVLauncher.GamePatchV3\XIVLauncher.GamePatchV3.csproj" />
     </ItemGroup>
