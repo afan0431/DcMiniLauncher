@@ -1716,6 +1716,78 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
     /// <summary>登出后等选角界面出来的上限（游戏自己的登出要几秒, 落到标题时还要再点一次「开始游戏」）</summary>
     private static readonly TimeSpan ParkTimeout = TimeSpan.FromMinutes(2);
 
+    /// <summary>停在选角界面后隔多久看一次游戏在哪个界面（有人在 Cat 之外进了角色就要报进世界）</summary>
+    private static readonly TimeSpan ParkWatchInterval = TimeSpan.FromSeconds(5);
+
+    /// <summary>停在选角界面后看着游戏的那段的取消源; 再停一次、从选角界面进角色、游戏收尾时取消</summary>
+    private CancellationTokenSource? parkWatch;
+
+    private void StopParkWatch() => Interlocked.Exchange(ref parkWatch, null)?.Cancel();
+
+    /// <summary>
+    ///     停在选角界面后看着游戏: 有人在游戏里点了进入游戏（不经 Cat）时, 走从选角界面进角色的那条路 —— 编排看到已在世界里,
+    ///     报 inWorld 并接着看当前角色, 工作台与服务器随之把会话改回已登录（11-09 悉达凯隐: 到点停号后被手动登回, Cat 两个小时都显示停着）。
+    ///     每次只短暂占闸连模块问一次 WHERE, 闸被跨区等操作占着就等下一轮
+    /// </summary>
+    private void StartParkWatch(FFXIVProcess launched, ICatLaunchReporter reporter)
+    {
+        var watch = CancellationTokenSource.CreateLinkedTokenSource(closeCts.Token);
+        Interlocked.Exchange(ref parkWatch, watch)?.Cancel();
+        var token = watch.Token;
+
+        lock (cleanupLock)
+        {
+            autoEnterTasks.Add
+            (
+                Task.Run
+                (async () =>
+                    {
+                        try
+                        {
+                            while (!launched.UnderlyingProcess.HasExited)
+                            {
+                                await Task.Delay(ParkWatchInterval, token).ConfigureAwait(false);
+                                var where = await ReadWhereAsync(launched, token).ConfigureAwait(false);
+
+                                if (where == null || !where.Contains("where=" + CatModuleReplies.WHERE_IN_GAME, StringComparison.Ordinal))
+                                    continue;
+
+                                if (Interlocked.CompareExchange(ref parkWatch, null, watch) != watch)
+                                    return;
+
+                                Log.Information("[CatHost] 停在选角界面后角色被登回游戏（不经 Cat）, 报进世界");
+                                StartAutoEnter(launched, reporter, closeCts.Token);
+                                return;
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // 再停一次、进角色或游戏收尾
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Warning(ex, "[CatHost] 停在选角界面后看游戏出错（游戏不受影响）");
+                        }
+                    },
+                    CancellationToken.None
+                )
+            );
+        }
+    }
+
+    /// <summary>短暂占闸连游戏内模块问一次 WHERE; 闸被占着返回 null</summary>
+    private static async Task<string?> ReadWhereAsync(FFXIVProcess launched, CancellationToken token)
+    {
+        using var gate = InGame.InGameTravelService.TryEnterGate(launched.ProcessID);
+
+        if (gate == null)
+            return null;
+
+        using var module = new InGame.MiniModuleClient(launched.ProcessID);
+        await module.ConnectAsync(10_000, token).ConfigureAwait(false);
+        return await module.SendAsync("WHERE", token).ConfigureAwait(false);
+    }
+
     /// <inheritdoc />
     public async Task ParkAtCharaSelectAsync(ICatLaunchReporter reporter, CancellationToken cancellationToken)
     {
@@ -1733,7 +1805,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             return;
         }
 
-        // 先停掉在看当前角色的那段（它把登出当成异常）, 再占闸连模块
+        // 先停掉在看当前角色的那段（它把登出当成异常）与上一次停着时看游戏的那段, 再占闸连模块
+        StopParkWatch();
+
         lock (cleanupLock)
         {
             if (autoEnterCancellations.Remove(launched.ProcessID, out var running))
@@ -1806,6 +1880,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
             Log.Information("[CatHost] 停在选角界面: 已在选角界面");
             reporter.Stage(CatStages.AT_CHARA_SELECT);
+            StartParkWatch(launched, reporter);
         }
         catch (OperationCanceledException)
         {
@@ -1840,6 +1915,7 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             : new CatAutoEnterTarget(name, homeWorld ?? request.CharacterHomeWorld, null);
 
         Log.Information("[CatHost] 从选角界面进角色");
+        StopParkWatch();
         StartAutoEnter(launched, reporter, closeCts.Token, target);
         return Task.CompletedTask;
     }
