@@ -103,6 +103,12 @@ public interface ICatInternationalEnvironment
     /// <summary>游戏进程里是否已有 Dalamud</summary>
     bool IsDalamudLoaded(Process process);
 
+    /// <summary>把国际服自动进入角色用的 Dalamud 插件 CatLobby 登记成开发插件并开着; 不抛异常, 失败在结果里</summary>
+    Task<DalamudDevPluginRegistrar.Result> EnsureAutoEnterPluginAsync();
+
+    /// <summary>为一个已起来的国际服游戏建自动进入角色的游戏一侧</summary>
+    ICatAutoEnterGame CreateAutoEnterGame(Process process);
+
     /// <summary>Minion</summary>
     ICatInternationalMinion Minion { get; }
 }
@@ -258,6 +264,19 @@ internal sealed class CatInternationalRealEnvironment(Func<Task> ensureInitializ
             return false;
         }
     }
+
+    /// <summary>登录器目录下放 CatLobby 插件的子目录</summary>
+    public const string AUTO_ENTER_PLUGIN_DIRECTORY = "CatLobby";
+
+    public Task<DalamudDevPluginRegistrar.Result> EnsureAutoEnterPluginAsync() =>
+        DalamudDevPluginRegistrar.EnsureAsync
+        (
+            InternationalRoot,
+            Path.Combine(AppContext.BaseDirectory, AUTO_ENTER_PLUGIN_DIRECTORY, "CatLobby.dll")
+        );
+
+    public ICatAutoEnterGame CreateAutoEnterGame(Process process) =>
+        new CatInternationalAutoEnter(process);
 
     public ICatInternationalMinion Minion { get; } = new CatInternationalMinion();
 

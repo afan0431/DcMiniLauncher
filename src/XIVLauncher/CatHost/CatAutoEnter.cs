@@ -940,7 +940,7 @@ public sealed class CatAutoEnter
             {
                 switch (KindOfOk(lobby))
                 {
-                    case OkKind.Notice when lobby.OkText.Contains(FORCED_LOGOUT_PROMPT, StringComparison.Ordinal):
+                    case OkKind.Notice when CatAutoEnterTexts.IsForcedLogoutPrompt(lobby.OkText):
                     {
                         // 服务器那边角色还没下线（上一次没登出完就结束了、或刚在别处登录过）: 游戏原话「稍等片刻即可进行重新登录」, 点掉再登
                         var reply = await SendAsync("DIALOG NOTICE", "点掉「已强制令该角色下线」的提示", cancellationToken).ConfigureAwait(false);
@@ -980,14 +980,14 @@ public sealed class CatAutoEnter
             // 「取消登录」那句不点; 文字读不到的不点; 点过之后那个框关了又出来别的是/否框, 不知道在问什么, 停手交给人。
             // 是不是登录确认框、对应的是不是这个角色, 由模块在点的那一刻自己再核对一遍（见模块的 DIALOG YES）。
             // 幻想药那个框（FANTASIA_PROMPT）在登录确认框之前, 同样只答一次, 答完它还开着（正在关）时不再点。
-            var fantasia = lobby.YesNo && lobby.YesNoText.Contains(FANTASIA_PROMPT, StringComparison.Ordinal);
+            var fantasia = lobby.YesNo && CatAutoEnterTexts.IsFantasiaPrompt(lobby.YesNoText);
 
             if (!lobby.YesNo)
                 confirmClosed = clickedYes;
             else if (fantasia && fantasiaYes)
             {
             }
-            else if (!lobby.YesNoText.Contains(CANCEL_LOGIN_PROMPT, StringComparison.Ordinal))
+            else if (!CatAutoEnterTexts.IsCancelLoginPrompt(lobby.YesNoText))
             {
                 if (clickedYes)
                 {
@@ -1122,9 +1122,7 @@ public sealed class CatAutoEnter
         if (lobby.Queue > 0)
             return lobby.Queue;
 
-        var match = Regex.Match(lobby.OkText, @"排队人数\s*[:：]\s*(\d+)");
-
-        return match.Success && int.TryParse(match.Groups[1].Value, out var count) ? count : 0;
+        return CatAutoEnterTexts.ParseQueueNumber(lobby.OkText);
     }
 
     private void ReportQueue(int queue)
@@ -1266,7 +1264,7 @@ public sealed class CatAutoEnter
     /// </summary>
     private static OkKind KindOfOk(CatModuleReplies.LobbyState lobby)
     {
-        if (lobby.Queue > 0 || lobby.OkText.Contains(QUEUE_PROMPT, StringComparison.Ordinal))
+        if (lobby.Queue > 0 || CatAutoEnterTexts.IsQueuePrompt(lobby.OkText))
             return OkKind.Queue;
 
         return lobby.OkText.Length == 0 && lobby.YesNo ? OkKind.Unknown : OkKind.Notice;

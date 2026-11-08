@@ -22,6 +22,11 @@ namespace XIVLauncher.CatHost;
 ///         游戏进程退出就发 game.exited（不带 reason）; 不发 game.crashed / game.restarted, launch 里的 crashDialogTimeoutSeconds 对国际服不起作用。
 ///         如果原版崩溃处理器弹出对话框并让游戏进程停着不退, 这里会一直显示运行中, 直到有人处理对话框或外壳发 close（close 会结束游戏进程）。
 ///     </para>
+///     <para>
+///         <b>自动进入角色</b>靠登录器自带的 Dalamud 插件 CatLobby（<c>CatLobby\CatLobby.dll</c>）: 起游戏前把它登记成国际服 Dalamud 的开发插件,
+///         游戏起来、Dalamud 加载后由 <see cref="CatAutoEnter" /> 经 <see cref="CatInternationalAutoEnter" /> 连插件开的管道。
+///         登记不上、没开 Dalamud、Dalamud 没等到都不拦启动, 报 game.autoEnterStopped（moduleUnavailable）, 游戏停在当前界面交给人。
+///     </para>
 /// </summary>
 public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInternationalEnvironment environment) : ICatGameRunner
 {
@@ -37,6 +42,16 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
     private TimeSpan                  closeTimeout = TimeSpan.FromSeconds(CatProtocol.DEFAULT_CLOSE_TIMEOUT_SECONDS);
     private int                       cleaned;
     private ICatMinionClientDirs?     clientDirs;
+
+    private volatile CatAutoEnter?    autoEnter;
+    private CancellationTokenSource?  autoEnterCts;
+    private Task?                     autoEnterTask;
+    private string?                   autoEnterBlocked;
+
+    private static readonly TimeSpan AutoEnterShutdownTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>自动进入角色各步的等待上限与轮询间隔; 不给用默认值（单测里给短的）</summary>
+    public CatAutoEnterTimings? AutoEnterTimings { get; init; }
 
     /// <summary>等 Dalamud.dll 出现在游戏进程里的上限</summary>
     public TimeSpan DalamudInjectTimeout { get; init; } = TimeSpan.FromMinutes(1);
@@ -72,11 +87,15 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
 
             var dalamud = await PrepareDalamudAsync(reporter, linked.Token).ConfigureAwait(false);
 
+            if (request.AutoEnter)
+                autoEnterBlocked = await PrepareAutoEnterPluginAsync(dalamud != null).ConfigureAwait(false);
+
             var process = await StartAsync(login, dalamud, reporter, linked.Token).ConfigureAwait(false);
 
             // 国际服不做崩溃重启（见类注释）: 只等游戏进程自己退出
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
 
+            await StopAutoEnterAsync().ConfigureAwait(false);
             Cleanup(process);
             await RetireClientDirAsync().ConfigureAwait(false);
             reporter.Exited(process.Id, TryGetExitCode(process), IsCloseRequested ? CatExitReasons.CLOSED : null);
@@ -133,6 +152,10 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
         if (process != null)
             await CatGameCloser.CloseAsync(process, gracefulTimeout).ConfigureAwait(false);
     }
+
+    /// <inheritdoc />
+    public CatAcceptResult SelectCharacter(string contentId) =>
+        autoEnter?.SelectCharacter(contentId) ?? CatAcceptResult.Rejected(CatCodes.NOT_RUNNING, "当前没有在等人选角色");
 
     /// <inheritdoc />
     public async Task InjectAsync(bool dalamud, bool minion, bool force, ICatLaunchReporter reporter, CancellationToken cancellationToken)
@@ -454,16 +477,19 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
             return process;
         }
 
+        var dalamudLoaded = false;
+
         try
         {
             if (dalamud != null)
             {
                 reporter.Stage(CatStages.INJECTING);
-                var loaded = await WaitForDalamudAsync(process, startToken).ConfigureAwait(false);
-                reporter.Agent(CatAgentKinds.DALAMUD, loaded, loaded ? null : CatCodes.DALAMUD_UNAVAILABLE, loaded ? null : "游戏进程里没有等到 Dalamud 加载");
+                dalamudLoaded = await WaitForDalamudAsync(process, startToken).ConfigureAwait(false);
+                reporter.Agent(CatAgentKinds.DALAMUD, dalamudLoaded, dalamudLoaded ? null : CatCodes.DALAMUD_UNAVAILABLE, dalamudLoaded ? null : "游戏进程里没有等到 Dalamud 加载");
             }
 
-            if (request.Minion)
+            // 自动进入角色的, Minion 等角色进了世界再挂（StartAutoEnter）, 免得挂载和编排抢游戏主线程
+            if (request.Minion && !(request.AutoEnter && autoEnterBlocked == null && dalamudLoaded))
                 await AttachMinionAsync(process, dalamud != null, reporter, startToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (IsCloseRequested)
@@ -476,9 +502,134 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
             await remoteHookReport.ConfigureAwait(false);
 
         if (!process.HasExited && !IsCloseRequested)
+        {
             reporter.Stage(CatStages.RUNNING);
 
+            if (request.AutoEnter)
+            {
+                if (autoEnterBlocked == null && !dalamudLoaded)
+                    autoEnterBlocked = "游戏里没有等到 Dalamud 加载, 自动进入角色用的 CatLobby 插件起不来";
+
+                if (autoEnterBlocked != null)
+                    reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, autoEnterBlocked);
+                else
+                    StartAutoEnter(process, reporter, startToken);
+            }
+        }
+
         return process;
+    }
+
+    /// <summary>
+    ///     起游戏前登记自动进入角色用的 CatLobby 插件。返回 null = 可以自动进入; 否则是不能自动进入的原因（游戏照常启动, 停在当前界面交给人）
+    /// </summary>
+    private async Task<string?> PrepareAutoEnterPluginAsync(bool dalamud)
+    {
+        if (!dalamud)
+            return "国际服自动进入角色要靠 Dalamud 里的 CatLobby 插件, 这次上号没有开 Dalamud";
+
+        var result = await environment.EnsureAutoEnterPluginAsync().ConfigureAwait(false);
+        Log.Information("[CatHost] 国际服 CatLobby 插件: {Action}{Error}", result.Action, result.Error == null ? "" : $"（{result.Error}）");
+
+        return result.Ok ? null : $"CatLobby 插件没登记上, 自动进入角色用不了: {result.Error}";
+    }
+
+    /// <summary>
+    ///     在后台自动进入角色（不挡游戏守护）: 编排 → 带 Minion 的在角色进世界后再挂 → 之后隔一段时间看一次当前角色。游戏进程收尾时取消
+    /// </summary>
+    private void StartAutoEnter(Process process, ICatLaunchReporter reporter, CancellationToken startToken)
+    {
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(startToken);
+        var game         = environment.CreateAutoEnterGame(process);
+        var flow         = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(request.CharacterName, request.CharacterHomeWorld), AutoEnterTimings);
+        var token        = cancellation.Token;
+
+        autoEnter    = flow;
+        autoEnterCts = cancellation;
+
+        autoEnterTask = Task.Run
+        (async () =>
+            {
+                try
+                {
+                    var outcome = await flow.RunAsync(token).ConfigureAwait(false);
+
+                    // 国际服的插件不认等级、副本命令（回 unknown-command）, 读取器遇到会按「不支持」停读, 不报错
+                    var observe = flow.ObserveAsync(token);
+
+                    if (request.Minion && outcome != CatAutoEnterOutcome.Cancelled)
+                        await AttachMinionInWorldAsync(flow, process, reporter, token).ConfigureAwait(false);
+
+                    await observe.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // 游戏退出或收到关闭请求
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "[CatHost] 国际服自动进入角色的后台任务出错（游戏不受影响）");
+                }
+                finally
+                {
+                    (game as IDisposable)?.Dispose();
+                }
+            }
+        );
+    }
+
+    /// <summary>
+    ///     角色第一次进了世界再挂 Minion, 挂完把阶段恢复成编排当前的阶段; 已经挂着就不再挂。挂载出错只记日志
+    /// </summary>
+    private async Task AttachMinionInWorldAsync(CatAutoEnter flow, Process process, ICatLaunchReporter reporter, CancellationToken token)
+    {
+        await flow.EnteredWorld.WaitAsync(token).ConfigureAwait(false);
+
+        if (environment.Minion.IsAttached(process))
+        {
+            Log.Information("[CatHost] 国际服角色已进入游戏, 这个游戏已经挂着 Minion, 不再挂");
+            return;
+        }
+
+        Log.Information("[CatHost] 国际服角色已进入游戏, 挂 Minion");
+
+        try
+        {
+            await AttachMinionAsync(process, environment.IsDalamudLoaded(process), reporter, token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[CatHost] 国际服进世界后挂 Minion 出错（游戏不受影响）");
+        }
+
+        if (!process.HasExited && !IsCloseRequested)
+            reporter.Stage(flow.CurrentStage ?? CatStages.RUNNING);
+    }
+
+    /// <summary>
+    ///     取消并等自动进入角色的后台任务结束, 保证它的事件都排在 game.exited 之前
+    /// </summary>
+    private async Task StopAutoEnterAsync()
+    {
+        var task = autoEnterTask;
+
+        if (task == null)
+            return;
+
+        autoEnterCts?.Cancel();
+
+        try
+        {
+            await task.WaitAsync(AutoEnterShutdownTimeout).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CatHost] 等国际服自动进入角色的后台任务结束超时");
+        }
     }
 
     /// <summary>
@@ -503,6 +654,7 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
             Log.Warning(ex, "[CatHost] 等游戏进程退出失败");
         }
 
+        await StopAutoEnterAsync().ConfigureAwait(false);
         Cleanup(process);
         await RetireClientDirAsync().ConfigureAwait(false);
 
