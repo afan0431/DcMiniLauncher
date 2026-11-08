@@ -10,8 +10,9 @@ public class CatGameCloserTests
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(20);
 
     [Fact]
-    public async Task NotInWorld_KillsWithoutWaitingForTimeout()
+    public async Task NotInWorld_FallsBackToClosingInsteadOfAsking()
     {
+        // 不在世界里时改走关闭消息; 测试进程没有窗口, 发不了关闭消息就当场结束, 不等满时限
         using var process = StartSleeper();
         var exit  = new FakeExit((_, _) => Task.FromResult(CatGameExitOutcome.NotInWorld));
         var clock = Stopwatch.StartNew();

@@ -1603,8 +1603,42 @@ namespace
         }
     }
 
+    // addon 自己的文字节点里最长的那条（错误框 Dialogue 的说明文字; 按钮上的「确定」在按钮组件里, 不在这一层）
+    void CopyLongestTextNode(void* addon, char* destination, size_t capacity)
+    {
+        const auto uld   = reinterpret_cast<uint8_t*>(addon) + offsets::ATK_UNIT_BASE_ULD_MANAGER;
+        const auto count = ReadAt<unsigned short>(uld, offsets::ATK_ULD_NODE_COUNT);
+        const auto list  = ReadAt<uint8_t**>(uld, offsets::ATK_ULD_NODE_LIST);
+
+        if (!PlausiblePointer(list) || count == 0 || count > 256)
+            return;
+
+        char   text[DIALOG_TEXT_MAX];
+        size_t best = 0;
+
+        for (unsigned short i = 0; i < count; ++i)
+        {
+            const auto node = list[i];
+
+            if (!PlausiblePointer(node) || ReadAt<unsigned short>(node, offsets::ATK_RES_NODE_TYPE) != offsets::ATK_NODE_TYPE_TEXT)
+                continue;
+
+            text[0] = '\0';
+            CopyUtf8String(node + offsets::ATK_TEXT_NODE_NODE_TEXT, text, sizeof(text));
+            text[sizeof(text) - 1] = '\0';
+
+            const size_t length = strnlen(text, sizeof(text));
+
+            if (length > best && length < capacity)
+            {
+                best = length;
+                memcpy(destination, text, length + 1);
+            }
+        }
+    }
+
     // 读对话框的提示文字。文字只是给启动器判断用的附加信息, 读不到或读歪了留空, 不让整条命令失败。
-    // SelectYesno / SelectOk 先取提示文字节点, 取不到再看 AtkValues; Dialogue 只看 AtkValues
+    // SelectYesno / SelectOk 先取提示文字节点, 取不到再看 AtkValues; Dialogue 先看 AtkValues, 没有再取最长的文字节点
     void ReadDialogText(void* addon, bool hasPromptNode, char* destination, size_t capacity)
     {
         destination[0] = '\0';
@@ -1621,6 +1655,9 @@ namespace
 
             if (destination[0] == '\0')
                 CopyFirstStringValue(addon, destination, capacity);
+
+            if (destination[0] == '\0' && !hasPromptNode)
+                CopyLongestTextNode(addon, destination, capacity);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -1718,9 +1755,10 @@ namespace
 
     // ---- DIALOG --------------------------------------------------------------
 
-    constexpr int DIALOG_YES = 0;
-    constexpr int DIALOG_NO  = 1;
-    constexpr int DIALOG_OK  = 2;
+    constexpr int DIALOG_YES    = 0;
+    constexpr int DIALOG_NO     = 1;
+    constexpr int DIALOG_OK     = 2;
+    constexpr int DIALOG_NOTICE = 3;
 
     // 节点事件链上的那条 ButtonClick
     void* FindButtonClickEvent(void* node)
@@ -1794,7 +1832,7 @@ namespace
                 return 1;
             }
 
-            const auto dialogue = FindAddon(p, "Dialogue");
+            const auto dialogue = action == DIALOG_OK ? FindAddon(p, "Dialogue") : nullptr;
 
             if (dialogue != nullptr)
             {
@@ -1833,7 +1871,25 @@ namespace
             const auto dialogId = ReadAt<unsigned>(lobby, offsets::AGENT_LOBBY_DIALOG_ADDON_ID);
             const auto queue    = ReadAt<int>(lobby, offsets::AGENT_LOBBY_QUEUE_POSITION);
 
-            if ((dialogId != 0 && dialogId == ReadAt<unsigned short>(ok, offsets::ATK_UNIT_BASE_ID)) || queue > 0)
+            const bool lobbyOwned = dialogId != 0 && dialogId == ReadAt<unsigned short>(ok, offsets::ATK_UNIT_BASE_ID);
+
+            if (queue > 0)
+                return -2;
+
+            if (action == DIALOG_NOTICE)
+            {
+                // 大厅为登录结果开的提示框（如「已强制令该角色下线, 稍等片刻即可重新登录」）: 只在选角界面、没有排队名次、
+                // 读得到文字且文字里没有「排队」时点, 排队提示仍不点
+                if (where != 2)
+                    return -5;
+
+                char text[DIALOG_TEXT_MAX];
+                ReadDialogText(ok, true, text, sizeof(text));
+
+                if (text[0] == '\0' || strstr(text, u8"排队") != nullptr)
+                    return -2;
+            }
+            else if (lobbyOwned)
                 return -2;
 
             fireInt(ok, offsets::SELECT_OK_OK);
@@ -2865,20 +2921,25 @@ std::string GameEnterCharacter(const std::string& who)
 }
 
 // arguments: "YES <contentId>" 点登录确认框的「是」（contentId = 要登录的角色, 客户端选中的不是它就不点）;
-//            "NO" 点是/否框的「否」; "OK" 点错误框或确定框（大厅自己开的确定框即排队提示不点）
+//            "NO" 点是/否框的「否」; "OK" 点错误框或确定框（大厅自己开的确定框即排队提示不点）;
+//            "NOTICE" 只点确定框, 大厅自己开的也点, 但排队提示（有名次或文字带「排队」）不点
 std::string GameDialog(const std::string& arguments)
 {
     const auto space  = arguments.find(' ');
     const auto button = arguments.substr(0, space);
     const auto extra  = space == std::string::npos ? std::string() : arguments.substr(space + 1);
 
-    const int action = button == "YES" ? DIALOG_YES : button == "NO" ? DIALOG_NO : button == "OK" ? DIALOG_OK : -1;
+    const int action = button == "YES"      ? DIALOG_YES
+                     : button == "NO"       ? DIALOG_NO
+                     : button == "OK"       ? DIALOG_OK
+                     : button == "NOTICE"   ? DIALOG_NOTICE
+                                            : -1;
 
-    // 「是」必须说明是替哪个角色确认; 其余两个不带参数
+    // 「是」必须说明是替哪个角色确认; 其余不带参数
     const auto expected = action == DIALOG_YES && !extra.empty() ? ParseContentId(extra) : 0ULL;
 
     if (action < 0 || (action == DIALOG_YES ? expected == 0 : !extra.empty()))
-        return "FAIL usage: DIALOG <YES <contentId>|NO|OK>";
+        return "FAIL usage: DIALOG <YES <contentId>|NO|OK|NOTICE>";
 
     CallStatePtr state;
     std::string  failure;

@@ -602,6 +602,142 @@ public sealed class CatAutoEnterTests
         Assert.DoesNotContain("DIALOG OK", game.Commands);
     }
 
+    private const string FORCED_LOGOUT = "上次该角色退出时系统出现异常，或正在通过其他客户端登录，已强制令该角色下线。 稍等片刻即可进行重新登录。";
+
+    [Fact]
+    public async Task ForcedLogoutNotice_DismissesAndLogsInAgain()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        var notices = 0;
+
+        game.AfterConfirm = g =>
+        {
+            if (notices++ < 2)
+            {
+                g.Ok   = true;
+                g.Text = FORCED_LOGOUT;
+            }
+            else
+                g.EnterWorld("11");
+        };
+
+        game.Intercept = command =>
+        {
+            if (command != "DIALOG NOTICE")
+                return null;
+
+            game.Ok   = false;
+            game.Text = string.Empty;
+            return "OK clicked addon=SelectOk";
+        };
+
+        var flow    = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null));
+        var outcome = await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.DoesNotContain(reporter.Entries, x => x.StartsWith("stopped:", StringComparison.Ordinal));
+        Assert.Equal(2, game.Commands.Count(x => x == "DIALOG NOTICE"));
+        Assert.Equal(3, game.Commands.Count(x => x == "ENTERCHARA 11"));
+        // 第一次等 15 秒、第二次等 30 秒才重新登录
+        Assert.True(game.Elapsed >= TimeSpan.FromSeconds(45), $"只等了 {game.Elapsed}");
+    }
+
+    [Fact]
+    public async Task ForcedLogoutNotice_StopsAfterRetriesRunOut()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        game.AfterConfirm = g =>
+        {
+            g.Ok   = true;
+            g.Text = FORCED_LOGOUT;
+        };
+
+        game.Intercept = command =>
+        {
+            if (command != "DIALOG NOTICE")
+                return null;
+
+            game.Ok   = false;
+            game.Text = string.Empty;
+            return "OK clicked addon=SelectOk";
+        };
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:lobbyError", reporter.Entries);
+        Assert.Contains(reporter.Messages, x => x.Contains("强制令该角色下线", StringComparison.Ordinal));
+        Assert.Equal(4, game.Commands.Count(x => x == "ENTERCHARA 11"));
+    }
+
+    [Fact]
+    public async Task ForcedLogoutNotice_OldModuleCannotDismiss_Stops()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        game.AfterConfirm = g =>
+        {
+            g.Ok   = true;
+            g.Text = FORCED_LOGOUT;
+        };
+
+        game.Intercept = command => command == "DIALOG NOTICE" ? "FAIL usage: DIALOG <YES <contentId>|NO|OK>" : null;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:lobbyError", reporter.Entries);
+        Assert.Equal(1, game.Commands.Count(x => x == "ENTERCHARA 11"));
+    }
+
+    [Fact]
+    public async Task ErrorDialogStillOpening_IsNotTreatedAsAnError()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        var opening = 3;
+
+        // 错误框在场但还没就绪、不可见: 不算弹出, 等它关掉后照常登录
+        game.Intercept = command =>
+        {
+            if (command != "LOBBYSTATE" || game.Where != "charaselect" || opening <= 0)
+                return null;
+
+            opening--;
+            return $"OK where=charaselect world=1042 worldIndex=0 selectedIndex=-1 hovered=0 locked=0 stage=0 uiStage=0 queue=0 dialogId=0 " +
+                   "yesno=0 ok=0 dialogue=1 loading=0\nD\tDialogue\t40\t0\t0\t";
+        };
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+    }
+
+    [Fact]
+    public async Task ModulePipeOpensLate_WaitsForIt()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.PipeNotReadyFor = 4;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.InWorld, outcome);
+        Assert.DoesNotContain(reporter.Entries, x => x.StartsWith("stopped:", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ModulePipeNeverOpens_StopsAfterWaiting()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+        game.PipeNotReadyFor = int.MaxValue;
+
+        var outcome = await new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null)).RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Equal(["stage:enteringLobby", "stopped:moduleUnavailable", "stage:running"], Entries(reporter));
+        Assert.True(game.Elapsed >= TimeSpan.FromSeconds(90), $"只等了 {game.Elapsed}");
+    }
+
     [Theory]
     [InlineData("0.5.0-focus")]
     [InlineData("0.5.9")]
@@ -1194,6 +1330,9 @@ public sealed class CatAutoEnterTests
             await Task.Delay(1, cancellationToken);
         }
 
+        /// <summary>接下来这么多次通话连不上管道（模块还在装钩子）</summary>
+        public int PipeNotReadyFor { get; set; }
+
         /// <summary>下一条命令答完之后, 这个角色（contentId）被人手动登进了游戏</summary>
         public string? EnterAfterNextReply { get; set; }
 
@@ -1201,6 +1340,13 @@ public sealed class CatAutoEnterTests
         {
             if (HasExited)
                 throw new System.IO.IOException("管道已断开");
+
+            // 模块还没开管道: 连不上, 命令没送到
+            if (PipeNotReadyFor > 0)
+            {
+                PipeNotReadyFor--;
+                throw new TimeoutException("The operation has timed out.");
+            }
 
             lock (Commands)
                 Commands.Add(command);
