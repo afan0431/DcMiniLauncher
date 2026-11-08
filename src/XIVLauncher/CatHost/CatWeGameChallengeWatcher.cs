@@ -195,7 +195,7 @@ public interface ICatWeGameScreen
         false;
 
     /// <summary>
-    ///     登录窗口上有没有「密码错误」之类的提示（硬件自动登录用, 真实图像识别阈值留实机核对）
+    ///     登录窗口是不是换成了「账号或密码错误」的登录报错页（硬件自动登录用）
     /// </summary>
     bool PasswordRejected() =>
         false;

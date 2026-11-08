@@ -535,7 +535,7 @@ public sealed class CatWeGameLoginCapture(ICatWeGameLoginEnvironment environment
 
                 case CatWeGameHwLoginOutcome.PasswordRejected:
                     ResumeQr(watched);
-                    reporter.WeGameHwLoginFallback("WeGame 提示密码错误, 请联系客户核对密码后重新上号");
+                    reporter.WeGameHwLoginFallback("WeGame 提示账号或密码错误, 请联系客户核对密码后重新上号");
                     break;
 
                 default: // FallBackToManual

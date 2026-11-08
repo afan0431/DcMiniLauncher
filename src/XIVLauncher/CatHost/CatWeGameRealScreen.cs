@@ -310,11 +310,67 @@ public sealed class CatWeGameRealScreen(ICatWeGameQrCodec codec) : ICatWeGameScr
     }
 
     /// <summary>
-    ///     登录窗口上有没有「密码错误」之类的提示。还没在真实画面上见过密码错的样子, 先一律返回 false:
-    ///     密码错时按等登录结果超时退回员工手动
+    ///     登录窗口是不是换成了登录报错页（「账号或密码错误，请重新输入或找回密码。错误码:140022013」, 下面「重新登录」「退出」两个按钮）
     /// </summary>
-    public bool PasswordRejected() =>
-        false;
+    public bool PasswordRejected()
+    {
+        var window = FindLoginWindow();
+
+        if (window == IntPtr.Zero || IsIconic(window) || !GetClientRect(window, out var client) || client.Right <= 0 || client.Bottom <= 0)
+            return false;
+
+        if (!TryCapture(window, out var pixels, out var width, out var height) || ClientOffset(window) is not { } offset)
+            return false;
+
+        var cropped = CropClient(pixels, width, height, offset.X, offset.Y, client.Right, client.Bottom);
+        return cropped != null && LoginErrorShown(cropped, client.Right, client.Bottom);
+    }
+
+    /// <summary>
+    ///     认登录报错页（按 1210×680 量, 11-08 真号填错密码实测）: 「重新登录」(49–251, 356–392) 是纯橙色（约 255,118,5）,
+    ///     「退出」(49–251, 400–436) 是灰褐色（约 95,63,51）, QQ / 微信页签那一条 (105–145, 270–284) 是暗的。
+    ///     快捷安全登录页同一位置也有橙色按钮, 但页签是亮的、下面没有灰按钮; 账号密码页这个位置是暗色的密码框
+    /// </summary>
+    internal static bool LoginErrorShown(byte[] bgra, int width, int height)
+    {
+        if (width <= 0 || height <= 0 || bgra.Length < width * height * 4)
+            return false;
+
+        var (r1, g1, b1) = AverageColor(bgra, width, height, 60, 364, 90, 384);
+        var (r2, g2, b2) = AverageColor(bgra, width, height, 60, 410, 90, 426);
+        var (rt, gt, bt) = AverageColor(bgra, width, height, 105, 270, 145, 284);
+
+        var retryOrange = r1 > 200 && g1 is > 70 and < 170 && b1 < 70;
+        var quitGray    = (r2 + 2 * g2 + b2) / 4 is >= 45 and <= 140 && r2 - b2 < 90 && r2 < 170;
+        var tabsDark    = (rt + 2 * gt + bt) / 4 < 70;
+
+        return retryOrange && quitGray && tabsDark;
+    }
+
+    /// <summary>按 1210×680 量的矩形在实际截图上取平均颜色</summary>
+    private static (double R, double G, double B) AverageColor(byte[] bgra, int width, int height, int x0, int y0, int x1, int y1)
+    {
+        var left   = Math.Clamp(x0 * width  / 1210, 0, width - 1);
+        var right  = Math.Clamp(x1 * width  / 1210, 0, width - 1);
+        var top    = Math.Clamp(y0 * height / 680, 0, height - 1);
+        var bottom = Math.Clamp(y1 * height / 680, 0, height - 1);
+        double r = 0, g = 0, b = 0;
+        var count = 0;
+
+        for (var y = top; y <= bottom; y++)
+        {
+            for (var x = left; x <= right; x++)
+            {
+                var offset = (y * width + x) * 4;
+                b += bgra[offset];
+                g += bgra[offset + 1];
+                r += bgra[offset + 2];
+                count++;
+            }
+        }
+
+        return count == 0 ? (0, 0, 0) : (r / count, g / count, b / count);
+    }
 
     /// <summary>
     ///     鼠标消息的坐标参数: 低 16 位是横坐标, 高 16 位是纵坐标
