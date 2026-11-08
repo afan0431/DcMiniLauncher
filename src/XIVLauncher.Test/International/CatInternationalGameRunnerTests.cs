@@ -3,6 +3,7 @@ using System.IO;
 using System.Net.Http;
 using System.Text.Json;
 using XIVLauncher.CatHost;
+using XIVLauncher.CatLobby.Protocol;
 using XIVLauncher.Common;
 using XIVLauncher.Common.Game;
 using XIVLauncher.Common.Game.Exceptions;
@@ -49,9 +50,20 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     }
 
     private CatInternationalGameRunner NewRunner() =>
-        new(redactor, environment) { DalamudInjectTimeout = TimeSpan.FromSeconds(5) };
+        new(redactor, environment)
+        {
+            DalamudInjectTimeout = TimeSpan.FromSeconds(5),
+            AutoEnterTimings = new CatAutoEnterTimings
+            {
+                Poll            = TimeSpan.FromMilliseconds(5),
+                QueuePoll       = TimeSpan.FromMilliseconds(5),
+                ObserveInterval = TimeSpan.FromMilliseconds(20),
+                ModuleReadyPoll = TimeSpan.FromMilliseconds(20),
+                CharaListSettle = TimeSpan.FromMilliseconds(50)
+            }
+        };
 
-    private static CatLaunchRequest Request(bool dalamud = false, bool minion = false, string account = ACCOUNT, string? password = PASSWORD) =>
+    private static CatLaunchRequest Request(bool dalamud = false, bool minion = false, string account = ACCOUNT, string? password = PASSWORD, bool autoEnter = false, string? character = null, string? homeWorld = null) =>
         new
         (
             "op-intl",
@@ -59,7 +71,10 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
             dalamud,
             minion ? new CatMinionLaunch(CARD, MinionCards.VARIANT_GLOBAL, new CatSecret(KEYCODE), MINION_ID, FORUM_ID, new CatSecret(FORUM_PW)) : null,
             IsInternational: true,
-            Password: password == null ? null : new CatSecret(password)
+            Password: password == null ? null : new CatSecret(password),
+            AutoEnter: autoEnter,
+            CharacterName: character,
+            CharacterHomeWorld: homeWorld
         );
 
     private async Task<int> RunToFailureAsync(CatLaunchRequest request) =>
@@ -383,6 +398,159 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         Assert.Equal($"failed:{CatCodes.CANCELLED}", reporter.Entries.Last());
         Assert.Single(reporter.Entries, x => x.StartsWith("failed:", StringComparison.Ordinal));
         Assert.Null(environment.GameProcess);
+    }
+
+    #endregion
+
+    #region 自动进入角色
+
+    [Fact]
+    public async Task AutoEnter_RegistersPluginBeforeStartingGame_ThenEntersWorld()
+    {
+        using var plugin = new FakeGamePlugin(environment);
+        plugin.Characters.Add(new CharaRow(9001, 0, 0, 23, 23, "Alice Fox", "Asura", "Asura", 0));
+        plugin.Characters.Add(new CharaRow(9002, 1, 0, 54, 54, "Alice Fox", "Tonberry", "Tonberry", 0));
+
+        var runner = NewRunner();
+        var run    = runner.RunAsync(Request(dalamud: true, autoEnter: true, character: "Alice Fox", homeWorld: "Asura"), reporter, CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("stage:inWorld"));
+
+        Assert.Equal(1, environment.PluginCalls);
+        Assert.True(environment.Calls.IndexOf("plugin") > environment.Calls.IndexOf("dalamud"));
+        Assert.True(environment.Calls.IndexOf("plugin") < environment.Calls.IndexOf("start"));
+        Assert.Contains("character:Alice Fox@Asura", reporter.Entries);
+        Assert.Contains("DIALOG YES 9001", plugin.Commands);
+        Assert.DoesNotContain(reporter.Entries, x => x.StartsWith("stopped:", StringComparison.Ordinal));
+        Assert.Equal(CatCodes.NOT_RUNNING, runner.SelectCharacter("9001").Code);
+
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        await run.WaitAsync(Timeout);
+
+        // 编排的事件都排在退出之前
+        var entries = reporter.Entries.ToList();
+        Assert.True(entries.IndexOf("character:Alice Fox@Asura") < entries.FindIndex(x => x.StartsWith("exited", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task AutoEnter_WithMinion_AttachesOnlyAfterEnteringWorld()
+    {
+        using var plugin = new FakeGamePlugin(environment);
+        plugin.Characters.Add(new CharaRow(9001, 0, 0, 23, 23, "Alice Fox", "Asura", "Asura", 0));
+
+        var runner = NewRunner();
+        var run    = runner.RunAsync(Request(dalamud: true, minion: true, autoEnter: true, character: "Alice Fox"), reporter, CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("agent:minion:ok"));
+
+        var entries = reporter.Entries.ToList();
+        Assert.True(entries.IndexOf("character:Alice Fox@Asura") < entries.IndexOf("agent:minion:ok"));
+        Assert.NotNull(environment.FakeMinion.Attached);
+
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        await run.WaitAsync(Timeout);
+    }
+
+    [Fact]
+    public async Task AutoEnter_PluginRegistrationFails_GameStillStarts_AndStopsWithReason()
+    {
+        environment.PluginError = "改 Dalamud 配置失败";
+
+        var runner = NewRunner();
+        var run    = runner.RunAsync(Request(dalamud: true, autoEnter: true), reporter, CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains($"stopped:{CatAutoEnterStopCodes.MODULE_UNAVAILABLE}"));
+
+        Assert.Contains("started", reporter.Entries);
+        Assert.Contains(reporter.Messages, x => x.Contains("CatLobby 插件没登记上") && x.Contains("改 Dalamud 配置失败"));
+        Assert.Equal(0, environment.AutoEnterGames);
+
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        await run.WaitAsync(Timeout);
+    }
+
+    [Fact]
+    public async Task AutoEnter_WithoutDalamud_DoesNotRegisterAndStops()
+    {
+        var runner = NewRunner();
+        var run    = runner.RunAsync(Request(dalamud: false, autoEnter: true), reporter, CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains($"stopped:{CatAutoEnterStopCodes.MODULE_UNAVAILABLE}"));
+
+        Assert.Equal(0, environment.PluginCalls);
+        Assert.Equal(0, environment.AutoEnterGames);
+        Assert.Contains(reporter.Messages, x => x.Contains("没有开 Dalamud"));
+
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        await run.WaitAsync(Timeout);
+    }
+
+    [Fact]
+    public async Task AutoEnter_DalamudNeverLoads_StopsWithReason()
+    {
+        environment.DalamudLoaded = false;
+
+        var runner = new CatInternationalGameRunner(redactor, environment) { DalamudInjectTimeout = TimeSpan.FromMilliseconds(100) };
+        var run    = runner.RunAsync(Request(dalamud: true, autoEnter: true), reporter, CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains($"stopped:{CatAutoEnterStopCodes.MODULE_UNAVAILABLE}"));
+
+        Assert.Equal(0, environment.AutoEnterGames);
+
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        await run.WaitAsync(Timeout);
+    }
+
+    [Fact]
+    public async Task NoAutoEnter_NeverTouchesThePlugin()
+    {
+        var runner = NewRunner();
+        var run    = runner.RunAsync(Request(dalamud: true), reporter, CancellationToken.None);
+
+        await reporter.Running.Task.WaitAsync(Timeout);
+
+        Assert.Equal(0, environment.PluginCalls);
+        Assert.Equal(0, environment.AutoEnterGames);
+
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        await run.WaitAsync(Timeout);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + Timeout;
+
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+                throw new TimeoutException("没有等到预期的状态");
+
+            await Task.Delay(10);
+        }
+    }
+
+    /// <summary>
+    ///     游戏起来后才知道进程号的假插件: 假环境建自动进入角色的游戏一侧时才绑进程号并开管道
+    /// </summary>
+    private sealed class FakeGamePlugin : IDisposable
+    {
+        private readonly CatInternationalAutoEnterTests.FakePlugin plugin = new();
+
+        public FakeGamePlugin(FakeEnvironment environment)
+        {
+            environment.AutoEnterGameFactory = process =>
+            {
+                plugin.Bind(process.Id);
+                plugin.Start();
+                return new CatInternationalAutoEnter(process);
+            };
+        }
+
+        public List<CharaRow> Characters => plugin.Characters;
+
+        public List<string> Commands => plugin.Commands;
+
+        public void Dispose() => plugin.Dispose();
     }
 
     #endregion
@@ -741,6 +909,16 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
 
         public bool DalamudLoaded { get; set; } = true;
 
+        /// <summary>登记 CatLobby 插件失败的原因; null = 成功</summary>
+        public string? PluginError { get; set; }
+
+        public int PluginCalls { get; private set; }
+
+        /// <summary>自动进入角色的游戏一侧; 不设就用真实的国际服游戏一侧</summary>
+        public Func<Process, ICatAutoEnterGame>? AutoEnterGameFactory { get; set; }
+
+        public int AutoEnterGames { get; private set; }
+
         public Exception? StartError { get; set; }
 
         public GameStartRequest? StartRequest { get; private set; }
@@ -802,6 +980,25 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         }
 
         public bool IsDalamudLoaded(Process process) => DalamudLoaded;
+
+        public Task<DalamudDevPluginRegistrar.Result> EnsureAutoEnterPluginAsync()
+        {
+            Record("plugin");
+            PluginCalls++;
+
+            return Task.FromResult
+            (
+                PluginError == null
+                    ? new DalamudDevPluginRegistrar.Result(true, "登记并开启", null)
+                    : new DalamudDevPluginRegistrar.Result(false, "none", PluginError)
+            );
+        }
+
+        public ICatAutoEnterGame CreateAutoEnterGame(Process process)
+        {
+            AutoEnterGames++;
+            return AutoEnterGameFactory?.Invoke(process) ?? new CatInternationalAutoEnter(process);
+        }
 
         public ICatInternationalMinion Minion => FakeMinion;
 

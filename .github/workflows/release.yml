@@ -55,6 +55,16 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: Download Dalamud for CatLobby
+        shell: pwsh
+        run: |
+          # CatLobby 是国际服 Dalamud 插件, 编译要引用 goatcorp Dalamud 的程序集; 取发行包里的当前 release 版, 经 DALAMUD_HOME 交给 Dalamud.NET.Sdk
+          $zip = Join-Path $env:RUNNER_TEMP 'dalamud.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'dalamud'
+          Invoke-WebRequest -Uri 'https://goatcorp.github.io/dalamud-distrib/latest.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          if (-not (Test-Path (Join-Path $dir 'Dalamud.dll'))) { throw 'Dalamud 发行包里没有 Dalamud.dll' }
+          "DALAMUD_HOME=$dir" >> $env:GITHUB_ENV
       - name: Build launcher
         run: |
           cd src
@@ -67,7 +77,7 @@ jobs:
       - name: Check output
         run: |
           $out = "src\bin\win-x64"
-          foreach ($f in "XIVLauncherCN.exe", "MiniLauncherModule.dll") {
+          foreach ($f in "XIVLauncherCN.exe", "MiniLauncherModule.dll", "CatLobby\CatLobby.dll", "CatLobby\CatLobby.json") {
             if (-not (Test-Path "$out\$f")) { throw "产物里缺 $f" }
           }
           # 调试符号 / 增量链接文件不进包

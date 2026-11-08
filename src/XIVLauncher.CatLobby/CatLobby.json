@@ -1,0 +1,10 @@
+{
+  "Author": "Cat",
+  "Name": "CatLobby",
+  "InternalName": "CatLobby",
+  "Punchline": "Cat 国际服自动进入角色。",
+  "Description": "加载后在游戏进程里开命名管道，供 DcMiniLauncher 读选角界面、选角色、点登录确认框。不改任何游戏数据，不联网。",
+  "CanUnloadAsync": true,
+  "AcceptsFeedback": false,
+  "Tags": [ "cat" ]
+}

@@ -1506,7 +1506,7 @@ public sealed class CatRpcServerTests : IDisposable
     }
 
     [Fact]
-    public async Task Launch_International_IgnoresAutoEnter()
+    public async Task Launch_International_AcceptsAutoEnter()
     {
         await using var client = await ConnectAndHelloAsync();
 
@@ -1517,7 +1517,7 @@ public sealed class CatRpcServerTests : IDisposable
         );
         await runner.Started.Task.WaitAsync(Timeout);
 
-        Assert.False(runner.Request!.AutoEnter);
+        Assert.True(runner.Request!.AutoEnter);
         Assert.Equal("Xiao Bai", runner.Request.CharacterName);
     }
 

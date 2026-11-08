@@ -186,6 +186,21 @@
         </Page>
     </ItemGroup>
 
+    <!-- 国际服 Dalamud 插件 CatLobby: 只为排构建顺序引用, 不引用它的程序集; 产物放进登录器目录下的 CatLobby\。没有国际服 Dalamud 的机器加 -p:SkipCatLobby=true 跳过 -->
+    <ItemGroup Condition="'$(SkipCatLobby)' != 'true'">
+        <ProjectReference Include="..\XIVLauncher.CatLobby\XIVLauncher.CatLobby.csproj" ReferenceOutputAssembly="false" OutputItemType="CatLobbyMain" Private="false"/>
+    </ItemGroup>
+
+    <Target Name="CopyCatLobbyToOutput" AfterTargets="Build" Condition="'$(SkipCatLobby)' != 'true'">
+        <ItemGroup>
+            <CatLobbyFile Include="@(CatLobbyMain->'%(RootDir)%(Directory)CatLobby.dll')"/>
+            <CatLobbyFile Include="@(CatLobbyMain->'%(RootDir)%(Directory)CatLobby.json')"/>
+        </ItemGroup>
+
+        <Error Condition="'@(CatLobbyFile)' == ''" Text="没有拿到 CatLobby 的构建产物"/>
+        <Copy SourceFiles="@(CatLobbyFile)" DestinationFolder="$(OutDir)CatLobby" SkipUnchangedFiles="true"/>
+    </Target>
+
     <Target Name="CopyVcdiffShimToOutput" AfterTargets="Build">
         <ItemGroup>
             <VcdiffShimOutput Include="$(MSBuildProjectDirectory)\..\bin\VcdiffShim\**\*"/>

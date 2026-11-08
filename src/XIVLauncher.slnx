@@ -17,6 +17,9 @@
         <BuildType Solution="ReleaseNoUpdate|x64" Project="Release" />
         <BuildType Solution="ReleaseNoUpdate|x86" Project="Release" />
     </Project>
+    <Project Path="XIVLauncher.CatLobby/XIVLauncher.CatLobby.csproj">
+        <BuildType Solution="ReleaseNoUpdate|*" Project="Release" />
+    </Project>
     <Project Path="XIVLauncher.CompanionApp/XIVLauncher.CompanionApp.csproj">
         <BuildType Solution="ReleaseNoUpdate|Any CPU" Project="Debug" />
         <BuildType Solution="ReleaseNoUpdate|x64" Project="Release" />
