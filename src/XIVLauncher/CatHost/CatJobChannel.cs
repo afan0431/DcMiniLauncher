@@ -106,6 +106,9 @@ public sealed class CatJobChannel : ICatLocalEndpoints
     private readonly Dictionary<int, bool?> lastDuty = [];
     private readonly Dictionary<int, string> lastBilling = [];
 
+    /// <summary>每个游戏进程最近一条回报的原因代码（reason.code, 没有为 null）; 游戏退出后判断要不要重开用</summary>
+    private readonly Dictionary<int, string?> lastReasonCodes = [];
+
     /// <summary>每个游戏进程上一次经本机接口收下回报的时刻（Environment.TickCount64）</summary>
     private readonly Dictionary<int, long> lastPostedAt = [];
 
@@ -296,6 +299,32 @@ public sealed class CatJobChannel : ICatLocalEndpoints
 
             foreach (var other in lastPostedAt.Keys.Where(x => x != pid).ToArray())
                 lastPostedAt.Remove(other);
+
+            foreach (var other in lastReasonCodes.Keys.Where(x => x != pid).ToArray())
+                lastReasonCodes.Remove(other);
+        }
+    }
+
+    /// <summary>这个游戏最近一条回报的原因代码（如 Afan 报的 customerOnline = 客户登录了自己的账号）, 没收到过或不带原因为 null</summary>
+    public string? LastReasonCode(int pid)
+    {
+        lock (stateLock)
+            return lastReasonCodes.TryGetValue(pid, out var code) ? code : null;
+    }
+
+    /// <summary>当前任务单要 Afan 做（desired 为 run）; 没有任务单为 false</summary>
+    public bool WantsRun
+    {
+        get
+        {
+            lock (stateLock)
+            {
+                if (jobJson == null)
+                    return false;
+
+                using var doc = JsonDocument.Parse(jobJson);
+                return doc.RootElement.TryGetProperty("desired", out var d) && d.ValueKind == JsonValueKind.String && d.GetString() == "run";
+            }
         }
     }
 
@@ -356,6 +385,7 @@ public sealed class CatJobChannel : ICatLocalEndpoints
             if (!lastSeqs.TryGetValue(pid, out var last) || seq > last)
             {
                 lastSeqs[pid]            = seq;
+                lastReasonCodes[pid]     = progress!["reason"] is JsonObject reason && reason["code"] is JsonValue code && code.TryGetValue<string>(out var c) ? c : null;
                 progress!["operationId"] = operation;
                 publish(PROGRESS_EVENT, progress);
             }

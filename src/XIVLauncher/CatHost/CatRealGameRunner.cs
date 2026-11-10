@@ -1548,7 +1548,124 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
             CleanupProcess(launched, companionAppManager);
         }
 
+        // 崩溃处理器没重开（或没有崩溃处理器）, 游戏自己退出了: 掉线后登不上被关掉的, 等网络恢复按崩溃重开同一条路重开
+        if (ReferenceEquals(result, launched) && launched.UnderlyingProcess.HasExited
+            && await RelaunchAfterExitAsync(launched, options, reporter, startToken, cancellationToken).ConfigureAwait(false) is { } again)
+            result = again;
+
         return result;
+    }
+
+    /// <summary>大厅端口, 同 <see cref="XIVLauncher.Common.Game.Launcher" /> 启动参数 Dev.LobbyPort01</summary>
+    private const int LOBBY_PORT = 54994;
+
+    /// <summary>连不上大厅时多久再探一次: 只是问的频率, 结论只看这一次连没连上, 决定网络恢复后最多晚几秒发现</summary>
+    private static readonly TimeSpan LobbyProbeInterval = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    ///     游戏自己退出后要不要重开（掉线重登第 4 段, Afan 任务 11-11-disconnect-relogin）: 大范围断网时游戏登不上会被关掉,
+    ///     这时等连得上这个号的大厅再按崩溃重开同一条路重开（重取票据、报 restarted、会话不变、自动进角色, Afan 照原任务单接着做）。
+    ///     只在这些都成立时重开: 不是 Cat 让关的、没在交接、没有已定的退出原因; 自动进角色且不挂 Minion（挂 Minion 的由 MINIONAPP 自己重开）;
+    ///     退出码非 0（0 = 正常退出游戏）; 这一次起来后进过世界（没进过世界就退出 = 起游戏本身有问题, 不再起, 照常报退出）;
+    ///     任务单要做（desired = run）; Afan 最后一条回报不是「客户登录了自己的账号」（客户在玩, 重开会把客户顶下去）。
+    ///     等网络期间收到 close 照常收尾。重开了返回新进程, 不重开返回 null
+    /// </summary>
+    private async Task<FFXIVProcess?> RelaunchAfterExitAsync
+    (
+        FFXIVProcess                  exited,
+        RestartMonitor.RestartOptions options,
+        ICatLaunchReporter            reporter,
+        CancellationToken             startToken,
+        CancellationToken             cancellationToken
+    )
+    {
+        if (IsCloseRequested || exitReason != null || await HandOffDecidedAsync().ConfigureAwait(false))
+            return null;
+
+        if (!request.AutoEnter || request.Minion)
+            return null;
+
+        var pid  = exited.ProcessID;
+        var code = TryGetExitCode(exited);
+
+        if (code is null or 0 || autoEnter is not { } flow || !flow.EnteredWorld.IsCompletedSuccessfully || jobs is not { WantsRun: true } channel)
+            return null;
+
+        if (channel.LastReasonCode(pid) == CUSTOMER_ONLINE)
+        {
+            reporter.Log("info", "游戏退出前 Afan 报了客户登录了自己的账号, 不重开");
+            return null;
+        }
+
+        reporter.Log("info", $"游戏退出了（退出码 0x{(uint)code.Value:X8}）, 任务单还要做: 连得上大厅就重开");
+
+        try
+        {
+            await WaitLobbyReachableAsync(reporter, startToken).ConfigureAwait(false);
+
+            if (IsCloseRequested)
+                return null;
+
+            exitReason = null;
+            return await RunGameAsync(options, pid, reporter, startToken, cancellationToken).ConfigureAwait(false);
+        }
+        catch (CatLaunchException ex)
+        {
+            exitReason         = CatExitReasons.RESTART_FAILED;
+            exitFailureCode    = ex.Code;
+            exitFailureMessage = ex.Message;
+            reporter.Log("error", $"退出后重开游戏失败: {ex.Message}");
+            return null;
+        }
+        catch (OperationCanceledException) when (IsCloseRequested || startToken.IsCancellationRequested)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Afan 回报的原因代码: 客户登录了自己的账号（Cat AutoRunHandlers.CustomerOnlineCode）</summary>
+    private const string CUSTOMER_ONLINE = "customerOnline";
+
+    /// <summary>等到连得上这个号的大厅（TCP 连一下就断开）; 连不上的原因变了才记一条</summary>
+    private async Task WaitLobbyReachableAsync(ICatLaunchReporter reporter, CancellationToken token)
+    {
+        var    host = context.Area.AreaLobby;
+        string? last = null;
+
+        while (true)
+        {
+            token.ThrowIfCancellationRequested();
+            var error = await ProbeLobbyAsync(host, token).ConfigureAwait(false);
+
+            if (error == null)
+            {
+                if (last != null)
+                    reporter.Log("info", $"连得上大厅 {host} 了, 重开游戏");
+                return;
+            }
+
+            if (error != last)
+            {
+                reporter.Log("info", $"连不上大厅 {host}:{LOBBY_PORT}（{error}）, 等网络恢复");
+                last = error;
+            }
+
+            await Task.Delay(LobbyProbeInterval, token).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task<string?> ProbeLobbyAsync(string host, CancellationToken token)
+    {
+        try
+        {
+            using var client = new System.Net.Sockets.TcpClient();
+            await client.ConnectAsync(host, LOBBY_PORT, token).ConfigureAwait(false);
+            return null;
+        }
+        catch (System.Net.Sockets.SocketException ex)
+        {
+            return $"{ex.SocketErrorCode}";
+        }
     }
 
     private async Task<(FFXIVProcess Process, bool DalamudOk, CompanionAppManager? Companion)> StartOnceAsync

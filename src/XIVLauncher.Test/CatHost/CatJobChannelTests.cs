@@ -175,6 +175,31 @@ public sealed class CatJobChannelTests
     }
 
     [Fact]
+    public void LastReasonCodeAndWantsRun_FollowTheLatestReportAndJob()
+    {
+        var channel = NewChannel();
+        channel.GameStarted(1234);
+        Assert.False(channel.WantsRun);
+
+        channel.SetJob(Job(3, desired: "run"));
+        Assert.True(channel.WantsRun);
+
+        Assert.Null(channel.LastReasonCode(1234));
+        channel.PostProgress(Progress(1234, 1, "blocked", """{"code":"customerOnline","text":"客户登录了自己的账号"}"""));
+        Assert.Equal("customerOnline", channel.LastReasonCode(1234));
+
+        // 重发的旧序号不改; 新的一条没带原因就清掉
+        channel.PostProgress(Progress(1234, 1));
+        Assert.Equal("customerOnline", channel.LastReasonCode(1234));
+        channel.MinProgressInterval = TimeSpan.Zero;
+        channel.PostProgress(Progress(1234, 2));
+        Assert.Null(channel.LastReasonCode(1234));
+
+        channel.SetJob(Job(4, desired: "pause"));
+        Assert.False(channel.WantsRun);
+    }
+
+    [Fact]
     public void PostProgress_PublishesTheReportAsIsPlusOperationId_OncePerSeq()
     {
         var channel = NewChannel();
