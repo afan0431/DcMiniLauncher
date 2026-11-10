@@ -1591,9 +1591,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         if (code is null or 0 || autoEnter is not { } flow || !flow.EnteredWorld.IsCompletedSuccessfully || jobs is not { WantsRun: true } channel)
             return null;
 
-        if (channel.LastReasonCode(pid) == CUSTOMER_ONLINE)
+        if (channel.LastReasonCode(pid) is CUSTOMER_ONLINE or GAME_TIME_OUT)
         {
-            reporter.Log("info", "游戏退出前 Afan 报了客户登录了自己的账号, 不重开");
+            reporter.Log("info", $"游戏退出前 Afan 报了 {channel.LastReasonCode(pid)}（客户在线或游戏时间不足）, 不重开");
             return null;
         }
 
@@ -1625,6 +1625,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
 
     /// <summary>Afan 回报的原因代码: 客户登录了自己的账号（Cat AutoRunHandlers.CustomerOnlineCode）</summary>
     private const string CUSTOMER_ONLINE = "customerOnline";
+
+    /// <summary>Afan 回报的原因代码: 游戏时间不足（Cat CustomerSideStops.GameTimeOutCode）; 重开也登不进去</summary>
+    private const string GAME_TIME_OUT = "gameTimeOut";
 
     /// <summary>等到连得上这个号的大厅（TCP 连一下就断开）; 连不上的原因变了才记一条</summary>
     private async Task WaitLobbyReachableAsync(ICatLaunchReporter reporter, CancellationToken token)

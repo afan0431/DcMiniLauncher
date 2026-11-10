@@ -1394,8 +1394,14 @@ public sealed class CatAutoEnter
     {
         cancellationToken.ThrowIfCancellationRequested();
         Log.Information("[CatAutoEnter] {Step}时大厅弹出错误框: {Text}", step, Describe(lobby.DialogueText));
-        return Task.FromResult<Exception>(new StopException(CatAutoEnterStopCodes.LOBBY_ERROR, $"{step}时大厅提示: {Describe(lobby.DialogueText)}"));
+        var code = IsGameTimeOut(lobby.DialogueText) ? CatAutoEnterStopCodes.GAME_TIME_OUT : CatAutoEnterStopCodes.LOBBY_ERROR;
+        return Task.FromResult<Exception>(new StopException(code, $"{step}时大厅提示: {Describe(lobby.DialogueText)}"));
     }
+
+    /// <summary>游戏时间（点卡 / 月卡）用完的提示「无法开始游戏，剩余游戏时间不足。」（右下角 6012, 11-11 用户截图）; 框里的字按宽度折过行, 比之前去掉换行</summary>
+    internal static bool IsGameTimeOut(string? text) =>
+        (text ?? string.Empty).Replace("\r", string.Empty, StringComparison.Ordinal).Replace("\n", string.Empty, StringComparison.Ordinal)
+                              .Contains("剩余游戏时间不足", StringComparison.Ordinal);
 
     /// <summary>登录角色时被告知角色还没下线, 提示框已点掉, 要等一会儿重新登录</summary>
     private sealed class RetryEnterException(string notice) : Exception(notice);

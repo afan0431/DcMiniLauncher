@@ -557,6 +557,27 @@ public sealed class CatAutoEnterTests
     }
 
     [Fact]
+    public async Task GameTimeOutDialog_StopsWithItsOwnCode()
+    {
+        var (game, reporter) = Setup(Chara("11", "小白"));
+
+        game.AfterConfirm = g =>
+        {
+            g.Dialogue = true;
+            g.Text     = "无法开始游戏，剩余游戏时间不足。";
+        };
+
+        var flow    = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null));
+        var outcome = await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout);
+
+        Assert.Equal(CatAutoEnterOutcome.Stopped, outcome);
+        Assert.Contains("stopped:gameTimeOut", reporter.Entries);
+        Assert.Equal("LOBBYSTATE", game.Commands.Last()); // 框留着不点, 由 Cat 关游戏
+        Assert.True(CatAutoEnter.IsGameTimeOut("无法开始游戏，剩余游戏时间\n不足。"));
+        Assert.False(CatAutoEnter.IsGameTimeOut("与服务器的连接已断开。"));
+    }
+
+    [Fact]
     public async Task ErrorDialog_StopsAndLeavesTheGameAlone()
     {
         var (game, reporter) = Setup(Chara("11", "小白"));
