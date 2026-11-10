@@ -165,6 +165,9 @@ public static class CatAutoEnterStopCodes
     /// <summary>大厅弹出了错误或提示框</summary>
     public const string LOBBY_ERROR = "lobbyError";
 
+    /// <summary>大厅提示「无法开始游戏，剩余游戏时间不足。」（6012）: 框留在界面上, Cat 收到后暂停任务、关游戏、提醒客户充值</summary>
+    public const string GAME_TIME_OUT = "gameTimeOut";
+
     /// <summary>某一步等够时间没有结果（message 里写明卡在哪一步）</summary>
     public const string TIMEOUT = "timeout";
 
