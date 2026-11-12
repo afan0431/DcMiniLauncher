@@ -889,6 +889,59 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
 
     #endregion
 
+    #region 共用游戏配置
+
+    [Fact]
+    public async Task Launch_InjectsCharConfigModule_WithoutDalamudOrAutoEnter()
+    {
+        var target = new FakeCharConfigTarget();
+        environment.CharConfigTargetFactory = _ => target;
+
+        var runner = NewRunner();
+        var run    = runner.RunAsync(Request(), reporter, CancellationToken.None);
+
+        await WaitUntilAsync(() => target.Injections == 1);
+        await WaitUntilAsync(() => reporter.Entries.Contains("stage:running"));
+
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        await run.WaitAsync(Timeout);
+
+        Assert.Equal(1, target.Injections);
+    }
+
+    [Fact]
+    public async Task Launch_WithoutModuleFile_StillRuns()
+    {
+        var runner = NewRunner();
+        var run    = runner.RunAsync(Request(), reporter, CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("stage:running"));
+
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        await run.WaitAsync(Timeout);
+    }
+
+    private sealed class FakeCharConfigTarget : ICatModuleTarget
+    {
+        private int injections;
+
+        public int Injections => Volatile.Read(ref injections);
+
+        public bool HasExited => false;
+
+        public bool HasWindow => true;
+
+        public bool IsInjected => Injections > 0;
+
+        public string? Inject(bool readOnly)
+        {
+            Interlocked.Increment(ref injections);
+            return null;
+        }
+    }
+
+    #endregion
+
     #region 假环境
 
     private sealed class FakeEnvironment(string gamePath) : ICatInternationalEnvironment
@@ -999,6 +1052,11 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
             AutoEnterGames++;
             return AutoEnterGameFactory?.Invoke(process) ?? new CatInternationalAutoEnter(process);
         }
+
+        /// <summary>注入共用游戏配置模块的目标; 不设 = 这台电脑没有模块文件</summary>
+        public Func<Process, ICatModuleTarget>? CharConfigTargetFactory { get; set; }
+
+        public ICatModuleTarget? CreateCharConfigTarget(Process process) => CharConfigTargetFactory?.Invoke(process);
 
         public ICatInternationalMinion Minion => FakeMinion;
 

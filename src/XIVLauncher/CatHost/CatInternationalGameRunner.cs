@@ -477,6 +477,8 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
             return process;
         }
 
+        StartCharConfigInjection(process, startToken);
+
         var dalamudLoaded = false;
 
         try
@@ -518,6 +520,44 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
         }
 
         return process;
+    }
+
+    /// <summary>
+    ///     在后台给游戏注入「所有角色共用一套游戏配置」的模块（是否生效只看本机 machine.json）: 等窗口出现就注, 不等 Dalamud 和 Minion,
+    ///     赶在进入角色读配置之前。注不上只少这一项, 游戏照常
+    /// </summary>
+    private void StartCharConfigInjection(Process process, CancellationToken startToken)
+    {
+        if (environment.CreateCharConfigTarget(process) is not { } target)
+        {
+            Log.Information("[CatHost] 这台电脑没有游戏内模块文件, 国际服游戏不共用游戏配置 (PID={ProcessID})", process.Id);
+            return;
+        }
+
+        _ = Task.Run
+        (
+            async () =>
+            {
+                try
+                {
+                    var error = await CatModuleInjection.InjectWhenReadyAsync(target, true, false, null, startToken).ConfigureAwait(false);
+
+                    if (error == null)
+                        Log.Information("[CatHost] 国际服游戏已注入共用游戏配置的模块 (PID={ProcessID})", process.Id);
+                    else
+                        Log.Warning("[CatHost] 国际服游戏没有注入共用游戏配置的模块 (PID={ProcessID}): {Error}", process.Id, error);
+                }
+                catch (OperationCanceledException)
+                {
+                    Log.Information("[CatHost] 游戏已在收尾, 不再注入共用游戏配置的模块 (PID={ProcessID})", process.Id);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "[CatHost] 注入共用游戏配置的模块出错（游戏不受影响）");
+                }
+            },
+            CancellationToken.None
+        );
     }
 
     /// <summary>

@@ -232,6 +232,10 @@ namespace
     // 钩子里调: 只登记, 不查
     void WantName(const std::string& cid)
     {
+        // 只装共用配置时没有主线程通道, 查不了角色名: 发布时不写
+        if (ModuleCharConfigOnly())
+            return;
+
         std::lock_guard<std::mutex> lock(g_nameMutex);
 
         if (g_names.count(cid) == 0 && g_nameLookups.count(cid) == 0)

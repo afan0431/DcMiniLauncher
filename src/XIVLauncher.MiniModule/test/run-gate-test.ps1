@@ -260,10 +260,10 @@ try
             'DIALOG YES 123456'     = 'FAIL sigscan-failed'
             'DIALOG NO'             = 'FAIL sigscan-failed'
             'DIALOG OK'             = 'FAIL sigscan-failed'
-            'DIALOG YES'            = 'FAIL usage: DIALOG <YES <contentId>|NO|OK>'
-            'DIALOG YES 测试角色'   = 'FAIL usage: DIALOG <YES <contentId>|NO|OK>'
-            'DIALOG NO 123456'      = 'FAIL usage: DIALOG <YES <contentId>|NO|OK>'
-            'DIALOG MAYBE'          = 'FAIL usage: DIALOG <YES <contentId>|NO|OK>'
+            'DIALOG YES'            = 'FAIL usage: DIALOG <YES <contentId>|NO|OK|NOTICE>'
+            'DIALOG YES 测试角色'   = 'FAIL usage: DIALOG <YES <contentId>|NO|OK|NOTICE>'
+            'DIALOG NO 123456'      = 'FAIL usage: DIALOG <YES <contentId>|NO|OK|NOTICE>'
+            'DIALOG MAYBE'          = 'FAIL usage: DIALOG <YES <contentId>|NO|OK|NOTICE>'
         }
 
         foreach ($command in $expected.Keys)
@@ -316,6 +316,7 @@ finally
 # 覆盖: 主备特征码找到假宿主里的调用点 → MinHook 挂上 → 读之前放入（角色目录不存在先建）→ 这一套没有的文件不放入
 #       → 保存内容与登录时相同不发布 → 改了才发布（outbox、state.json pending、current）→ 没有文件的号第一次保存也发布
 #       → UNLOAD 时卸下钩子、模块卸载、宿主照常打开文件
+#       → 只装共用配置模式（模式文件 charconfig, 国际服客户端用）: 不开管道, 照常放入与发布, 进程正常退出
 # 本机目录用环境变量 CAT_CHARCONFIG_ROOT 指到临时目录, 不碰 %LOCALAPPDATA%\Cat\char-config。
 
 function Get-Sha256Hex([byte[]]$Bytes)
@@ -374,6 +375,7 @@ $startInfo.EnvironmentVariables['CAT_CHARCONFIG_ROOT'] = $charRoot
 $hookHost   = [Diagnostics.Process]::Start($startInfo)
 $hookHostId = $hookHost.Id
 $exitHostId = $null
+$onlyHostId = $null
 
 function Send-HostCommand([string]$Line)
 {
@@ -538,6 +540,68 @@ try
     elseif ($exitHost.ExitCode -ne 0) { $failures += ('挂着钩子时进程退出码不对: 0x{0:X8}' -f $exitHost.ExitCode) }
     elseif ((Get-OutboxCount $setDir) -ne $outboxBefore + 1) { $failures += "保存后立即退出, 写回没有发布（outbox $outboxBefore → $(Get-OutboxCount $setDir)）" }
     else { Write-Host '[OK] 挂着钩子时保存后立即退出: 正常退出且已发布' }
+
+    # 只装共用配置模式: 不开管道, 钩子照常放入与发布, 进程正常退出
+    $outboxBefore = Get-OutboxCount $setDir
+    $onlyHost   = [Diagnostics.Process]::Start($startInfo)
+    $hookHost   = $onlyHost
+    $onlyHostId = $onlyHost.Id
+    Start-Sleep -Milliseconds 500
+
+    $onlyModeFile = Join-Path $env:ProgramData "DcMiniLauncher\module-$($onlyHost.Id).mode"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $onlyModeFile) | Out-Null
+    [IO.File]::WriteAllText($onlyModeFile, 'charconfig')
+
+    try
+    {
+        $error4 = [Injector]::Inject($onlyHost.Id, $dllPath)
+        if ($error4) { throw "注入失败: $error4" }
+
+        # 没有管道可问: 心跳写着 hooked=true 说明挂钩已做完
+        $onlyHeartbeatPath = Join-Path $charRoot "modules\$($onlyHost.Id).json"
+        $hooked = Wait-Until {
+            (Test-Path $onlyHeartbeatPath) -and
+            (([IO.File]::ReadAllText($onlyHeartbeatPath, [Text.Encoding]::UTF8) | ConvertFrom-Json).hooked -eq $true)
+        } 10000
+        if (-not $hooked) { $failures += '只装共用配置模式: 心跳里没有 hooked=true' }
+        else { Write-Host '[OK] 只装共用配置模式: 已挂钩' }
+
+        $onlyPipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', "minilauncher-$($onlyHost.Id)", [System.IO.Pipes.PipeDirection]::InOut)
+        try
+        {
+            $onlyPipe.Connect(1500)
+            $failures += '只装共用配置模式不该开管道（管道名留给国际服的 CatLobby 插件）'
+        }
+        catch [TimeoutException] { Write-Host '[OK] 只装共用配置模式: 没有开管道' }
+        finally { $onlyPipe.Dispose() }
+
+        $answer = Send-HostCommand "READ $macroPath"
+        if ($answer -ne 'OK 1') { $failures += "只装共用配置模式 READ MACRO.DAT 失败: $answer" }
+
+        $macroOnly = [byte[]]$macroLatest.Clone()
+        $macroOnly[7] = 5
+        [IO.File]::WriteAllBytes($sourcePath, $macroOnly)
+        $answer = Send-HostCommand "SAVE $macroPath|$sourcePath"
+        if ($answer -ne 'OK') { $failures += "只装共用配置模式 SAVE MACRO.DAT 失败: $answer" }
+        if (-not (Wait-Until { (Get-OutboxCount $setDir) -eq $outboxBefore + 1 })) { $failures += "只装共用配置模式: 改过的 MACRO.DAT 没发布（outbox $outboxBefore → $(Get-OutboxCount $setDir)）" }
+        else
+        {
+            $newest = Get-ChildItem -Path (Join-Path $setDir 'outbox') -Filter '*.json' | Sort-Object Name | Select-Object -Last 1
+            $item   = [IO.File]::ReadAllText($newest.FullName, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($null -ne $item.charName) { $failures += "只装共用配置模式不查角色名, outbox 的 charName 应为 null: $($item.charName)" }
+            Write-Host '[OK] 只装共用配置模式: 读之前放入、改过的保存发布'
+        }
+
+        $onlyHost.StandardInput.WriteLine('QUIT')
+        $onlyHost.StandardInput.Flush()
+        if (-not $onlyHost.WaitForExit(15000)) { $failures += '只装共用配置模式: 进程退出卡住了（15 秒）' }
+        elseif ($onlyHost.ExitCode -ne 0) { $failures += ('只装共用配置模式: 进程退出码不对: 0x{0:X8}' -f $onlyHost.ExitCode) }
+        else { Write-Host '[OK] 只装共用配置模式: 进程正常退出' }
+    }
+    finally
+    {
+        if (Test-Path $onlyModeFile) { Remove-Item $onlyModeFile -Force }
+    }
 }
 finally
 {
@@ -546,7 +610,7 @@ finally
 }
 
 # ---- 5. 结论 ----------------------------------------------------------------
-foreach ($logPid in @($process.Id, $hookHostId, $exitHostId) | Where-Object { $_ })
+foreach ($logPid in @($process.Id, $hookHostId, $exitHostId, $onlyHostId) | Where-Object { $_ })
 {
     $logPath = Join-Path $env:TEMP "minilauncher-module-$logPid.log"
     if (Test-Path $logPath)
