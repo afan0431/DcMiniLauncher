@@ -109,6 +109,9 @@ public interface ICatInternationalEnvironment
     /// <summary>为一个已起来的国际服游戏建自动进入角色的游戏一侧</summary>
     ICatAutoEnterGame CreateAutoEnterGame(Process process);
 
+    /// <summary>为一个已起来的国际服游戏建注入「所有角色共用一套游戏配置」模块的目标; 这台电脑没有模块文件时返回 null</summary>
+    ICatModuleTarget? CreateCharConfigTarget(Process process);
+
     /// <summary>Minion</summary>
     ICatInternationalMinion Minion { get; }
 }
@@ -277,6 +280,9 @@ internal sealed class CatInternationalRealEnvironment(Func<Task> ensureInitializ
 
     public ICatAutoEnterGame CreateAutoEnterGame(Process process) =>
         new CatInternationalAutoEnter(process);
+
+    public ICatModuleTarget? CreateCharConfigTarget(Process process) =>
+        InGame.MiniModuleInjector.ModulePath.Exists ? new CatCharConfigModuleTarget(process) : null;
 
     public ICatInternationalMinion Minion { get; } = new CatInternationalMinion();
 

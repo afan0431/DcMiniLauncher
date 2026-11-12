@@ -18,6 +18,10 @@
 // 模块就不装标题守卫和选角右键菜单。VERSION 的回应里带 mode=readonly|full
 bool ModuleReadOnly();
 
+// 只装共用配置模式: 模式文件内容为 charconfig（国际服客户端用）。只挂 FileInterface::OpenFile,
+// 不建主线程通道、不开管道、不碰任何按国服客户端偏移读写的东西
+bool ModuleCharConfigOnly();
+
 // ---- 日志 (log.cpp) ----------------------------------------------------------
 // 日志落在 %TEMP%\minilauncher-module-<pid>.log —— 游戏目录不保证可写, 且这里天然按 PID 分开
 void        LogInit();

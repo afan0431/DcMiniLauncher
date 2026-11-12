@@ -194,3 +194,23 @@ public sealed class CatProcessModuleTarget(Process process) : ICatModuleTarget
     /// <inheritdoc />
     public string? Inject(bool readOnly) => MiniModuleInjector.Inject(process, readOnly);
 }
+
+/// <summary>
+///     国际服的真实游戏进程: 模块只装「所有角色共用一套游戏配置」
+/// </summary>
+public sealed class CatCharConfigModuleTarget(Process process) : ICatModuleTarget
+{
+    private readonly CatProcessModuleTarget game = new(process);
+
+    /// <inheritdoc />
+    public bool HasExited => game.HasExited;
+
+    /// <inheritdoc />
+    public bool HasWindow => game.HasWindow;
+
+    /// <inheritdoc />
+    public bool IsInjected => game.IsInjected;
+
+    /// <inheritdoc />
+    public string? Inject(bool readOnly) => MiniModuleInjector.InjectCharConfigOnly(process);
+}

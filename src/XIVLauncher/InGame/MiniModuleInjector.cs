@@ -57,7 +57,7 @@ public static class MiniModuleInjector
 
     /// <summary>
     ///     模式文件 <c>%ProgramData%\DcMiniLauncher\module-&lt;pid&gt;.mode</c>: 注入前写, 模块启动时读。内容 <c>readonly</c> = 只读模式
-    ///     （不装标题守卫和选角右键菜单）; 没有这个文件 = 完整模式。游戏退出时随端口文件一起删
+    ///     （不装标题守卫和选角右键菜单）, <c>charconfig</c> = 只装共用游戏配置; 没有这个文件 = 完整模式。游戏退出时随端口文件一起删
     /// </summary>
     public static string ModeFilePath(int processId) =>
         Path.Combine(Path.GetDirectoryName(RunningGameRegistry.PortFilePath(processId))!, $"module-{processId}.mode");
@@ -70,10 +70,23 @@ public static class MiniModuleInjector
     public static string? Inject(Process gameProcess, bool readOnly = false)
     {
         lock (InjectSync)
-            return InjectCore(gameProcess, readOnly);
+            return InjectCore(gameProcess, readOnly ? MODE_READ_ONLY : null);
     }
 
-    private static string? InjectCore(Process gameProcess, bool readOnly)
+    /// <summary>
+    ///     给国际服游戏注入, 只装「所有角色共用一套游戏配置」: 模块不建主线程通道、不开管道, 其余功能（偏移都是国服客户端的）一样不装。
+    ///     返回 null 表示成功, 否则是失败原因。模块已经在了就不再注入
+    /// </summary>
+    public static string? InjectCharConfigOnly(Process gameProcess)
+    {
+        lock (InjectSync)
+            return InjectCore(gameProcess, MODE_CHAR_CONFIG);
+    }
+
+    private const string MODE_READ_ONLY   = "readonly";
+    private const string MODE_CHAR_CONFIG = "charconfig";
+
+    private static string? InjectCore(Process gameProcess, string? mode)
     {
         var modulePath = ModulePath;
 
@@ -89,8 +102,8 @@ public static class MiniModuleInjector
             return null;
         }
 
-        // 每次注入前都按这次要的模式重写（进程号会复用: 不能让上一个游戏留下的文件决定这一次）; 只读模式写不成就不注, 免得装成完整模式
-        if (WriteModeFile(gameProcess.Id, readOnly) is { } modeError)
+        // 每次注入前都按这次要的模式重写（进程号会复用: 不能让上一个游戏留下的文件决定这一次）; 模式文件写不成就不注, 免得装成完整模式
+        if (WriteModeFile(gameProcess.Id, mode) is { } modeError)
             return modeError;
 
         if (LoadLibrary(gameProcess, modulePath.FullName) is { } failure)
@@ -262,17 +275,17 @@ public static class MiniModuleInjector
         return null;
     }
 
-    /// <summary>写（只读）或删（完整）模式文件; 失败返回原因</summary>
-    private static string? WriteModeFile(int processId, bool readOnly)
+    /// <summary>写（mode 非空）或删（完整模式）模式文件; 失败返回原因</summary>
+    private static string? WriteModeFile(int processId, string? mode)
     {
         var path = ModeFilePath(processId);
 
         try
         {
-            if (readOnly)
+            if (mode != null)
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                File.WriteAllText(path, "readonly");
+                File.WriteAllText(path, mode);
             }
             else if (File.Exists(path))
                 File.Delete(path);
@@ -282,7 +295,7 @@ public static class MiniModuleInjector
         catch (Exception ex)
         {
             Log.Warning(ex, "[MiniModule] 写模式文件失败 {Path}", path);
-            return readOnly ? $"写只读模式文件失败, 没有注入: {ex.Message}" : $"删旧的模式文件失败, 没有注入: {ex.Message}";
+            return mode != null ? $"写模式文件失败, 没有注入: {ex.Message}" : $"删旧的模式文件失败, 没有注入: {ex.Message}";
         }
     }
 
