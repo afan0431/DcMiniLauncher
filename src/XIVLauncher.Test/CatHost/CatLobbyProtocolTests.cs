@@ -610,7 +610,7 @@ public sealed class CatLobbyProtocolTests
     }
 
     [Theory]
-    [InlineData("This World is currently full. Please wait until an opening is available and try again.")]
+    [InlineData("This World is currently full. Please wait until an opening is available and try again. If you are on the free trial, you cannot log in while there is a queue.")]
     [InlineData("Log in with Rin?")]
     [InlineData("")]
     public void NonQueueTexts(string text)

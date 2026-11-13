@@ -38,6 +38,9 @@ internal sealed class CatLobbyPipe : IDisposable
     private readonly CancellationTokenSource stop = new();
     private          Task?                   loop;
 
+    /// <summary>每条命令上一次的回应, 只在管道线程上读写</summary>
+    private readonly Dictionary<string, string> lastReplies = new();
+
     public CatLobbyPipe(IFramework framework, LobbyGame game, IPluginLog log, string logPath)
     {
         this.framework = framework;
@@ -133,11 +136,30 @@ internal sealed class CatLobbyPipe : IDisposable
             if (payload.Length > LobbyReplies.MAX_RESPONSE_BYTES)
                 payload = Encoding.UTF8.GetBytes("FAIL too-large");
 
-            log.Debug("[pipe] < {Command} | > {Response}", command.Trim(), response.Split('\n')[0]);
+            Trace(command.Trim(), response);
 
             await server.WriteAsync(payload, token).ConfigureAwait(false);
             await server.FlushAsync(token).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    ///     记一条命令和它的回应。编排是轮询的, 同一条命令回应没变时只记调试级, 变了才记信息级,
+    ///     这样默认日志级别下就能从 dalamud.log 看出自动进入角色每一步停在哪
+    /// </summary>
+    private void Trace(string command, string response)
+    {
+        var changed = !lastReplies.TryGetValue(command, out var last) || last != response;
+
+        if (lastReplies.Count > 64)
+            lastReplies.Clear();
+
+        lastReplies[command] = response;
+
+        if (changed)
+            log.Information("[pipe] < {Command} | > {Response}", command, LobbyTextRules.Sanitize(response, 1500));
+        else
+            log.Debug("[pipe] < {Command} | > {Response}", command, response.Split('\n')[0]);
     }
 
     /// <summary>执行一条命令, 返回回应。任何异常都转成 FAIL exception, 不让管道线程退出</summary>

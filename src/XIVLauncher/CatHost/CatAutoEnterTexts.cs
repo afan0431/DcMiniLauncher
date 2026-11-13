@@ -11,7 +11,7 @@ internal static partial class CatAutoEnterTexts
     private static readonly string[] QueueKeywords =
     [
         CatAutoEnter.QUEUE_PROMPT,
-        "queue", "人待ち", "混み合って", "Warteliste", "Joueurs en attente"
+        "Players in queue", "人待ち", "混み合って", "Warteliste", "Joueurs en attente"
     ];
 
     private static readonly string[] ForcedLogoutKeywords =

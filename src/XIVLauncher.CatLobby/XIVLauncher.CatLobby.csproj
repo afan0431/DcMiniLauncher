@@ -19,9 +19,9 @@
         <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
     </PropertyGroup>
 
-    <!-- SDK 默认到 %APPDATA%\XIVLauncher\addon\Hooks\dev 找国际服 Dalamud; DML 把它放在 XIVLauncherCN\international 下 -->
+    <!-- SDK 默认到 %APPDATA%\XIVLauncher\addon\Hooks\dev 找国际服 Dalamud; DML 把它放在 XIVLauncherCN\international 下, dev 目录总是当前在用的那一版 -->
     <PropertyGroup>
-        <CatLobbyDalamudDir>$(APPDATA)\XIVLauncherCN\international\addon\Hooks\15.0.3.9\</CatLobbyDalamudDir>
+        <CatLobbyDalamudDir>$(APPDATA)\XIVLauncherCN\international\addon\Hooks\dev\</CatLobbyDalamudDir>
         <DalamudLibPath Condition="'$(DALAMUD_HOME)' == ''">$(CatLobbyDalamudDir)</DalamudLibPath>
         <AssemblySearchPaths>$(AssemblySearchPaths);$(DalamudLibPath)</AssemblySearchPaths>
     </PropertyGroup>

@@ -436,6 +436,7 @@ public sealed class CatAutoEnterTextsTests
     [Theory]
     [InlineData("要以 Alice 登录吗？")]
     [InlineData("Log in as Alice?")]
+    [InlineData("This World is currently full. Please wait until an opening is available and try again. If you are on the free trial, you cannot log in while there is a queue.")]
     [InlineData("")]
     public void OrdinaryPrompts_AreNotSpecial(string text)
     {
@@ -553,6 +554,77 @@ public sealed class DalamudDevPluginRegistrarTests : IDisposable
 
         Assert.True(result.Ok);
         Assert.Equal(dll, Assert.Single(Locations()).Value<string>("Path"));
+    }
+
+    private JObject ReadConfig() => JObject.Parse(File.ReadAllText(ConfigPath));
+
+    private static JObject ProfileEntry(JObject config, string name) =>
+        Assert.Single(((JArray)config["DefaultProfile"]!["Plugins"]!["$values"]!).OfType<JObject>(), x => x.Value<string>("InternalName") == name);
+
+    [Fact]
+    public async Task NewEntry_StartsOnBoot_AndIsEnabledInDefaultProfileUnderTheSameId()
+    {
+        WriteConfig((AFAN, true));
+
+        await DalamudDevPluginRegistrar.EnsureAsync(Config, dll);
+
+        var config   = ReadConfig();
+        var settings = (JObject)config["DevPluginSettings"]![dll]!;
+        var id       = settings.Value<string>("WorkingPluginId");
+
+        Assert.True(settings.Value<bool>("StartOnBoot"));
+        Assert.False(settings.Value<bool>("AutomaticReloading"));
+        Assert.True(Guid.TryParse(id, out var guid) && guid != Guid.Empty);
+
+        var entry = ProfileEntry(config, "CatLobby");
+        Assert.Equal(id, entry.Value<string>("WorkingPluginId"));
+        Assert.True(entry.Value<bool>("IsEnabled"));
+    }
+
+    [Fact]
+    public async Task MovedPlugin_KeepsItsId_DropsOldSettings_AndReenablesInProfile()
+    {
+        const string OLD = @"D:\old\CatLobby\CatLobby.dll";
+        const string ID  = "11111111-2222-3333-4444-555555555555";
+
+        WriteConfig((AFAN, true), (OLD, true));
+
+        var config = ReadConfig();
+        config["DevMode"] = false;
+        config["DevPluginSettings"] = new JObject
+        {
+            [AFAN] = new JObject { ["StartOnBoot"] = true, ["WorkingPluginId"] = "772e8f7c-1486-46f3-b43e-87f7f98f30c5" },
+            [OLD]  = new JObject { ["StartOnBoot"] = false, ["WorkingPluginId"] = ID },
+        };
+        config["DefaultProfile"] = new JObject
+        {
+            ["Plugins"] = new JObject
+            {
+                ["$values"] = new JArray
+                {
+                    new JObject { ["InternalName"] = "Afan", ["WorkingPluginId"] = "772e8f7c-1486-46f3-b43e-87f7f98f30c5", ["IsEnabled"] = true },
+                    new JObject { ["InternalName"] = "CatLobby", ["WorkingPluginId"] = ID, ["IsEnabled"] = false },
+                    new JObject { ["InternalName"] = "CatLobby", ["WorkingPluginId"] = "99999999-2222-3333-4444-555555555555", ["IsEnabled"] = false },
+                }
+            }
+        };
+        File.WriteAllText(ConfigPath, config.ToString());
+
+        await DalamudDevPluginRegistrar.EnsureAsync(Config, dll);
+
+        var after    = ReadConfig();
+        var settings = (JObject)after["DevPluginSettings"]!;
+
+        Assert.True(after.Value<bool>("DevMode"));
+        Assert.Null(settings[OLD]);
+        Assert.NotNull(settings[AFAN]);
+        Assert.True(settings[dll]!.Value<bool>("StartOnBoot"));
+        Assert.Equal(ID, settings[dll]!.Value<string>("WorkingPluginId"));
+
+        var entry = ProfileEntry(after, "CatLobby");
+        Assert.Equal(ID, entry.Value<string>("WorkingPluginId"));
+        Assert.True(entry.Value<bool>("IsEnabled"));
+        Assert.True(ProfileEntry(after, "Afan").Value<bool>("IsEnabled"));
     }
 
     [Fact]

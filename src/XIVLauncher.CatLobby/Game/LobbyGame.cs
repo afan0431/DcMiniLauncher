@@ -30,8 +30,8 @@ internal sealed unsafe class LobbyGame(IDataManager data, IPluginLog log)
     /// <summary>_CharaSelectWorldServer ← (25, 0, 服务器下标)。未实机</summary>
     private const int CALLBACK_SELECT_WORLD = 25;
 
-    /// <summary>_TitleMenu ← (4): 「开始游戏」。未实机</summary>
-    private const int CALLBACK_TITLE_START = 4;
+    /// <summary>_TitleMenu 上「开始游戏」按钮的节点 id; 和国服小模块一样, 对按钮发它自己登记的点击事件。未实机</summary>
+    private const uint TITLE_START_BUTTON_ID = 4;
 
     /// <summary>SelectYesno: FireCallbackInt(0)=是 (1)=否; SelectOk: FireCallbackInt(0)=确定。未实机</summary>
     private const int CALLBACK_YES = 0;
@@ -294,13 +294,12 @@ internal sealed unsafe class LobbyGame(IDataManager data, IPluginLog log)
         if (title == null)
             return false;
 
-        var button = title->GetComponentButtonById(4);
+        var button = title->GetComponentButtonById(TITLE_START_BUTTON_ID);
 
         if (!Plausible(button) || !button->IsEnabled)
             return false;
 
-        FireInts(title, true, CALLBACK_TITLE_START);
-        return true;
+        return ClickButton(title, button);
     }
 
     // ---- 选角列表 ----------------------------------------------------------------

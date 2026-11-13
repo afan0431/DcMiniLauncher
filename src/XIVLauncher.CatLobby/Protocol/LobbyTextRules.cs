@@ -11,12 +11,12 @@ namespace XIVLauncher.CatLobby.Protocol;
 public static partial class LobbyTextRules
 {
     /// <summary>
-    ///     排队提示（Error 表第 13206 行「服务器拥挤, 排队人数: n」）里的词: 英 queue / 日 人待ち 混み合って / 德 Warteliste / 法 en attente。
+    ///     排队提示（Error 表第 13206 行「服务器拥挤, 排队人数: n」）里的词: 英 Players in queue（只写 queue 会连「服务器已满」第 13216 行一起命中）/ 日 人待ち 混み合って / 德 Warteliste / 法 en attente。
     ///     「是否退出排队」那个是/否框（Lobby 表第 1800 行）带 queue，但它是 SelectYesno, 不走确定框的判断。
     /// </summary>
     private static readonly string[] QueueKeywords =
     [
-        "queue", "人待ち", "混み合って", "Warteliste", "Joueurs en attente"
+        "Players in queue", "人待ち", "混み合って", "Warteliste", "Joueurs en attente"
     ];
 
     /// <summary>
