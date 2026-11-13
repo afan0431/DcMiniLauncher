@@ -57,7 +57,7 @@ public static class MiniModuleInjector
 
     /// <summary>
     ///     模式文件 <c>%ProgramData%\DcMiniLauncher\module-&lt;pid&gt;.mode</c>: 注入前写, 模块启动时读。内容 <c>readonly</c> = 只读模式
-    ///     （不装标题守卫和选角右键菜单）, <c>charconfig</c> = 只装共用游戏配置; 没有这个文件 = 完整模式。游戏退出时随端口文件一起删
+    ///     （不装标题守卫和选角右键菜单）; 没有这个文件 = 完整模式。游戏退出时随端口文件一起删
     /// </summary>
     public static string ModeFilePath(int processId) =>
         Path.Combine(Path.GetDirectoryName(RunningGameRegistry.PortFilePath(processId))!, $"module-{processId}.mode");
@@ -73,18 +73,7 @@ public static class MiniModuleInjector
             return InjectCore(gameProcess, readOnly ? MODE_READ_ONLY : null);
     }
 
-    /// <summary>
-    ///     给国际服游戏注入, 只装「所有角色共用一套游戏配置」: 模块不建主线程通道、不开管道, 其余功能（偏移都是国服客户端的）一样不装。
-    ///     返回 null 表示成功, 否则是失败原因。模块已经在了就不再注入
-    /// </summary>
-    public static string? InjectCharConfigOnly(Process gameProcess)
-    {
-        lock (InjectSync)
-            return InjectCore(gameProcess, MODE_CHAR_CONFIG);
-    }
-
-    private const string MODE_READ_ONLY   = "readonly";
-    private const string MODE_CHAR_CONFIG = "charconfig";
+    private const string MODE_READ_ONLY = "readonly";
 
     private static string? InjectCore(Process gameProcess, string? mode)
     {

@@ -3,10 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Text;
-using Newtonsoft.Json.Linq;
 using XIVLauncher.CatHost;
-using XIVLauncher.CatLobby.Protocol;
-using XIVLauncher.Dalamud;
 using XIVLauncher.InGame;
 using XIVLauncher.Test.CatHost;
 using Xunit;
@@ -14,25 +11,25 @@ using Xunit;
 namespace XIVLauncher.Test.International;
 
 /// <summary>
-///     国际服自动进入角色: 假插件开同名管道（回应用插件自己的协议层拼装），编排与国际服游戏一侧原样跑通
+///     国际服自动进入角色: 假的游戏内模块开同名管道（回应与小模块逐字一致），编排与国际服游戏一侧原样跑通
 /// </summary>
 public sealed class CatInternationalAutoEnterTests : IDisposable
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(30);
 
     private readonly Process       placeholder;
-    private readonly FakePlugin    plugin;
+    private readonly FakeModule    module;
     private readonly RecordingReporter reporter = new();
 
     public CatInternationalAutoEnterTests()
     {
         placeholder = StartPlaceholder();
-        plugin      = new FakePlugin(placeholder.Id);
+        module      = new FakeModule(placeholder.Id);
     }
 
     public void Dispose()
     {
-        plugin.Dispose();
+        module.Dispose();
 
         try
         {
@@ -104,7 +101,7 @@ public sealed class CatInternationalAutoEnterTests : IDisposable
     [Fact]
     public async Task Send_HoldsTheGate_UntilReleased()
     {
-        plugin.Start();
+        module.Start();
 
         using var game = new CatInternationalAutoEnter(placeholder);
 
@@ -117,14 +114,14 @@ public sealed class CatInternationalAutoEnterTests : IDisposable
 
     #endregion
 
-    #region 编排对着假插件
+    #region 编排对着假模块
 
     [Fact]
     public async Task SameNameOnTwoWorlds_EnglishHomeWorldPicksTheRightOne_AndLevelReadsStopQuietly()
     {
-        plugin.Characters.Add(new CharaRow(1001, 0, 0, 23, 23, "Alice Fox", "Asura", "Asura", 0));
-        plugin.Characters.Add(new CharaRow(1002, 1, 0, 54, 54, "Alice Fox", "Tonberry", "Tonberry", 0));
-        plugin.Start();
+        module.Characters.Add(new CharaRow(1001, 0, 0, 23, 23, "Alice Fox", "Asura", "Asura", 0));
+        module.Characters.Add(new CharaRow(1002, 1, 0, 54, 54, "Alice Fox", "Tonberry", "Tonberry", 0));
+        module.Start();
 
         using var game = new CatInternationalAutoEnter(placeholder);
         var flow       = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("Alice Fox", "tonberry"), FastTimings());
@@ -132,12 +129,12 @@ public sealed class CatInternationalAutoEnterTests : IDisposable
         Assert.Equal(CatAutoEnterOutcome.InWorld, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
 
         Assert.Equal("1002", flow.EnteredContentId);
-        Assert.Contains("DIALOG YES 1002", plugin.Commands);
+        Assert.Contains("DIALOG YES 1002", module.Commands);
         Assert.Contains("character:Alice Fox@Tonberry", reporter.Entries);
         Assert.Equal(CatStages.IN_WORLD, flow.CurrentStage);
         Assert.DoesNotContain(reporter.Entries, x => x.StartsWith("stopped:", StringComparison.Ordinal));
 
-        // 编排结束后的看当前角色: 插件对等级、副本命令回 unknown-command, 读取器按「不支持」停读, 不停手也不刷屏
+        // 编排结束后的看当前角色: 模块不认的命令回 unknown-command, 读取器按「不支持」停读, 不停手也不刷屏
         using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
 
         try
@@ -149,8 +146,8 @@ public sealed class CatInternationalAutoEnterTests : IDisposable
             // 到时取消
         }
 
-        Assert.Equal(1, plugin.Commands.Count(x => x == "LEVELS"));
-        Assert.Equal(1, plugin.Commands.Count(x => x == "DUTY"));
+        Assert.Equal(1, module.Commands.Count(x => x == "LEVELS"));
+        Assert.Equal(1, module.Commands.Count(x => x == "DUTY"));
         Assert.DoesNotContain(reporter.Entries, x => x.StartsWith("stopped:", StringComparison.Ordinal));
         Assert.Empty(reporter.LevelReports);
     }
@@ -158,8 +155,8 @@ public sealed class CatInternationalAutoEnterTests : IDisposable
     [Fact]
     public async Task SingleCharacter_NoName_Enters_AndKeepsEnglishWorldCodes()
     {
-        plugin.Characters.Add(new CharaRow(2001, 0, 0, 23, 23, "Bob Wolf", "Asura", "Asura", 0));
-        plugin.Start();
+        module.Characters.Add(new CharaRow(2001, 0, 0, 23, 23, "Bob Wolf", "Asura", "Asura", 0));
+        module.Start();
 
         using var game = new CatInternationalAutoEnter(placeholder);
         var flow       = new CatAutoEnter(game, reporter, new CatAutoEnterTarget(null, null), FastTimings());
@@ -176,7 +173,7 @@ public sealed class CatInternationalAutoEnterTests : IDisposable
     [Fact]
     public async Task NoCharacterInList_StopsInsteadOfSwitchingArea()
     {
-        plugin.Start();
+        module.Start();
 
         using var game = new CatInternationalAutoEnter(placeholder);
         var flow       = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("Nobody Here", "Asura"), FastTimings());
@@ -184,13 +181,13 @@ public sealed class CatInternationalAutoEnterTests : IDisposable
         Assert.Equal(CatAutoEnterOutcome.Stopped, await flow.RunAsync(CancellationToken.None).WaitAsync(Timeout));
 
         Assert.Contains($"stopped:{CatAutoEnterStopCodes.NO_CHARACTER}", reporter.Entries);
-        Assert.DoesNotContain("ENTERCHARA", string.Join('|', plugin.Commands));
+        Assert.DoesNotContain("ENTERCHARA", string.Join('|', module.Commands));
     }
 
     [Fact]
-    public async Task PluginPipeAppearsLate_HandshakeKeepsRetrying()
+    public async Task ModulePipeAppearsLate_HandshakeKeepsRetrying()
     {
-        plugin.Characters.Add(new CharaRow(3001, 0, 0, 23, 23, "Cara Owl", "Asura", "Asura", 0));
+        module.Characters.Add(new CharaRow(3001, 0, 0, 23, 23, "Cara Owl", "Asura", "Asura", 0));
 
         using var game = new CatInternationalAutoEnter(placeholder);
         var flow       = new CatAutoEnter(game, reporter, new CatAutoEnterTarget("Cara Owl", "Asura"), FastTimings());
@@ -199,7 +196,7 @@ public sealed class CatInternationalAutoEnterTests : IDisposable
         await Task.Delay(300);
         Assert.False(run.IsCompleted);
 
-        plugin.Start();
+        module.Start();
 
         Assert.Equal(CatAutoEnterOutcome.InWorld, await run.WaitAsync(Timeout));
     }
@@ -207,29 +204,29 @@ public sealed class CatInternationalAutoEnterTests : IDisposable
     #endregion
 
     /// <summary>
-    ///     假的 CatLobby 插件: 在 <c>minilauncher-&lt;pid&gt;</c> 上按插件的协议层拼装应答, 标题 → 选角 → 点登录确认框 → 进世界
+    ///     假的游戏内模块: 在 <c>minilauncher-&lt;pid&gt;</c> 上按小模块的回应格式拼装应答, 标题 → 选角 → 点登录确认框 → 进世界
     /// </summary>
-    internal sealed class FakePlugin : IDisposable
+    internal sealed class FakeModule : IDisposable
     {
         private int pid;
 
-        public FakePlugin()
+        public FakeModule()
         {
         }
 
-        public FakePlugin(int pid) => this.pid = pid;
+        public FakeModule(int pid) => this.pid = pid;
 
         /// <summary>管道名按游戏进程号; 进程号在游戏起来后才知道时先建后绑</summary>
         public void Bind(int gamePid) => pid = gamePid;
 
-        private readonly CancellationTokenSource stop   = new();
-        private readonly object                  sync   = new();
+        private readonly CancellationTokenSource stop = new();
+        private readonly object                  sync = new();
 
-        private LobbyWhere where = LobbyWhere.Title;
-        private ulong      selected;
-        private ulong      confirming;
-        private ulong      inWorld;
-        private Task?      loop;
+        private string where = "title";
+        private ulong  selected;
+        private ulong  confirming;
+        private ulong  inWorld;
+        private Task?  loop;
 
         public List<CharaRow> Characters { get; } = [];
 
@@ -304,93 +301,129 @@ public sealed class CatInternationalAutoEnterTests : IDisposable
             }
         }
 
+        private static ulong ContentIdOf(string command, string prefix) =>
+            ulong.TryParse(command[prefix.Length..].Trim(), out var value) ? value : 0UL;
+
         private string Handle(string raw)
         {
             lock (sync)
             {
                 Seen.Enqueue(raw.Trim());
 
-                var parsed = LobbyCommand.Parse(raw);
+                var command = raw.Trim('\0', ' ', '\t', '\r', '\n');
 
-                switch (parsed.Kind)
+                switch (command)
                 {
-                    case LobbyCommandKind.Version:
-                        return LobbyReplies.Version(pid, "fake.log");
+                    case "VERSION":
+                        return $"OK version=0.11.0 pid={pid} mode=readonly log=fake.log";
 
-                    case LobbyCommandKind.LobbyState:
-                        return LobbyReplies.LobbyState(Snapshot());
+                    case "LOBBYSTATE":
+                        return LobbyState();
 
-                    case LobbyCommandKind.TitleReady:
-                        return LobbyReplies.TitleReady(true);
+                    case "TITLEREADY":
+                        return "OK ready=1";
 
-                    case LobbyCommandKind.SkipMovie:
+                    case "SKIPMOVIE":
                         return "OK";
 
-                    case LobbyCommandKind.Login:
-                        if (where != LobbyWhere.Title)
-                            return LobbyReplies.Login(false);
+                    case "LOGIN":
+                        if (where != "title")
+                            return "FAIL no-title-menu";
 
-                        where = LobbyWhere.CharaSelect;
-                        return LobbyReplies.Login(true);
+                        where = "charaselect";
+                        return "OK";
 
-                    case LobbyCommandKind.Charas:
-                        return LobbyReplies.Charas
-                        (
-                            new CharaListSnapshot(where, Characters.Count, 0, 0, -1, -1, selected, 0, [.. Characters])
-                        );
+                    case "CHARAS":
+                        return Charas();
 
-                    case LobbyCommandKind.FocusChara:
-                        return "OK already world=1";
-
-                    case LobbyCommandKind.SelectChara:
-                        selected = parsed.ContentId;
-                        return $"OK selected index=0 cid={parsed.ContentId}";
-
-                    case LobbyCommandKind.EnterChara:
-                        confirming = parsed.ContentId;
-                        return $"OK clicked index=0 cid={parsed.ContentId}";
-
-                    case LobbyCommandKind.DialogYes:
-                        if (confirming != parsed.ContentId)
-                            return LobbyReplies.Dialog(DialogVerdict.OtherCharacter, "SelectYesno");
-
-                        inWorld    = confirming;
-                        confirming = 0;
-                        where      = LobbyWhere.InGame;
-                        return LobbyReplies.Dialog(DialogVerdict.Click, "SelectYesno");
-
-                    case LobbyCommandKind.WhoAmI:
-                    {
-                        var row = Characters.FirstOrDefault(x => x.ContentId == inWorld);
-
-                        return LobbyReplies.WhoAmI
-                        (
-                            row == null
-                                ? new WhoAmISnapshot(false, 0, 0, 0, "", "", false, false, 0, "")
-                                : new WhoAmISnapshot(true, row.ContentId, row.CurrentWorldId, row.HomeWorldId, row.CurrentWorldName, row.HomeWorldName, true, true, row.ContentId, row.Name)
-                        );
-                    }
-
-                    default:
-                        return LobbyReplies.UNKNOWN_COMMAND;
+                    case "WHOAMI":
+                        return WhoAmI();
                 }
+
+                if (command.StartsWith("FOCUSCHARA ", StringComparison.Ordinal))
+                    return "OK already world=1";
+
+                if (command.StartsWith("SELECTCHARA ", StringComparison.Ordinal))
+                {
+                    selected = ContentIdOf(command, "SELECTCHARA ");
+                    return $"OK selected index=0 cid={selected}";
+                }
+
+                if (command.StartsWith("ENTERCHARA ", StringComparison.Ordinal))
+                {
+                    confirming = ContentIdOf(command, "ENTERCHARA ");
+                    return $"OK clicked index=0 cid={confirming}";
+                }
+
+                if (command.StartsWith("DIALOG YES ", StringComparison.Ordinal))
+                {
+                    if (confirming != ContentIdOf(command, "DIALOG YES "))
+                        return "FAIL other-character";
+
+                    inWorld    = confirming;
+                    confirming = 0;
+                    where      = "ingame";
+                    return "OK clicked addon=SelectYesno";
+                }
+
+                return "FAIL unknown-command";
             }
         }
 
-        private LobbySnapshot Snapshot()
+        private string LobbyState()
         {
-            var yesNo = confirming == 0
-                            ? DialogSnapshot.None
-                            : new DialogSnapshot(true, 1, true, true, $"Log in as {Characters.First(x => x.ContentId == confirming).Name}?");
+            var yesNo = confirming != 0;
+            var text  = yesNo ? $"Log in as {Characters.First(x => x.ContentId == confirming).Name}?" : "";
 
-            return new LobbySnapshot
-            (
-                where, 0, 0, -1, 0, false, 0, 0, 0, 0, false, 0,
-                yesNo, DialogSnapshot.None, DialogSnapshot.None
-            );
+            var reply = $"OK where={where} world=0 worldIndex=0 selectedIndex=-1 hovered=0 locked=0 stage=0 uiStage=0 queue=0 dialogId=0 " +
+                        $"yesno={(yesNo ? 1 : 0)} ok=0 dialogue=0 loading=0 listWorld=0 queuePrompt=0";
+
+            return yesNo ? $"{reply}\nD\tSelectYesno\t1\t1\t1\t{text}\nT {text}" : reply;
+        }
+
+        private string Charas()
+        {
+            var header = $"OK where={where} n={Characters.Count} total={Characters.Count} selected={selected} selectedIndex=-1 " +
+                         "hovered=0 hoveredIndex=-1 source=dc skipped=0 invalid=0";
+
+            var body = new StringBuilder();
+
+            foreach (var row in Characters)
+            {
+                body.Append("\nC\t").Append(row.ContentId).Append('\t').Append(row.Index).Append('\t').Append(row.LoginFlags)
+                    .Append('\t').Append(row.CurrentWorldId).Append('\t').Append(row.HomeWorldId)
+                    .Append('\t').Append(row.Name).Append('\t').Append(row.CurrentWorldName).Append('\t').Append(row.HomeWorldName)
+                    .Append('\t').Append(row.ClickFlags);
+            }
+
+            return header + body;
+        }
+
+        private string WhoAmI()
+        {
+            var row = Characters.FirstOrDefault(x => x.ContentId == inWorld);
+
+            return row == null
+                       ? "OK loaded=0 cid=0 world=0 home=0 worldName= homeName= loggedIn=0 inZone=0 lobbyCid=0 name="
+                       : $"OK loaded=1 cid={row.ContentId} world={row.CurrentWorldId} home={row.HomeWorldId} worldName={row.CurrentWorldName} " +
+                         $"homeName={row.HomeWorldName} loggedIn=1 inZone=1 lobbyCid={row.ContentId} name={row.Name}";
         }
     }
 }
+
+/// <summary>选角列表里的一个角色（世界名是英文名, 如 Asura）</summary>
+internal sealed record CharaRow
+(
+    ulong  ContentId,
+    int    Index,
+    byte   LoginFlags,
+    ushort CurrentWorldId,
+    ushort HomeWorldId,
+    string Name,
+    string CurrentWorldName,
+    string HomeWorldName,
+    uint   ClickFlags
+);
 
 /// <summary>
 ///     自动进入角色按提示框文字判断的关键词: 国服中文不变, 国际服四种语言都认
@@ -444,211 +477,5 @@ public sealed class CatAutoEnterTextsTests
         Assert.False(CatAutoEnterTexts.IsFantasiaPrompt(text));
         Assert.False(CatAutoEnterTexts.IsForcedLogoutPrompt(text));
         Assert.False(CatAutoEnterTexts.IsQueuePrompt(text));
-    }
-}
-
-/// <summary>
-///     把 CatLobby 登记成国际服 Dalamud 的开发插件: 幂等、不动别的开发插件（如 Afan）
-/// </summary>
-public sealed class DalamudDevPluginRegistrarTests : IDisposable
-{
-    private readonly string root = Path.Combine(Path.GetTempPath(), "cat-devplugin-" + Guid.NewGuid().ToString("N"));
-    private readonly string dll;
-
-    private const string AFAN = @"F:\Projects\Afan\dalamud\Afan\bin\Debug\Afan.dll";
-
-    public DalamudDevPluginRegistrarTests()
-    {
-        Directory.CreateDirectory(Path.Combine(root, "CatLobby"));
-        dll = Path.Combine(root, "CatLobby", "CatLobby.dll");
-        File.WriteAllText(dll, "x");
-    }
-
-    public void Dispose() => Directory.Delete(root, true);
-
-    private DirectoryInfo Config => new(Path.Combine(root, "config"));
-
-    private string ConfigPath => Path.Combine(root, "config", "dalamudConfig.json");
-
-    private void WriteConfig(params (string Path, bool Enabled)[] entries)
-    {
-        Directory.CreateDirectory(Config.FullName);
-
-        var values = new JArray(entries.Select(x => new JObject
-        {
-            ["$type"]     = "Dalamud.Configuration.DevPluginLocationSettings, Dalamud",
-            ["Path"]      = x.Path,
-            ["IsEnabled"] = x.Enabled,
-            ["Nickname"]  = null
-        }));
-
-        File.WriteAllText(ConfigPath, new JObject
-        {
-            ["LastVersion"] = "15.0.3.9",
-            ["DevPluginLoadLocations"] = new JObject
-            {
-                ["$type"]   = "System.Collections.Generic.List`1[[Dalamud.Configuration.DevPluginLocationSettings, Dalamud]], System.Private.CoreLib",
-                ["$values"] = values
-            }
-        }.ToString());
-    }
-
-    private JArray Locations() =>
-        (JArray)JObject.Parse(File.ReadAllText(ConfigPath))["DevPluginLoadLocations"]!["$values"]!;
-
-    [Fact]
-    public async Task AddsOwnEntry_KeepsAfanUntouched()
-    {
-        WriteConfig((AFAN, true));
-
-        var result = await DalamudDevPluginRegistrar.EnsureAsync(Config, dll);
-
-        Assert.True(result.Ok);
-        var locations = Locations();
-        Assert.Equal(2, locations.Count);
-        Assert.Equal(AFAN, locations[0].Value<string>("Path"));
-        Assert.True(locations[0].Value<bool>("IsEnabled"));
-        Assert.Equal(dll, locations[1].Value<string>("Path"));
-        Assert.True(locations[1].Value<bool>("IsEnabled"));
-        Assert.Equal("Dalamud.Configuration.DevPluginLocationSettings, Dalamud", locations[1].Value<string>("$type"));
-        Assert.Equal("15.0.3.9", JObject.Parse(File.ReadAllText(ConfigPath)).Value<string>("LastVersion"));
-    }
-
-    [Fact]
-    public async Task SecondRun_IsIdempotent_AndDoesNotRewriteTheFile()
-    {
-        WriteConfig((AFAN, true));
-        await DalamudDevPluginRegistrar.EnsureAsync(Config, dll);
-
-        var before = File.ReadAllText(ConfigPath);
-        var stamp  = File.GetLastWriteTimeUtc(ConfigPath);
-        await Task.Delay(30);
-
-        var result = await DalamudDevPluginRegistrar.EnsureAsync(Config, dll);
-
-        Assert.True(result.Ok);
-        Assert.Equal(before, File.ReadAllText(ConfigPath));
-        Assert.Equal(stamp, File.GetLastWriteTimeUtc(ConfigPath));
-        Assert.Equal(2, Locations().Count);
-    }
-
-    [Fact]
-    public async Task DisabledOrMovedEntry_IsCorrected_AndDuplicatesRemoved()
-    {
-        WriteConfig((AFAN, true), (@"D:\old\CatLobby\CatLobby.dll", false), (@"E:\other\CatLobby.dll", true));
-
-        var result = await DalamudDevPluginRegistrar.EnsureAsync(Config, dll);
-
-        Assert.True(result.Ok);
-        var locations = Locations();
-        Assert.Equal(2, locations.Count);
-        Assert.Equal(AFAN, locations[0].Value<string>("Path"));
-        Assert.Equal(dll, locations[1].Value<string>("Path"));
-        Assert.True(locations[1].Value<bool>("IsEnabled"));
-    }
-
-    [Fact]
-    public async Task NoConfigFile_CreatesOne()
-    {
-        var result = await DalamudDevPluginRegistrar.EnsureAsync(Config, dll);
-
-        Assert.True(result.Ok);
-        Assert.Equal(dll, Assert.Single(Locations()).Value<string>("Path"));
-    }
-
-    private JObject ReadConfig() => JObject.Parse(File.ReadAllText(ConfigPath));
-
-    private static JObject ProfileEntry(JObject config, string name) =>
-        Assert.Single(((JArray)config["DefaultProfile"]!["Plugins"]!["$values"]!).OfType<JObject>(), x => x.Value<string>("InternalName") == name);
-
-    [Fact]
-    public async Task NewEntry_StartsOnBoot_AndIsEnabledInDefaultProfileUnderTheSameId()
-    {
-        WriteConfig((AFAN, true));
-
-        await DalamudDevPluginRegistrar.EnsureAsync(Config, dll);
-
-        var config   = ReadConfig();
-        var settings = (JObject)config["DevPluginSettings"]![dll]!;
-        var id       = settings.Value<string>("WorkingPluginId");
-
-        Assert.True(settings.Value<bool>("StartOnBoot"));
-        Assert.False(settings.Value<bool>("AutomaticReloading"));
-        Assert.True(Guid.TryParse(id, out var guid) && guid != Guid.Empty);
-
-        var entry = ProfileEntry(config, "CatLobby");
-        Assert.Equal(id, entry.Value<string>("WorkingPluginId"));
-        Assert.True(entry.Value<bool>("IsEnabled"));
-    }
-
-    [Fact]
-    public async Task MovedPlugin_KeepsItsId_DropsOldSettings_AndReenablesInProfile()
-    {
-        const string OLD = @"D:\old\CatLobby\CatLobby.dll";
-        const string ID  = "11111111-2222-3333-4444-555555555555";
-
-        WriteConfig((AFAN, true), (OLD, true));
-
-        var config = ReadConfig();
-        config["DevMode"] = false;
-        config["DevPluginSettings"] = new JObject
-        {
-            [AFAN] = new JObject { ["StartOnBoot"] = true, ["WorkingPluginId"] = "772e8f7c-1486-46f3-b43e-87f7f98f30c5" },
-            [OLD]  = new JObject { ["StartOnBoot"] = false, ["WorkingPluginId"] = ID },
-        };
-        config["DefaultProfile"] = new JObject
-        {
-            ["Plugins"] = new JObject
-            {
-                ["$values"] = new JArray
-                {
-                    new JObject { ["InternalName"] = "Afan", ["WorkingPluginId"] = "772e8f7c-1486-46f3-b43e-87f7f98f30c5", ["IsEnabled"] = true },
-                    new JObject { ["InternalName"] = "CatLobby", ["WorkingPluginId"] = ID, ["IsEnabled"] = false },
-                    new JObject { ["InternalName"] = "CatLobby", ["WorkingPluginId"] = "99999999-2222-3333-4444-555555555555", ["IsEnabled"] = false },
-                }
-            }
-        };
-        File.WriteAllText(ConfigPath, config.ToString());
-
-        await DalamudDevPluginRegistrar.EnsureAsync(Config, dll);
-
-        var after    = ReadConfig();
-        var settings = (JObject)after["DevPluginSettings"]!;
-
-        Assert.True(after.Value<bool>("DevMode"));
-        Assert.Null(settings[OLD]);
-        Assert.NotNull(settings[AFAN]);
-        Assert.True(settings[dll]!.Value<bool>("StartOnBoot"));
-        Assert.Equal(ID, settings[dll]!.Value<string>("WorkingPluginId"));
-
-        var entry = ProfileEntry(after, "CatLobby");
-        Assert.Equal(ID, entry.Value<string>("WorkingPluginId"));
-        Assert.True(entry.Value<bool>("IsEnabled"));
-        Assert.True(ProfileEntry(after, "Afan").Value<bool>("IsEnabled"));
-    }
-
-    [Fact]
-    public async Task PluginFileMissing_FailsWithoutTouchingConfig()
-    {
-        WriteConfig((AFAN, true));
-        var before = File.ReadAllText(ConfigPath);
-
-        var result = await DalamudDevPluginRegistrar.EnsureAsync(Config, Path.Combine(root, "nowhere", "CatLobby.dll"));
-
-        Assert.False(result.Ok);
-        Assert.Equal(before, File.ReadAllText(ConfigPath));
-    }
-
-    [Fact]
-    public async Task BrokenConfig_FailsWithReason_AndIsLeftAlone()
-    {
-        Directory.CreateDirectory(Config.FullName);
-        File.WriteAllText(ConfigPath, "{ not json");
-
-        var result = await DalamudDevPluginRegistrar.EnsureAsync(Config, dll);
-
-        Assert.False(result.Ok);
-        Assert.NotNull(result.Error);
-        Assert.Equal("{ not json", File.ReadAllText(ConfigPath));
     }
 }

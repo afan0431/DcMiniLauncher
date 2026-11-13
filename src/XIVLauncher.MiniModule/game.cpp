@@ -1779,6 +1779,23 @@ namespace
         return nullptr;
     }
 
+    // 提示框文字是排队提示: 国服中文「排队」, 国际服英 / 日 / 德 / 法文各一个关键词
+    bool IsQueueNoticeText(const char* text)
+    {
+        static const char* const keywords[] =
+        {
+            u8"排队", u8"Players in queue", u8"人待ち", u8"混み合って", u8"Warteliste", u8"Joueurs en attente",
+        };
+
+        for (const char* keyword : keywords)
+        {
+            if (strstr(text, keyword) != nullptr)
+                return true;
+        }
+
+        return false;
+    }
+
     // 返回: 1=点了 SelectYesno 2=点了 SelectOk 3=点了 Dialogue 0=没有对应的对话框
     //       -1=异常 -2=那是大厅自己开的确定框（排队提示）, 不点 -3=在游戏里, 不点 -4=Dialogue 的确定按钮找不到
     //       -5=不在选角界面（是/否框只在那里点） -6=是/否框不是大厅为登录开的那个 -7=登录请求已经发出（这时的是/否框是在问要不要取消登录）
@@ -1879,14 +1896,14 @@ namespace
             if (action == DIALOG_NOTICE)
             {
                 // 大厅为登录结果开的提示框（如「已强制令该角色下线, 稍等片刻即可重新登录」）: 只在选角界面、没有排队名次、
-                // 读得到文字且文字里没有「排队」时点, 排队提示仍不点
+                // 读得到文字且文字不是排队提示（中 / 英 / 日 / 德 / 法）时点, 排队提示仍不点
                 if (where != 2)
                     return -5;
 
                 char text[DIALOG_TEXT_MAX];
                 ReadDialogText(ok, true, text, sizeof(text));
 
-                if (text[0] == '\0' || strstr(text, u8"排队") != nullptr)
+                if (text[0] == '\0' || IsQueueNoticeText(text))
                     return -2;
             }
             else if (lobbyOwned)

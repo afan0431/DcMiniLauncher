@@ -19,7 +19,7 @@ namespace
 
     // 启动器注入前按 pid 写的模式文件 <ProgramData>\DcMiniLauncher\module-<pid>.mode。没有这个文件 = 照常全装。
     //   readonly 开头   = 只读模式: 只为读角色和等级而注入时用, 不装标题守卫、不装选角右键菜单, 游戏的行为与没注入时一样
-    //   charconfig 开头 = 只装共用游戏配置: 国际服客户端用（其余功能的偏移都是国服客户端的, 管道名由国际服的 CatLobby 插件占着）
+    //   charconfig 开头 = 只装共用游戏配置: 不建主线程通道、不开管道, 其余功能都不装
     Mode ReadModeFile()
     {
         wchar_t     programData[MAX_PATH]{};

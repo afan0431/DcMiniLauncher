@@ -621,7 +621,7 @@ public sealed class CatLaunchHost : ICatRpcHandler, ICatLaunchReporter
         // 只登录不起游戏, 不注入截取模块
         var remoteHook = authOnly ? null : parameters.RemoteHook;
 
-        // 国际服靠游戏里的 CatLobby 插件自动进入角色; 只登录不起游戏, 不做
+        // 国际服靠注入游戏的游戏内模块自动进入角色; 只登录不起游戏, 不做
         var autoEnter = parameters.AutoEnter == true && !authOnly;
 
         // 只登录不起游戏, 不挂 Minion

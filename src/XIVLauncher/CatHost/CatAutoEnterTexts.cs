@@ -3,8 +3,8 @@ using System.Text.RegularExpressions;
 namespace XIVLauncher.CatHost;
 
 /// <summary>
-///     自动进入角色里按提示框文字做判断的关键词: 国服用中文原文, 国际服（CatLobby 插件）用英 / 日 / 德 / 法四种客户端语言的原文。
-///     国际服关键词出自游戏数据表 Error / Lobby 各语言原文, 与插件里的 LobbyTextRules 保持一致; 比较时不分大小写。
+///     自动进入角色里按提示框文字做判断的关键词: 国服用中文原文, 国际服（游戏内模块读回来的提示框文字）用英 / 日 / 德 / 法四种客户端语言的原文。
+///     国际服关键词出自游戏数据表 Error / Lobby 各语言原文; 比较时不分大小写。
 /// </summary>
 internal static partial class CatAutoEnterTexts
 {

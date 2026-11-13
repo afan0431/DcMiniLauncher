@@ -10,7 +10,7 @@ namespace XIVLauncher.CatHost;
 
 /// <summary>
 ///     国际服（Square Enix 账号, Windows 版, 账号密码, 不带一次性密码）的无界面启动:
-///     检查目录与版本 → 登录 → 准备 Dalamud → 启动游戏 → 等 Dalamud 落地 → 挂 Minion → 守到游戏退出。
+///     检查目录与版本 → 登录 → 准备 Dalamud → 启动游戏 → 注入游戏内模块 → 等 Dalamud 落地 → 挂 Minion → 守到游戏退出。
 ///     <para>
 ///         与国服启动器 <see cref="CatRealGameRunner" /> 是两个互不相干的类: 不用账号库、设备信息、大区、跨区服务, 不打补丁（有更新只报
 ///         gameUpdateRequired）。对外部世界的依赖全在 <see cref="ICatInternationalEnvironment" /> 里。
@@ -23,9 +23,9 @@ namespace XIVLauncher.CatHost;
 ///         如果原版崩溃处理器弹出对话框并让游戏进程停着不退, 这里会一直显示运行中, 直到有人处理对话框或外壳发 close（close 会结束游戏进程）。
 ///     </para>
 ///     <para>
-///         <b>自动进入角色</b>靠登录器自带的 Dalamud 插件 CatLobby（<c>CatLobby\CatLobby.dll</c>）: 起游戏前把它登记成国际服 Dalamud 的开发插件,
-///         游戏起来、Dalamud 加载后由 <see cref="CatAutoEnter" /> 经 <see cref="CatInternationalAutoEnter" /> 连插件开的管道。
-///         登记不上、没开 Dalamud、Dalamud 没等到都不拦启动, 报 game.autoEnterStopped（moduleUnavailable）, 游戏停在当前界面交给人。
+///         <b>自动进入角色</b>靠登录器自带的游戏内模块（MiniLauncherModule.dll, 只读模式）: 游戏起来后注入, 模块开管道应答命令,
+///         由 <see cref="CatAutoEnter" /> 经 <see cref="CatInternationalAutoEnter" /> 连管道编排; 不依赖 Dalamud。
+///         这台电脑没有模块文件、模块注入失败都不拦启动, 报 game.autoEnterStopped（moduleUnavailable）, 游戏停在当前界面交给人。
 ///     </para>
 /// </summary>
 public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInternationalEnvironment environment) : ICatGameRunner
@@ -86,9 +86,6 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
             loginClient = null;
 
             var dalamud = await PrepareDalamudAsync(reporter, linked.Token).ConfigureAwait(false);
-
-            if (request.AutoEnter)
-                autoEnterBlocked = await PrepareAutoEnterPluginAsync(dalamud != null).ConfigureAwait(false);
 
             var process = await StartAsync(login, dalamud, reporter, linked.Token).ConfigureAwait(false);
 
@@ -477,21 +474,25 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
             return process;
         }
 
-        StartCharConfigInjection(process, startToken);
-
-        var dalamudLoaded = false;
+        var moduleInjection = StartModuleInjection(process, startToken);
 
         try
         {
             if (dalamud != null)
             {
                 reporter.Stage(CatStages.INJECTING);
-                dalamudLoaded = await WaitForDalamudAsync(process, startToken).ConfigureAwait(false);
+                var dalamudLoaded = await WaitForDalamudAsync(process, startToken).ConfigureAwait(false);
                 reporter.Agent(CatAgentKinds.DALAMUD, dalamudLoaded, dalamudLoaded ? null : CatCodes.DALAMUD_UNAVAILABLE, dalamudLoaded ? null : "游戏进程里没有等到 Dalamud 加载");
             }
 
+            // 自动进入角色要等模块注入结果: 注不上就不做自动进入
+            if (request.AutoEnter)
+                autoEnterBlocked = await moduleInjection.WaitAsync(startToken).ConfigureAwait(false) is { } injectError
+                                       ? $"游戏内模块没注入上, 自动进入角色用不了: {injectError}"
+                                       : null;
+
             // 自动进入角色的, Minion 等角色进了世界再挂（StartAutoEnter）, 免得挂载和编排抢游戏主线程
-            if (request.Minion && !(request.AutoEnter && autoEnterBlocked == null && dalamudLoaded))
+            if (request.Minion && !(request.AutoEnter && autoEnterBlocked == null))
                 await AttachMinionAsync(process, dalamud != null, reporter, startToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (IsCloseRequested)
@@ -509,9 +510,6 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
 
             if (request.AutoEnter)
             {
-                if (autoEnterBlocked == null && !dalamudLoaded)
-                    autoEnterBlocked = "游戏里没有等到 Dalamud 加载, 自动进入角色用的 CatLobby 插件起不来";
-
                 if (autoEnterBlocked != null)
                     reporter.AutoEnterStopped(CatAutoEnterStopCodes.MODULE_UNAVAILABLE, autoEnterBlocked);
                 else
@@ -523,18 +521,19 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
     }
 
     /// <summary>
-    ///     在后台给游戏注入「所有角色共用一套游戏配置」的模块（是否生效只看本机 machine.json）: 等窗口出现就注, 不等 Dalamud 和 Minion,
-    ///     赶在进入角色读配置之前。注不上只少这一项, 游戏照常
+    ///     在后台给游戏注入游戏内模块（只读模式: 开管道、应答命令, 不装标题守卫和选角右键菜单; 共用游戏配置在模块里, 是否生效只看本机 machine.json）:
+    ///     等窗口出现就注, 不等 Dalamud 和 Minion, 赶在进入角色读配置之前。返回 null = 注入成功; 否则是没注入的原因（游戏照常）
     /// </summary>
-    private void StartCharConfigInjection(Process process, CancellationToken startToken)
+    private Task<string?> StartModuleInjection(Process process, CancellationToken startToken)
     {
-        if (environment.CreateCharConfigTarget(process) is not { } target)
+        if (environment.CreateModuleTarget(process) is not { } target)
         {
-            Log.Information("[CatHost] 这台电脑没有游戏内模块文件, 国际服游戏不共用游戏配置 (PID={ProcessID})", process.Id);
-            return;
+            const string NO_MODULE = "这台电脑没有游戏内模块文件";
+            Log.Information("[CatHost] {Reason}, 国际服游戏不注入模块 (PID={ProcessID})", NO_MODULE, process.Id);
+            return Task.FromResult<string?>(NO_MODULE);
         }
 
-        _ = Task.Run
+        return Task.Run
         (
             async () =>
             {
@@ -543,35 +542,25 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
                     var error = await CatModuleInjection.InjectWhenReadyAsync(target, true, false, null, startToken).ConfigureAwait(false);
 
                     if (error == null)
-                        Log.Information("[CatHost] 国际服游戏已注入共用游戏配置的模块 (PID={ProcessID})", process.Id);
+                        Log.Information("[CatHost] 国际服游戏已注入游戏内模块 (PID={ProcessID})", process.Id);
                     else
-                        Log.Warning("[CatHost] 国际服游戏没有注入共用游戏配置的模块 (PID={ProcessID}): {Error}", process.Id, error);
+                        Log.Warning("[CatHost] 国际服游戏没有注入游戏内模块 (PID={ProcessID}): {Error}", process.Id, error);
+
+                    return error;
                 }
                 catch (OperationCanceledException)
                 {
-                    Log.Information("[CatHost] 游戏已在收尾, 不再注入共用游戏配置的模块 (PID={ProcessID})", process.Id);
+                    Log.Information("[CatHost] 游戏已在收尾, 不再注入游戏内模块 (PID={ProcessID})", process.Id);
+                    return "游戏已在收尾";
                 }
                 catch (Exception ex)
                 {
-                    Log.Error(ex, "[CatHost] 注入共用游戏配置的模块出错（游戏不受影响）");
+                    Log.Error(ex, "[CatHost] 注入游戏内模块出错（游戏不受影响）");
+                    return $"注入游戏内模块出错: {ex.Message}";
                 }
             },
             CancellationToken.None
         );
-    }
-
-    /// <summary>
-    ///     起游戏前登记自动进入角色用的 CatLobby 插件。返回 null = 可以自动进入; 否则是不能自动进入的原因（游戏照常启动, 停在当前界面交给人）
-    /// </summary>
-    private async Task<string?> PrepareAutoEnterPluginAsync(bool dalamud)
-    {
-        if (!dalamud)
-            return "国际服自动进入角色要靠 Dalamud 里的 CatLobby 插件, 这次上号没有开 Dalamud";
-
-        var result = await environment.EnsureAutoEnterPluginAsync().ConfigureAwait(false);
-        Log.Information("[CatHost] 国际服 CatLobby 插件: {Action}{Error}", result.Action, result.Error == null ? "" : $"（{result.Error}）");
-
-        return result.Ok ? null : $"CatLobby 插件没登记上, 自动进入角色用不了: {result.Error}";
     }
 
     /// <summary>
@@ -594,7 +583,7 @@ public sealed class CatInternationalGameRunner(CatLogRedactor redactor, ICatInte
                 {
                     var outcome = await flow.RunAsync(token).ConfigureAwait(false);
 
-                    // 国际服的插件不认等级、副本命令（回 unknown-command）, 读取器遇到会按「不支持」停读, 不报错
+                    // 读取器遇到游戏内模块不认的命令（回 unknown-command）会按「不支持」停读, 不报错
                     var observe = flow.ObserveAsync(token);
 
                     if (request.Minion && outcome != CatAutoEnterOutcome.Cancelled)

@@ -5,8 +5,8 @@ using XIVLauncher.InGame;
 namespace XIVLauncher.CatHost;
 
 /// <summary>
-///     国际服自动进入角色的游戏一侧: 游戏里是 Dalamud 插件 CatLobby 开的同名管道（<c>minilauncher-&lt;pid&gt;</c>）, 命令与应答和国服小模块同一套。
-///     与 <see cref="CatAutoEnterRealGame" /> 的区别: 不注入任何东西, 只等插件的管道; 没有大区（国际服一个入口）, 也没有服务器表、超域。
+///     国际服自动进入角色的游戏一侧: 管道（<c>minilauncher-&lt;pid&gt;</c>）由注入游戏的游戏内模块开, 命令与应答和国服一致。
+///     与 <see cref="CatAutoEnterRealGame" /> 的区别: 自己不注入任何东西, 只连模块的管道; 没有大区（国际服一个入口）, 也没有服务器表、超域。
 ///     管道闸与 <see cref="Release" /> 的语义和国服一致: 发命令时才占, 长时间等待前放开。
 ///     工作台靠这个类型在不在程序集里判断登录器支不支持国际服自动进入, 改名要同步改工作台外壳的探测。
 /// </summary>

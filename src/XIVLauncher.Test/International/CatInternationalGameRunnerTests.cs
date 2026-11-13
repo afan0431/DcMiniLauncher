@@ -3,7 +3,6 @@ using System.IO;
 using System.Net.Http;
 using System.Text.Json;
 using XIVLauncher.CatHost;
-using XIVLauncher.CatLobby.Protocol;
 using XIVLauncher.Common;
 using XIVLauncher.Common.Game;
 using XIVLauncher.Common.Game.Exceptions;
@@ -49,10 +48,10 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         game.Dispose();
     }
 
-    private CatInternationalGameRunner NewRunner() =>
+    private CatInternationalGameRunner NewRunner(TimeSpan? dalamudInjectTimeout = null) =>
         new(redactor, environment)
         {
-            DalamudInjectTimeout = TimeSpan.FromSeconds(5),
+            DalamudInjectTimeout = dalamudInjectTimeout ?? TimeSpan.FromSeconds(5),
             AutoEnterTimings = new CatAutoEnterTimings
             {
                 Poll            = TimeSpan.FromMilliseconds(5),
@@ -405,22 +404,24 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     #region 自动进入角色
 
     [Fact]
-    public async Task AutoEnter_RegistersPluginBeforeStartingGame_ThenEntersWorld()
+    public async Task AutoEnter_InjectsReadOnlyModule_ThenEntersWorld()
     {
-        using var plugin = new FakeGamePlugin(environment);
-        plugin.Characters.Add(new CharaRow(9001, 0, 0, 23, 23, "Alice Fox", "Asura", "Asura", 0));
-        plugin.Characters.Add(new CharaRow(9002, 1, 0, 54, 54, "Alice Fox", "Tonberry", "Tonberry", 0));
+        var target = new FakeModuleTarget();
+        environment.ModuleTarget = target;
+        using var module = new FakeGameModule(environment);
+        module.Characters.Add(new CharaRow(9001, 0, 0, 23, 23, "Alice Fox", "Asura", "Asura", 0));
+        module.Characters.Add(new CharaRow(9002, 1, 0, 54, 54, "Alice Fox", "Tonberry", "Tonberry", 0));
 
         var runner = NewRunner();
         var run    = runner.RunAsync(Request(dalamud: true, autoEnter: true, character: "Alice Fox", homeWorld: "Asura"), reporter, CancellationToken.None);
 
         await WaitUntilAsync(() => reporter.Entries.Contains("stage:inWorld"));
 
-        Assert.Equal(1, environment.PluginCalls);
-        Assert.True(environment.Calls.IndexOf("plugin") > environment.Calls.IndexOf("dalamud"));
-        Assert.True(environment.Calls.IndexOf("plugin") < environment.Calls.IndexOf("start"));
+        Assert.Equal(1, target.Injections);
+        Assert.True(target.LastReadOnly);
+        Assert.True(environment.Calls.IndexOf("start") < environment.Calls.IndexOf("autoEnterGame"));
         Assert.Contains("character:Alice Fox@Asura", reporter.Entries);
-        Assert.Contains("DIALOG YES 9001", plugin.Commands);
+        Assert.Contains("DIALOG YES 9001", module.Commands);
         Assert.DoesNotContain(reporter.Entries, x => x.StartsWith("stopped:", StringComparison.Ordinal));
         Assert.Equal(CatCodes.NOT_RUNNING, runner.SelectCharacter("9001").Code);
 
@@ -435,8 +436,9 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     [Fact]
     public async Task AutoEnter_WithMinion_AttachesOnlyAfterEnteringWorld()
     {
-        using var plugin = new FakeGamePlugin(environment);
-        plugin.Characters.Add(new CharaRow(9001, 0, 0, 23, 23, "Alice Fox", "Asura", "Asura", 0));
+        environment.ModuleTarget = new FakeModuleTarget();
+        using var module = new FakeGameModule(environment);
+        module.Characters.Add(new CharaRow(9001, 0, 0, 23, 23, "Alice Fox", "Asura", "Asura", 0));
 
         var runner = NewRunner();
         var run    = runner.RunAsync(Request(dalamud: true, minion: true, autoEnter: true, character: "Alice Fox"), reporter, CancellationToken.None);
@@ -452,17 +454,60 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     }
 
     [Fact]
-    public async Task AutoEnter_PluginRegistrationFails_GameStillStarts_AndStopsWithReason()
+    public async Task AutoEnter_WithoutDalamud_WithMinion_EntersWorld_ThenAttachesMinion()
     {
-        environment.PluginError = "改 Dalamud 配置失败";
+        var target = new FakeModuleTarget();
+        environment.ModuleTarget = target;
+        using var module = new FakeGameModule(environment);
+        module.Characters.Add(new CharaRow(9001, 0, 0, 23, 23, "Alice Fox", "Asura", "Asura", 0));
 
+        var runner = NewRunner();
+        var run    = runner.RunAsync(Request(dalamud: false, minion: true, autoEnter: true, character: "Alice Fox"), reporter, CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("agent:minion:ok"));
+
+        var entries = reporter.Entries.ToList();
+        Assert.False(environment.StartedWithDalamud);
+        Assert.Equal(1, target.Injections);
+        Assert.Contains("stage:inWorld", entries);
+        Assert.True(entries.IndexOf("character:Alice Fox@Asura") < entries.IndexOf("agent:minion:ok"));
+        Assert.DoesNotContain(entries, x => x.StartsWith("stopped:", StringComparison.Ordinal));
+        Assert.NotNull(environment.FakeMinion.Attached);
+
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        await run.WaitAsync(Timeout);
+    }
+
+    [Fact]
+    public async Task AutoEnter_DalamudNeverLoads_StillEntersWorld()
+    {
+        environment.DalamudLoaded = false;
+        environment.ModuleTarget  = new FakeModuleTarget();
+        using var module = new FakeGameModule(environment);
+        module.Characters.Add(new CharaRow(9001, 0, 0, 23, 23, "Alice Fox", "Asura", "Asura", 0));
+
+        var runner = NewRunner(TimeSpan.FromMilliseconds(100));
+        var run    = runner.RunAsync(Request(dalamud: true, autoEnter: true, character: "Alice Fox"), reporter, CancellationToken.None);
+
+        await WaitUntilAsync(() => reporter.Entries.Contains("stage:inWorld"));
+
+        Assert.Contains($"agent:dalamud:{CatCodes.DALAMUD_UNAVAILABLE}", reporter.Entries);
+        Assert.DoesNotContain(reporter.Entries, x => x.StartsWith("stopped:", StringComparison.Ordinal));
+
+        await runner.CloseAsync(TimeSpan.FromSeconds(1));
+        await run.WaitAsync(Timeout);
+    }
+
+    [Fact]
+    public async Task AutoEnter_NoModuleFile_GameStillStarts_AndStopsWithReason()
+    {
         var runner = NewRunner();
         var run    = runner.RunAsync(Request(dalamud: true, autoEnter: true), reporter, CancellationToken.None);
 
         await WaitUntilAsync(() => reporter.Entries.Contains($"stopped:{CatAutoEnterStopCodes.MODULE_UNAVAILABLE}"));
 
         Assert.Contains("started", reporter.Entries);
-        Assert.Contains(reporter.Messages, x => x.Contains("CatLobby 插件没登记上") && x.Contains("改 Dalamud 配置失败"));
+        Assert.Contains(reporter.Messages, x => x.Contains("没有游戏内模块文件"));
         Assert.Equal(0, environment.AutoEnterGames);
 
         await runner.CloseAsync(TimeSpan.FromSeconds(1));
@@ -470,46 +515,34 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     }
 
     [Fact]
-    public async Task AutoEnter_WithoutDalamud_DoesNotRegisterAndStops()
+    public async Task AutoEnter_InjectionFails_GameStillStarts_StopsWithReason_AndMinionAttachesRightAway()
     {
+        environment.ModuleTarget = new FakeModuleTarget { Error = "远程线程跑完了, 但目标进程模块列表里没有这个 DLL" };
+
         var runner = NewRunner();
-        var run    = runner.RunAsync(Request(dalamud: false, autoEnter: true), reporter, CancellationToken.None);
+        var run    = runner.RunAsync(Request(dalamud: false, minion: true, autoEnter: true), reporter, CancellationToken.None);
 
         await WaitUntilAsync(() => reporter.Entries.Contains($"stopped:{CatAutoEnterStopCodes.MODULE_UNAVAILABLE}"));
 
-        Assert.Equal(0, environment.PluginCalls);
+        Assert.Contains("started", reporter.Entries);
+        Assert.Contains(reporter.Messages, x => x.Contains("模块没注入上") && x.Contains("模块列表里没有这个 DLL"));
         Assert.Equal(0, environment.AutoEnterGames);
-        Assert.Contains(reporter.Messages, x => x.Contains("没有开 Dalamud"));
+        Assert.Contains("agent:minion:ok", reporter.Entries);
 
         await runner.CloseAsync(TimeSpan.FromSeconds(1));
         await run.WaitAsync(Timeout);
     }
 
     [Fact]
-    public async Task AutoEnter_DalamudNeverLoads_StopsWithReason()
+    public async Task NoAutoEnter_DoesNotOpenThePipe()
     {
-        environment.DalamudLoaded = false;
+        environment.ModuleTarget = new FakeModuleTarget();
 
-        var runner = new CatInternationalGameRunner(redactor, environment) { DalamudInjectTimeout = TimeSpan.FromMilliseconds(100) };
-        var run    = runner.RunAsync(Request(dalamud: true, autoEnter: true), reporter, CancellationToken.None);
-
-        await WaitUntilAsync(() => reporter.Entries.Contains($"stopped:{CatAutoEnterStopCodes.MODULE_UNAVAILABLE}"));
-
-        Assert.Equal(0, environment.AutoEnterGames);
-
-        await runner.CloseAsync(TimeSpan.FromSeconds(1));
-        await run.WaitAsync(Timeout);
-    }
-
-    [Fact]
-    public async Task NoAutoEnter_NeverTouchesThePlugin()
-    {
         var runner = NewRunner();
         var run    = runner.RunAsync(Request(dalamud: true), reporter, CancellationToken.None);
 
         await reporter.Running.Task.WaitAsync(Timeout);
 
-        Assert.Equal(0, environment.PluginCalls);
         Assert.Equal(0, environment.AutoEnterGames);
 
         await runner.CloseAsync(TimeSpan.FromSeconds(1));
@@ -530,27 +563,27 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
     }
 
     /// <summary>
-    ///     游戏起来后才知道进程号的假插件: 假环境建自动进入角色的游戏一侧时才绑进程号并开管道
+    ///     游戏起来后才知道进程号的假模块: 假环境建自动进入角色的游戏一侧时才绑进程号并开管道
     /// </summary>
-    private sealed class FakeGamePlugin : IDisposable
+    private sealed class FakeGameModule : IDisposable
     {
-        private readonly CatInternationalAutoEnterTests.FakePlugin plugin = new();
+        private readonly CatInternationalAutoEnterTests.FakeModule module = new();
 
-        public FakeGamePlugin(FakeEnvironment environment)
+        public FakeGameModule(FakeEnvironment environment)
         {
             environment.AutoEnterGameFactory = process =>
             {
-                plugin.Bind(process.Id);
-                plugin.Start();
+                module.Bind(process.Id);
+                module.Start();
                 return new CatInternationalAutoEnter(process);
             };
         }
 
-        public List<CharaRow> Characters => plugin.Characters;
+        public List<CharaRow> Characters => module.Characters;
 
-        public List<string> Commands => plugin.Commands;
+        public List<string> Commands => module.Commands;
 
-        public void Dispose() => plugin.Dispose();
+        public void Dispose() => module.Dispose();
     }
 
     #endregion
@@ -889,13 +922,13 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
 
     #endregion
 
-    #region 共用游戏配置
+    #region 游戏内模块
 
     [Fact]
-    public async Task Launch_InjectsCharConfigModule_WithoutDalamudOrAutoEnter()
+    public async Task Launch_InjectsReadOnlyModule_WithoutDalamudOrAutoEnter()
     {
-        var target = new FakeCharConfigTarget();
-        environment.CharConfigTargetFactory = _ => target;
+        var target = new FakeModuleTarget();
+        environment.ModuleTarget = target;
 
         var runner = NewRunner();
         var run    = runner.RunAsync(Request(), reporter, CancellationToken.None);
@@ -907,6 +940,8 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         await run.WaitAsync(Timeout);
 
         Assert.Equal(1, target.Injections);
+        Assert.True(target.LastReadOnly);
+        Assert.Equal(0, environment.AutoEnterGames);
     }
 
     [Fact]
@@ -921,22 +956,29 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         await run.WaitAsync(Timeout);
     }
 
-    private sealed class FakeCharConfigTarget : ICatModuleTarget
+    private sealed class FakeModuleTarget : ICatModuleTarget
     {
         private int injections;
 
         public int Injections => Volatile.Read(ref injections);
 
+        /// <summary>最近一次注入是不是只读模式</summary>
+        public bool LastReadOnly { get; private set; }
+
+        /// <summary>注入失败的原因; null = 成功</summary>
+        public string? Error { get; init; }
+
         public bool HasExited => false;
 
         public bool HasWindow => true;
 
-        public bool IsInjected => Injections > 0;
+        public bool IsInjected => Error == null && Injections > 0;
 
         public string? Inject(bool readOnly)
         {
+            LastReadOnly = readOnly;
             Interlocked.Increment(ref injections);
-            return null;
+            return Error;
         }
     }
 
@@ -961,11 +1003,6 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
         public string? DalamudError { get; set; }
 
         public bool DalamudLoaded { get; set; } = true;
-
-        /// <summary>登记 CatLobby 插件失败的原因; null = 成功</summary>
-        public string? PluginError { get; set; }
-
-        public int PluginCalls { get; private set; }
 
         /// <summary>自动进入角色的游戏一侧; 不设就用真实的国际服游戏一侧</summary>
         public Func<Process, ICatAutoEnterGame>? AutoEnterGameFactory { get; set; }
@@ -1034,29 +1071,17 @@ public sealed class CatInternationalGameRunnerTests : IDisposable
 
         public bool IsDalamudLoaded(Process process) => DalamudLoaded;
 
-        public Task<DalamudDevPluginRegistrar.Result> EnsureAutoEnterPluginAsync()
-        {
-            Record("plugin");
-            PluginCalls++;
-
-            return Task.FromResult
-            (
-                PluginError == null
-                    ? new DalamudDevPluginRegistrar.Result(true, "登记并开启", null)
-                    : new DalamudDevPluginRegistrar.Result(false, "none", PluginError)
-            );
-        }
-
         public ICatAutoEnterGame CreateAutoEnterGame(Process process)
         {
+            Record("autoEnterGame");
             AutoEnterGames++;
             return AutoEnterGameFactory?.Invoke(process) ?? new CatInternationalAutoEnter(process);
         }
 
-        /// <summary>注入共用游戏配置模块的目标; 不设 = 这台电脑没有模块文件</summary>
-        public Func<Process, ICatModuleTarget>? CharConfigTargetFactory { get; set; }
+        /// <summary>注入游戏内模块的目标; 不设 = 这台电脑没有模块文件</summary>
+        public ICatModuleTarget? ModuleTarget { get; set; }
 
-        public ICatModuleTarget? CreateCharConfigTarget(Process process) => CharConfigTargetFactory?.Invoke(process);
+        public ICatModuleTarget? CreateModuleTarget(Process process) => ModuleTarget;
 
         public ICatInternationalMinion Minion => FakeMinion;
 

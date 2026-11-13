@@ -570,7 +570,7 @@ try
         try
         {
             $onlyPipe.Connect(1500)
-            $failures += '只装共用配置模式不该开管道（管道名留给国际服的 CatLobby 插件）'
+            $failures += '只装共用配置模式不该开管道（该模式不建主线程通道）'
         }
         catch [TimeoutException] { Write-Host '[OK] 只装共用配置模式: 没有开管道' }
         finally { $onlyPipe.Dispose() }
