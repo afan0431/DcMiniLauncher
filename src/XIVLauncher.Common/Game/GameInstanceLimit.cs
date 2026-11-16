@@ -243,12 +243,19 @@ public static class GameInstanceLimit
                     continue;
                 }
 
-                if (status < 0)
+                if (status != 0)
                     throw new Win32Exception($"读取句柄表失败: 0x{status:X8}");
 
-                var count  = (long)Marshal.ReadIntPtr(buffer);
-                var size   = Marshal.SizeOf<PROCESS_HANDLE_TABLE_ENTRY_INFO>();
-                var first  = buffer + Marshal.SizeOf<PROCESS_HANDLE_SNAPSHOT_INFORMATION>();
+                var header   = Marshal.SizeOf<PROCESS_HANDLE_SNAPSHOT_INFORMATION>();
+                var size     = Marshal.SizeOf<PROCESS_HANDLE_TABLE_ENTRY_INFO>();
+                var capacity = (long)(length - header) / size;
+                var count    = (long)Marshal.ReadIntPtr(buffer);
+
+                // 条目数只认缓冲区装得下的: 读到正在创建的游戏进程时它曾超出缓冲区, 照读会越界把启动器整个崩掉 (2026-11-16 PC2)
+                if (count < 0 || count > capacity)
+                    throw new Win32Exception($"句柄表条目数 {count} 超出缓冲区容量 {capacity}");
+
+                var first  = buffer + header;
                 var result = new List<PROCESS_HANDLE_TABLE_ENTRY_INFO>((int)count);
 
                 for (var i = 0L; i < count; i++)
