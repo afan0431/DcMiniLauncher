@@ -79,8 +79,6 @@ public class DalamudSession
     {
         Log.Information("[Dalamud Session] 开始运行, 游戏路径: {0}", gamePath.FullName);
 
-        GameInstanceLimit.Release();
-
         var startInfo = CreateStartInfo();
 
         if (loadMethod != DalamudLoadMethod.ACLonly)
@@ -97,7 +95,8 @@ public class DalamudSession
                 break;
         }
 
-        var process = injector.Run(updater.Runner!, fakeLogin, noPlugin, noThirdPlugin, gameExe, gameArgs, environment, loadMethod, startInfo);
+        // 解除多开限制与注入器开游戏同锁串行: 几个号同时上号时, 别的启动器会去读本机正被注入器挂起改写的游戏进程, 启动器崩溃、注入失败 (2026-11-16 PC2)
+        var process = GameInstanceLimit.Launch(() => injector.Run(updater.Runner!, fakeLogin, noPlugin, noThirdPlugin, gameExe, gameArgs, environment, loadMethod, startInfo));
 
         updater.HideLoading();
 
