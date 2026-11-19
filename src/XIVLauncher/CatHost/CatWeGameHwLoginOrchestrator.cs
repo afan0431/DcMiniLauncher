@@ -286,61 +286,23 @@ public sealed class CatWeGameHwLoginFlow(ICatHidKeyboard keyboard, ICatWeGameScr
     }
 
     /// <summary>
-    ///     登录后点开游戏: 主界面上点「启动」; 首次启动会先弹协议勾选框（勾「以上所有内容」再点「启动」）和选大区对话框（点「确定」）。
-    ///     游戏的登录组件 sdologin 起来就算成功（version.dll 在它里面取登录信息, 外层随后收到）。按钮点了又变回能点时隔 <see cref="StartRetry" /> 再点
+    ///     登录后点开游戏（见 <see cref="CatWeGameAutoStart" />）
     /// </summary>
     private async Task<CatWeGameHwLoginResult> StartGameAsync(CancellationToken cancellationToken)
     {
-        var since     = Now().AddSeconds(-1);
-        var deadline  = Environment.TickCount64 + (long)StartTimeout.TotalMilliseconds;
-        long? clicked = null;
-        long? agreed  = null;
-
-        while (Environment.TickCount64 <= deadline)
+        var starter = new CatWeGameAutoStart(screen, foreground)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            ActionPause  = ActionPause,
+            Poll         = LoginResultPoll,
+            StartTimeout = StartTimeout,
+            StartRetry   = StartRetry,
+            AgreeSettle  = AgreeSettle,
+            Now          = Now
+        };
 
-            if (foreground.GameLoginStartedSince(since))
-            {
-                Log.Information("[CatHost] WeGame 已拉起游戏的登录组件, 等取登录信息");
-                return CatWeGameHwLoginResult.Success();
-            }
-
-            if (screen.ConfirmRegionDialog())
-            {
-                Log.Information("[CatHost] WeGame 弹出选大区, 按默认大区点了「确定」");
-                await DelayAsync(LoginResultPoll, cancellationToken).ConfigureAwait(false);
-                continue;
-            }
-
-            if (screen.CaptureMainWindow() is { } main)
-            {
-                var sinceClick = clicked is { } at ? Environment.TickCount64 - at : long.MaxValue;
-
-                if (main.AgreementOpen && !main.AgreeAllChecked)
-                {
-                    // 勾选框点一下切换一次: 上一下还没画出来时不再点, 免得又勾掉
-                    if (agreed is not { } tick || Environment.TickCount64 - tick >= (long)AgreeSettle.TotalMilliseconds)
-                    {
-                        Log.Information("[CatHost] WeGame 首次启动要勾协议, 勾「我已阅读同意以上所有内容」");
-                        ClickOnMainWindow(main, CatWeGameMainReader.AgreeAll);
-                        agreed = Environment.TickCount64;
-                    }
-                }
-                // 勾好协议后马上再点; 平时点过一次要等按钮又变回能点、且隔够 StartRetry 才再点
-                else if (main.AgreementOpen && sinceClick >= (long)ActionPause.TotalMilliseconds
-                         || main.StartReady && sinceClick >= (long)StartRetry.TotalMilliseconds)
-                {
-                    Log.Information("[CatHost] 点 WeGame 主界面的「启动」");
-                    ClickOnMainWindow(main, CatWeGameMainReader.StartButton);
-                    clicked = Environment.TickCount64;
-                }
-            }
-
-            await DelayAsync(LoginResultPoll, cancellationToken).ConfigureAwait(false);
-        }
-
-        return CatWeGameHwLoginResult.Fallback("已登录 WeGame, 但没能自动启动游戏, 请在这台电脑的 WeGame 里点「启动」");
+        return await starter.StartGameAsync(cancellationToken).ConfigureAwait(false)
+                   ? CatWeGameHwLoginResult.Success()
+                   : CatWeGameHwLoginResult.Fallback(CatWeGameAutoStart.START_FAILED);
     }
 
     /// <summary>逐字符硬件输入, 每个字符前核对 <paramref name="ready" />（前台 / 焦点）, 不对就停下返回 false</summary>
@@ -377,13 +339,6 @@ public sealed class CatWeGameHwLoginFlow(ICatHidKeyboard keyboard, ICatWeGameScr
 
         var (x, y) = CatWeGameChallengeWatcher.Scale(point, window.Width, window.Height);
         return screen.ClickLoginWindow(x, y);
-    }
-
-    /// <summary>后台点主界面里的一个（1600×900 基准）位置</summary>
-    private void ClickOnMainWindow(CatWeGameMainWindow main, (int X, int Y) point)
-    {
-        var (x, y) = CatWeGameMainReader.Scale(point, main.Width, main.Height);
-        screen.ClickMainWindow(x, y);
     }
 
     private static async Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
