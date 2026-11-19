@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -1257,6 +1258,69 @@ public sealed class CatWeGameChallengeWatcherTests
         Assert.Contains("cleared:q-1", entries);
     }
 
+    [Theory]
+    [InlineData(CatWeGameScan.Qq)]
+    [InlineData(CatWeGameScan.WeChat)]
+    [InlineData(null)]
+    public async Task Capture_ScanOrManualLogin_ClicksStartAfterSignIn(CatWeGameScan? scan)
+    {
+        // 客户扫码或员工手动登录: 登录窗还在时不点, 登录完主界面出来后自动点「启动」
+        var environment = new WaitingEnvironment();
+        var foreground  = new StubWeGameForeground();
+        screen.Window = Qr(QQ_LINK);
+        screen.Main   = new CatWeGameMainWindow(1600, 900, StartReady: true, AgreementOpen: false, AgreeAllChecked: false);
+        screen.OnMainClick = (_, _) => foreground.GameStarted = true;
+        var capture = new CatWeGameLoginCapture(environment, new EmptyStore(), redactor)
+        {
+            Screen        = screen,
+            WatchInterval = TimeSpan.FromMilliseconds(10),
+            AutoStartPoll = TimeSpan.FromMilliseconds(5),
+            Foreground    = foreground
+        };
+
+        var run = capture.FindRowAsync(Request(scan), reporter, CancellationToken.None);
+        await WaitUntilAsync(() => screen.CaptureCount >= 10);
+        Assert.Empty(screen.MainClicks);
+
+        foreground.SignedIn = true;
+        await WaitUntilAsync(() => foreground.GameStarted);
+
+        environment.Result.TrySetResult(new WeGameCaptureResult("10000000000000001", "captured-token-AAAA"));
+        await run.WaitAsync(Timeout);
+
+        Assert.Equal([(1382, 848)], screen.MainClicks.ToArray());
+    }
+
+    [Fact]
+    public async Task Capture_HwLoginFellBack_StaffLogsInByHand_ClicksStart()
+    {
+        // 没接硬件, 退回员工手动: 员工登录后照样自动点「启动」
+        var environment = new WaitingEnvironment();
+        var foreground  = new StubWeGameForeground();
+        screen.Main        = new CatWeGameMainWindow(1600, 900, StartReady: true, AgreementOpen: false, AgreeAllChecked: false);
+        screen.OnMainClick = (_, _) => foreground.GameStarted = true;
+        var capture = new CatWeGameLoginCapture(environment, new EmptyStore(), redactor)
+        {
+            Screen        = screen,
+            WatchInterval = TimeSpan.FromMilliseconds(10),
+            AutoStartPoll = TimeSpan.FromMilliseconds(5),
+            Keyboard      = new StubHidKeyboard { OpenResult = false },
+            Foreground    = foreground
+        };
+
+        var run = capture.FindRowAsync(Request(null) with { Password = new CatSecret("pw1234Ab") }, reporter, CancellationToken.None);
+        await WaitUntilAsync(() => !reporter.HwFallbacks.IsEmpty);
+        Assert.Empty(screen.MainClicks);
+
+        foreground.SignedIn = true;
+        await WaitUntilAsync(() => foreground.GameStarted);
+
+        environment.Result.TrySetResult(new WeGameCaptureResult("10000000000000001", "captured-token-AAAA"));
+        await run.WaitAsync(Timeout);
+
+        Assert.Equal([(1382, 848)], screen.MainClicks.ToArray());
+    }
+
     private CatWeGameChallengeWatcher CreatePopupWatcher(ICatWeGameClicker clicker, TimeSpan? recheck = null) =>
         new(screen, reporter, redactor, null) { Clicker = clicker, TileClickPause = TimeSpan.Zero, AnswerRecheck = recheck ?? TimeSpan.FromHours(1) };
 
@@ -1442,6 +1506,22 @@ public sealed class CatWeGameChallengeWatcherTests
                 return false;
 
             ConfirmCount++;
+            return true;
+        }
+
+        /// <summary>登录后的主界面; 默认没出来</summary>
+        public CatWeGameMainWindow? Main { get; set; }
+
+        public ConcurrentQueue<(int X, int Y)> MainClicks { get; } = new();
+
+        public Action<int, int>? OnMainClick { get; set; }
+
+        public CatWeGameMainWindow? CaptureMainWindow() => Main;
+
+        public bool ClickMainWindow(int x, int y)
+        {
+            MainClicks.Enqueue((x, y));
+            OnMainClick?.Invoke(x, y);
             return true;
         }
     }
