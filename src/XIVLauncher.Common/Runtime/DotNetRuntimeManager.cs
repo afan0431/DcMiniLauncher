@@ -108,6 +108,11 @@ public static class DotNetRuntimeManager
         }
     }
 
+    /// <summary>本地运行时就是 <paramref name="version" />, 且各部分目录都在、不是空的</summary>
+    public static bool IsInstalled(DirectoryInfo runtimeDirectory, string version) =>
+        GetLocalRuntimeVersion(new FileInfo(Path.Combine(runtimeDirectory.FullName, "version"))) == version &&
+        GetRequiredPaths(runtimeDirectory, version).All(path => path.Exists && path.EnumerateFileSystemInfos().Any());
+
     private static DirectoryInfo[] GetRequiredPaths(DirectoryInfo runtimeDirectory, string version) =>
     [
         new(Path.Combine(runtimeDirectory.FullName, "host",   "fxr",                          version)),
