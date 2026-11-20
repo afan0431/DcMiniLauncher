@@ -52,6 +52,18 @@ public class DalamudUpdater : IDalamudUpdater
 
     private static string runtimeVersion = string.Empty;
 
+    /// <summary>Version / OnlineHash / runtimeVersion 是发行源刚给的（而不是从本地记录里读的）</summary>
+    private static bool versionInfoFromRemote;
+
+    /// <summary>
+    ///     这次没连上发行源, 用的是发行源以前确认过的本地版本（<see cref="DalamudConfirmedLocal" />）。
+    ///     起游戏前要由 <see cref="DalamudSession" /> 核对游戏版本没变
+    /// </summary>
+    public bool UsingConfirmedLocal { get; private set; }
+
+    /// <summary>本地版本被确认时游戏是哪一版; 只在 <see cref="UsingConfirmedLocal" /> 时有意义</summary>
+    public string? ConfirmedGameVersion { get; private set; }
+
     private static readonly ConcurrentDictionary<string, (long Length, long LastWriteTimeUtcTicks, string Hash)> CachedFileHashes =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -59,6 +71,8 @@ public class DalamudUpdater : IDalamudUpdater
 
     /// <summary>等别的进程更新完 addon 目录的上限</summary>
     private static readonly TimeSpan UpdateMutexTimeout = TimeSpan.FromMinutes(5);
+
+    private DirectoryInfo HooksDirectory => new(Path.Combine(addonDirectory.FullName, "Hooks"));
 
     private string UpdateMutexName => CrossProcessMutex.NameForPath("DcMiniLauncher-DalamudUpdate", addonDirectory.FullName);
     private readonly DirectoryInfo assetDirectory;
@@ -100,7 +114,10 @@ public class DalamudUpdater : IDalamudUpdater
                 return;
             }
 
-            Log.Information("[DUPDATE] Dalamud 上次更新已超过 24 小时，将重新检查");
+            Log.Information
+            (
+                UsingConfirmedLocal ? "[DUPDATE] 上次没连上发行源（用的本地版本），将重新检查" : "[DUPDATE] Dalamud 上次更新已超过 24 小时，将重新检查"
+            );
         }
 
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -113,6 +130,7 @@ public class DalamudUpdater : IDalamudUpdater
 
         Log.Information("[DUPDATE] 启动 Dalamud 更新器中...");
         EnsurementException = null;
+        UsingConfirmedLocal = false;
         LoadingDetail       = string.Empty;
         LoadingTotal        = null;
         LoadingDownloaded   = 0;
@@ -150,6 +168,14 @@ public class DalamudUpdater : IDalamudUpdater
                         }
                     }
 
+                    if (!isUpdated && TryUseConfirmedLocal())
+                    {
+                        State = DownloadState.Done;
+                        // 没连上发行源不算「更新完成」: 下次 Run 照样去问
+                        lastCompletionUtc = null;
+                        return;
+                    }
+
                     State = isUpdated ? DownloadState.Done : DownloadState.NoIntegrity;
                 }
                 finally
@@ -181,6 +207,10 @@ public class DalamudUpdater : IDalamudUpdater
                 throw new DalamudIntegrityException("完整性验证最终失败");
 
             Runner = new FileInfo(Path.Combine(paths.currentVersionPath.FullName, "Dalamud.Injector.exe"));
+
+            if (versionInfoFromRemote)
+                DalamudConfirmedLocal.Confirm(HooksDirectory, Version, OnlineHash, runtimeVersion);
+
             SetLoadingDetail("正在启动...");
             ReportLoadingProgressCore(null, 0, null);
 
@@ -197,7 +227,7 @@ public class DalamudUpdater : IDalamudUpdater
     {
         Log.Verbose("[DUPDATE] 开始检查版本信息");
 
-        if (!refreshVersionInfo && !string.IsNullOrWhiteSpace(OnlineHash) && !string.IsNullOrWhiteSpace(Version))
+        if (!refreshVersionInfo && versionInfoFromRemote && !string.IsNullOrWhiteSpace(OnlineHash) && !string.IsNullOrWhiteSpace(Version))
         {
             Log.Verbose("[DUPDATE] 版本信息已存在: {Version} ({Hash})", Version, OnlineHash);
             return;
@@ -303,7 +333,12 @@ public class DalamudUpdater : IDalamudUpdater
         }
     }
 
-    public static bool CheckDalamudIntegrity(DirectoryInfo addonPath)
+    public static bool CheckDalamudIntegrity(DirectoryInfo addonPath) =>
+        CheckDalamudIntegrity(addonPath, OnlineHash);
+
+    /// <param name="addonPath">版本目录</param>
+    /// <param name="expectedHash">hashes.json 应有的 MD5; 空串时不比对, 只按 hashes.json 逐个核文件</param>
+    public static bool CheckDalamudIntegrity(DirectoryInfo addonPath, string expectedHash)
     {
         try
         {
@@ -331,13 +366,13 @@ public class DalamudUpdater : IDalamudUpdater
                 return false;
             }
 
-            if (!string.IsNullOrEmpty(OnlineHash))
+            if (!string.IsNullOrEmpty(expectedHash))
             {
                 var hashHash = ComputeFileHash(hashesPath);
 
-                if (OnlineHash != hashHash)
+                if (expectedHash != hashHash)
                 {
-                    Log.Error($"[UPDATE] hashes.json 哈希比对不一致, 本地: {hashHash}, 远程: {OnlineHash}");
+                    Log.Error($"[UPDATE] hashes.json 哈希比对不一致, 本地: {hashHash}, 应为: {expectedHash}");
                     return false;
                 }
             }
@@ -353,6 +388,8 @@ public class DalamudUpdater : IDalamudUpdater
 
     public async Task GetDalamudVersionInfoAsync()
     {
+        versionInfoFromRemote = false;
+
         var networkEnvironmentTask = networkEnvironmentService.GetCurrentAsync();
         runtimeVersion = await DotNetRuntimeManager.GetLatestVersionAsync(httpClient).ConfigureAwait(false);
 
@@ -392,7 +429,8 @@ public class DalamudUpdater : IDalamudUpdater
             var hash = ComputeFileHash(downloadPath);
 
             Log.Information($"[DUPDATE] 获取到远端 Dalamud 哈希: {hash}");
-            OnlineHash = hash;
+            OnlineHash            = hash;
+            versionInfoFromRemote = true;
         }
         finally
         {
@@ -422,6 +460,87 @@ public class DalamudUpdater : IDalamudUpdater
             Log.Error(ex, "[DUPDATE] 下载过程中发生错误");
             throw;
         }
+    }
+
+    /// <summary>
+    ///     更新反复失败后: 发行源以前确认过的本地版本若完好、且没有迹象说明它过时（发行源这次没说出更新的版本）, 就用它。
+    ///     游戏版本核对在 <see cref="DalamudSession.EnsureReady" /> 里做, 这里只看本地文件
+    /// </summary>
+    private bool TryUseConfirmedLocal()
+    {
+        var record = DalamudConfirmedLocal.Read(HooksDirectory);
+
+        if (record == null)
+        {
+            Log.Warning("[DUPDATE] 没有发行源确认过的本地 Dalamud, 不能不经发行源启动");
+            return false;
+        }
+
+        if (versionInfoFromRemote && (record.Version != Version || record.Hash != OnlineHash || record.Runtime != runtimeVersion))
+        {
+            Log.Warning
+            (
+                "[DUPDATE] 发行源有新版本 {Version}/{Runtime}, 本地确认过的是 {LocalVersion}/{LocalRuntime}, 不用旧版",
+                Version,
+                runtimeVersion,
+                record.Version,
+                record.Runtime
+            );
+            return false;
+        }
+
+        if (record.GameVersion == null)
+        {
+            Log.Warning("[DUPDATE] 本地 Dalamud {Version} 还没用来起过游戏, 不能不经发行源启动", record.Version);
+            return false;
+        }
+
+        var versionPath = new DirectoryInfo(Path.Combine(HooksDirectory.FullName, record.Version));
+
+        if (!versionPath.Exists || !CheckDalamudIntegrity(versionPath, record.Hash))
+        {
+            Log.Warning("[DUPDATE] 本地 Dalamud {Version} 不完整", record.Version);
+            return false;
+        }
+
+        if (!DotNetRuntimeManager.IsInstalled(Runtime, record.Runtime))
+        {
+            Log.Warning("[DUPDATE] 本地 .NET 运行时 {Runtime} 不完整", record.Runtime);
+            return false;
+        }
+
+        if (DalamudAssetManager.LocalAssets(assetDirectory) is not { } assets)
+        {
+            Log.Warning("[DUPDATE] 本地没有完整的 Dalamud 资源文件");
+            return false;
+        }
+
+        Version               = record.Version;
+        OnlineHash            = record.Hash;
+        runtimeVersion        = record.Runtime;
+        versionInfoFromRemote = false;
+        Runner                = new FileInfo(Path.Combine(versionPath.FullName, "Dalamud.Injector.exe"));
+        AssetDirectory        = assets;
+        ConfirmedGameVersion  = record.GameVersion;
+        UsingConfirmedLocal   = true;
+
+        Log.Warning
+        (
+            "[DUPDATE] 连不上 Dalamud 发行源（{Error}）, 用以前确认过的本地版本 {Version}（游戏 {GameVersion}）",
+            EnsurementException?.Message,
+            record.Version,
+            record.GameVersion
+        );
+        return true;
+    }
+
+    /// <summary>
+    ///     用发行源刚确认的版本起了游戏: 记下游戏版本, 以后连不上发行源时据此判断本地版本还适不适用
+    /// </summary>
+    public void ConfirmGameVersion(string gameVersion)
+    {
+        if (versionInfoFromRemote && !UsingConfirmedLocal)
+            DalamudConfirmedLocal.ConfirmGameVersion(HooksDirectory, Version, gameVersion);
     }
 
     #endregion

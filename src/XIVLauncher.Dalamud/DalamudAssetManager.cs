@@ -200,6 +200,19 @@ internal static class DalamudAssetManager
         return true;
     }
 
+    /// <summary>
+    ///     上次更新成功的资源目录（asset.ver 只在全部文件到齐后才推进）; 没有或目录空着时为 null
+    /// </summary>
+    public static DirectoryInfo? LocalAssets(DirectoryInfo baseDir)
+    {
+        var version = ReadLocalAssetVer(baseDir);
+        if (version <= 0)
+            return null;
+
+        var dir = new DirectoryInfo(Path.Combine(baseDir.FullName, version.ToString()));
+        return dir.Exists && dir.EnumerateFiles("*", SearchOption.AllDirectories).Any() ? dir : null;
+    }
+
     private static int ReadLocalAssetVer(DirectoryInfo baseDir)
     {
         try

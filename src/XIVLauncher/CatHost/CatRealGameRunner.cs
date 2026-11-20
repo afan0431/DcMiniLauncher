@@ -2516,7 +2516,9 @@ public sealed class CatRealGameRunner(CatLogRedactor redactor, Func<Task> ensure
         catch (Exception ex)
         {
             Log.Error(ex, "[CatHost] 准备 Dalamud 时发生错误");
-            return (null, $"下载 Dalamud 相关文件异常: {ex.Message}");
+            // 带上最底层的原因（连接被重置、找不到主机等）, 工作台照原样显示给员工
+            var cause = ex.GetBaseException();
+            return (null, cause == ex ? ex.Message : $"{ex.Message}: {cause.Message}");
         }
     }
 

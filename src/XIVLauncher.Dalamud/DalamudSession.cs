@@ -44,6 +44,9 @@ public class DalamudSession
         if (updater.Runner == null || !updater.Runner.Exists)
             throw new DalamudRunnerException("Dalamud 本地注入文件不存在, 请重新启动 XIVLauncher 以开始完整性检测与下载流程");
 
+        if (updater is DalamudUpdater cnUpdater)
+            CheckConfirmedGameVersion(cnUpdater, gamePathDir);
+
         // 国服不核对（flavor 缺省时 IsGameVersionSupported 为 null, 这一段不执行）
         if (flavor.IsGameVersionSupported is { } isSupported)
         {
@@ -57,6 +60,44 @@ public class DalamudSession
         }
 
         return DalamudInstallState.Ok;
+    }
+
+    /// <summary>
+    ///     国服: 没连上发行源、用的是本地确认过的版本时, 游戏必须还是确认时那一版, 否则本地 Dalamud 不一定适用;
+    ///     连上了发行源就记下这次的游戏版本, 供以后连不上时核对
+    /// </summary>
+    private void CheckConfirmedGameVersion(DalamudUpdater cnUpdater, DirectoryInfo gamePathDir)
+    {
+        string? gameVersion;
+
+        try
+        {
+            gameVersion = gameVersionProvider.GetVersion(gamePathDir);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[HOOKS] 读不出游戏版本");
+            gameVersion = null;
+        }
+
+        if (!cnUpdater.UsingConfirmedLocal)
+        {
+            if (!string.IsNullOrWhiteSpace(gameVersion))
+                cnUpdater.ConfirmGameVersion(gameVersion);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(gameVersion) || gameVersion != cnUpdater.ConfirmedGameVersion)
+        {
+            updater.HideLoading();
+            throw new DalamudRunnerException
+            (
+                $"连不上 Dalamud 发行源, 本地 Dalamud {DalamudUpdater.Version} 是在游戏 {cnUpdater.ConfirmedGameVersion} 时确认的, 现在游戏是 {gameVersion ?? "未知版本"}, 不一定适用",
+                cnUpdater.EnsurementException
+            );
+        }
+
+        Log.Warning("[HOOKS] 连不上 Dalamud 发行源, 游戏仍是 {GameVersion}, 用本地确认过的 Dalamud {Version}", gameVersion, DalamudUpdater.Version);
     }
 
     public void InjectGame(int gamePid, bool safeMode = false)
